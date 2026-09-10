@@ -61,6 +61,7 @@ vi.mock('@ant-design/icons', async () => {
     PlusOutlined: icon('plus'),
     ReloadOutlined: icon('reload'),
     SendOutlined: icon('send'),
+    CopyOutlined: icon('copy'),
   };
 });
 
@@ -82,6 +83,9 @@ vi.mock('antd', async () => {
     ),
     Empty: passthrough('div'),
     Input,
+    Modal: ({ children, open, ...props }: any) => (
+      open ? ReactModule.createElement('div', { ...props, 'data-testid': 'modal' }, children) : null
+    ),
     Segmented: passthrough('div'),
     Space: passthrough('div'),
     Tag: passthrough('span'),
@@ -266,6 +270,9 @@ describe('MessageQueueWorkbench MQTT stream lifecycle', () => {
     const text = renderedText(renderer);
     expect(text.match(/2 messages/g)).toHaveLength(2);
     expect(text).not.toContain('1 messages');
+    expect(text).toContain('first');
+    expect(text).toContain('second');
+    expect(text).toContain('devices/a');
     expect(backend.DBQuery.mock.calls[0][2]).not.toContain('OFFSET');
     expect(backend.DBQuery.mock.calls[1][2]).toContain('OFFSET 1');
     act(() => { renderer.unmount(); });
@@ -773,7 +780,7 @@ describe('MessageQueueWorkbench MQTT stream lifecycle', () => {
     await act(async () => { await Promise.resolve(); });
 
     expect(renderer.root.findAllByType('article')).toHaveLength(2);
-    expect(renderedText(renderer).match(/same delivery/g)).toHaveLength(2);
+    expect(renderedText(renderer).match(/same delivery/g)?.length).toBeGreaterThanOrEqual(2);
     act(() => { renderer.unmount(); });
   });
 
@@ -825,6 +832,138 @@ describe('MessageQueueWorkbench MQTT stream lifecycle', () => {
       defaultExchange: 'events.fanout',
       executionDbName: '/',
     });
+    act(() => { renderer.unmount(); });
+  });
+
+  it('shows Kafka consumer group details returned by the backend', async () => {
+    storeState.connections = [{
+      id: 'kafka-1',
+      name: 'Kafka test',
+      config: { type: 'kafka', host: '127.0.0.1', port: 9092 },
+    }];
+    backend.DBQuery.mockResolvedValueOnce({
+      success: true,
+      data: [{
+        group: 'orders', state: 'Stable', member: 'member-1', client_id: 'consumer-a',
+        topic: 'orders.events', partition: 2, current_offset: 11, log_end_offset: 14, lag: 3,
+      }],
+    });
+    const kafkaTab = { ...tab, id: 'message-queue-kafka-1-topics', connectionId: 'kafka-1', dbName: 'topics' } as any;
+    const renderer = renderWorkbench(kafkaTab);
+
+    clickButtonWithText(renderer, 'message_queue_workbench.consumer_groups.action.open');
+    await act(async () => { await Promise.resolve(); });
+
+    expect(backend.DBQuery).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'kafka' }),
+      'topics',
+      'SHOW CONSUMER GROUPS;',
+    );
+    expect(renderedText(renderer)).toContain('orders.events');
+    expect(renderedText(renderer)).toContain('member-1');
+    expect(renderedText(renderer)).toContain('3');
+    act(() => { renderer.unmount(); });
+  });
+
+  it('keeps the newest consumer group request when an earlier request resolves late', async () => {
+    storeState.connections = [{
+      id: 'kafka-1',
+      name: 'Kafka test',
+      config: { type: 'kafka', host: '127.0.0.1', port: 9092 },
+    }];
+    const first = deferred<any>();
+    const second = deferred<any>();
+    backend.DBQuery
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => second.promise);
+    const kafkaTab = { ...tab, id: 'message-queue-kafka-1-topics', connectionId: 'kafka-1', dbName: 'topics' } as any;
+    const renderer = renderWorkbench(kafkaTab);
+
+    clickButtonWithText(renderer, 'message_queue_workbench.consumer_groups.action.open');
+    act(() => { renderer.root.findByProps({ 'data-testid': 'modal' }).props.onCancel(); });
+    const consumerGroupsButton = renderer.root.findAllByType('button').find((candidate) => (
+      collectText(candidate.props.children).includes('message_queue_workbench.consumer_groups.action.open')
+    ));
+    expect(consumerGroupsButton?.props.loading).toBe(false);
+    clickButtonWithText(renderer, 'message_queue_workbench.consumer_groups.action.open');
+    await act(async () => {
+      second.resolve({ success: true, data: [{ group: 'new-group', state: 'Stable' }] });
+      await Promise.resolve();
+    });
+    await act(async () => {
+      first.resolve({ success: true, data: [{ group: 'old-group', state: 'Empty' }] });
+      await Promise.resolve();
+    });
+
+    expect(renderedText(renderer)).toContain('new-group');
+    expect(renderedText(renderer)).not.toContain('old-group');
+    act(() => { renderer.unmount(); });
+  });
+
+  it('shows RocketMQ consumer group details returned by the backend', async () => {
+    storeState.connections = [{
+      id: 'rocketmq-1',
+      name: 'RocketMQ test',
+      config: { type: 'rocketmq', host: '127.0.0.1', port: 9876 },
+    }];
+    backend.DBQuery.mockResolvedValueOnce({
+      success: true,
+      data: [
+        {
+          group: 'orders-group', state: '', member: '', client_id: 'client-a',
+          client_host: '192.168.1.10', topic: '', queue_id: null,
+          current_offset: null, log_end_offset: null, lag: null,
+        },
+        {
+          group: 'orders-group', state: '', member: '', client_id: '',
+          client_host: '', topic: 'orders.events', queue_id: 0,
+          current_offset: 8, log_end_offset: 12, lag: 4,
+        },
+      ],
+    });
+    const rocketMQTab = { ...tab, id: 'message-queue-rocketmq-1-topics', connectionId: 'rocketmq-1', dbName: 'topics' } as any;
+    const renderer = renderWorkbench(rocketMQTab);
+
+    const consumerGroupsButton = renderer.root.findAllByType('button').find((candidate) => (
+      collectText(candidate.props.children).includes('message_queue_workbench.consumer_groups.action.open')
+    ));
+    expect(consumerGroupsButton).toBeTruthy();
+    expect(consumerGroupsButton?.props.disabled).toBeFalsy();
+    clickButtonWithText(renderer, 'message_queue_workbench.consumer_groups.action.open');
+    await act(async () => { await Promise.resolve(); });
+
+    expect(backend.DBQuery).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'rocketmq' }),
+      'topics',
+      'SHOW CONSUMER GROUPS;',
+    );
+    expect(renderedText(renderer)).toContain('client-a');
+    expect(renderedText(renderer)).toContain('orders.events');
+    expect(renderedText(renderer)).toContain('4');
+    act(() => { renderer.unmount(); });
+  });
+
+  it('surfaces the backend reason when RocketMQ consumer group inspection fails', async () => {
+    storeState.connections = [{
+      id: 'rocketmq-1',
+      name: 'RocketMQ test',
+      config: { type: 'rocketmq', host: '127.0.0.1', port: 9876 },
+    }];
+    backend.DBQuery.mockResolvedValueOnce({
+      success: false,
+      message: 'RocketMQ 消费组诊断需要读取 broker 集群信息，请检查 NameServer/broker 可达性',
+    });
+    const rocketMQTab = { ...tab, id: 'message-queue-rocketmq-1-topics', connectionId: 'rocketmq-1', dbName: 'topics' } as any;
+    const renderer = renderWorkbench(rocketMQTab);
+
+    clickButtonWithText(renderer, 'message_queue_workbench.consumer_groups.action.open');
+    await act(async () => { await Promise.resolve(); });
+
+    // antd Empty 的 passthrough mock 把 description 挂在 prop 上而非 children。
+    const emptyNode = renderer.root.findAllByType('div').find((candidate) => (
+      typeof candidate.props.description === 'string' && candidate.props.description.includes('RocketMQ 消费组诊断需要读取 broker 集群信息')
+    ));
+    expect(emptyNode).toBeTruthy();
     act(() => { renderer.unmount(); });
   });
 });

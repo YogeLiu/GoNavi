@@ -58,7 +58,6 @@ vi.mock('antd', () => {
 });
 
 const makeProps = (overrides: Partial<DataGridToolbarFrameProps> = {}): DataGridToolbarFrameProps => ({
-  isV2Ui: true,
   tableName: 'users',
   dbName: 'main',
   translate: (key, params) => t(key, params),
@@ -72,8 +71,6 @@ const makeProps = (overrides: Partial<DataGridToolbarFrameProps> = {}): DataGrid
   panelPaddingX: 8,
   toolbarBottomPadding: 8,
   filterTopPadding: 8,
-  selectionAccentHex: '#22c55e',
-  toolbarDividerColor: '#ddd',
   showFilter: false,
   canModifyData: true,
   selectedRowKeysLength: 0,
@@ -128,7 +125,6 @@ const makeProps = (overrides: Partial<DataGridToolbarFrameProps> = {}): DataGrid
   onCommit: vi.fn(),
   onPreviewChanges: vi.fn(),
   onImport: vi.fn(),
-  onCopyQueryResultCsv: vi.fn(),
   onRequestAiInsight: vi.fn(),
   onToggleTotalCount: vi.fn(),
   onQuickWhereDraftChange: vi.fn(),
@@ -166,6 +162,25 @@ const expectTooltip = (renderer: ReactTestRenderer, label: string) => {
 describe('DataGridToolbarFrame cell selection actions', () => {
   beforeEach(() => {
     setCurrentLanguage('zh-CN');
+  });
+
+  it('keeps the RocketMQ TAG total action visible but disabled with an explanation', () => {
+    const reason = 'Broker offset 不能表示 TAG 精确总量';
+    const renderer = create(
+      <DataGridToolbarFrame
+        {...makeProps({
+          prefersManualTotalCount: true,
+          totalCountUnavailableLabel: 'TAG 总量不可用',
+          totalCountUnavailableReason: reason,
+        })}
+      />,
+    );
+    const action = renderer.root.find(
+      (node) => node.type === 'button' && node.props['aria-label'] === 'TAG 总量不可用',
+    );
+
+    expect(action.props.disabled).toBe(true);
+    expectTooltip(renderer, reason);
   });
 
   it('uses a pressed selection toggle with a dynamic action label', () => {
@@ -267,7 +282,6 @@ describe('DataGridToolbarFrame cell selection actions', () => {
       renderer.update(
         <DataGridToolbarFrame
           {...makeProps({
-            isV2Ui: false,
             cellEditMode: true,
             selectedCellsSize: 3,
             selectedCellRowCount: 2,

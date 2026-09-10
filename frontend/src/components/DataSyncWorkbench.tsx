@@ -14,6 +14,7 @@ import {
   buildSidebarConnectionTagTree,
   type SidebarConnectionTagTreeItem,
 } from './sidebarV2Utils';
+import { requestCloseWorkbenchTabs } from '../utils/workbenchTabCloseProtection';
 
 const resolveEntryMode = (tab: TabData): DataSyncEntryMode => {
   if (tab.dataSyncEntryMode === 'schemaCompare' || tab.dataSyncEntryMode === 'dataCompare') {
@@ -23,15 +24,16 @@ const resolveEntryMode = (tab: TabData): DataSyncEntryMode => {
 };
 
 const DataSyncWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
-  const closeTab = useStore((state) => state.closeTab);
   const connections = useStore((state) => state.connections);
   const connectionTags = useStore((state) => state.connectionTags);
   const sidebarRootOrder = useStore((state) => state.sidebarRootOrder);
+  const rootSortMode = useStore((state) => state.rootSortMode);
+  const rootConnectionSortMode = useStore((state) => state.rootConnectionSortMode);
   const i18n = useOptionalI18n();
   const entryMode = resolveEntryMode(tab);
   const handleClose = useCallback(() => {
-    closeTab(tab.id);
-  }, [closeTab, tab.id]);
+    requestCloseWorkbenchTabs([tab.id]);
+  }, [tab.id]);
   const initialTask = useMemo(
     () =>
       createDataSyncTaskDraft({
@@ -66,8 +68,10 @@ const DataSyncWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
       connections,
       connectionTags,
       sidebarRootOrder,
+      rootSortMode,
+      rootConnectionSortMode,
     ).map(projectItem);
-  }, [connections, connectionTags, sidebarRootOrder]);
+  }, [connections, connectionTags, rootConnectionSortMode, rootSortMode, sidebarRootOrder]);
 
   return (
     <div
@@ -80,6 +84,7 @@ const DataSyncWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
         connectionTree={connectionTree}
         locale={i18n?.language}
         onClose={handleClose}
+        workbenchTabId={tab.id}
       />
     </div>
   );

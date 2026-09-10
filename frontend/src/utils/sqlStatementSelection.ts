@@ -19,6 +19,29 @@ const isHorizontalWhitespace = (ch: string): boolean => (
   ch === ' ' || ch === '\t' || ch === '\r' || ch === '\f'
 );
 
+const isDelimiterFollowupOffset = (text: string, offset: number): boolean => {
+  if (offset <= 0 || (text[offset - 1] !== ';' && text[offset - 1] !== '；')) {
+    return false;
+  }
+  if (offset >= text.length || isWhitespace(text[offset])) {
+    return true;
+  }
+  return (text[offset] === '-' && text[offset + 1] === '-')
+    || (text[offset] === '/' && text[offset + 1] === '*');
+};
+
+const findStatementBeforeDelimiter = (
+  text: string,
+  ranges: SqlStatementRange[],
+  delimiterIndex: number,
+): SqlStatementRange | null => [...ranges]
+  .reverse()
+  .find((range) => (
+    range.start <= delimiterIndex
+    && range.end <= delimiterIndex
+    && text.slice(range.end, delimiterIndex).trim() === ''
+  )) || null;
+
 const isSqlIdentifierStart = (ch: string): boolean => /^[A-Za-z_]$/.test(ch);
 
 const isSqlIdentifierPart = (ch: string): boolean => /^[A-Za-z0-9_$#]$/.test(ch);
@@ -27,8 +50,17 @@ const normalizeSqlLexicalDbType = (dbType: string): string => {
   const normalized = String(dbType || '').trim().toLowerCase();
   if (normalized === 'doris') return 'diros';
   if (normalized === 'greatdb' || normalized === 'gdb') return 'goldendb';
+  if (normalized === 'mssql' || normalized === 'sql_server' || normalized === 'sql-server') return 'sqlserver';
   return normalized;
 };
+
+export const supportsSqlBracketIdentifier = (dbType: string): boolean => (
+  ['sqlserver', 'sqlite'].includes(normalizeSqlLexicalDbType(dbType))
+);
+
+export const supportsSqlEscapedBracketIdentifier = (dbType: string): boolean => (
+  normalizeSqlLexicalDbType(dbType) === 'sqlserver'
+);
 
 const MYSQL_DASH_COMMENT_DIALECTS = new Set([
   'mysql', 'mariadb', 'oceanbase', 'diros', 'starrocks', 'goldendb', 'sphinx', 'tidb',
@@ -39,7 +71,7 @@ const supportsSqlHashLineComment = (dbType: string): boolean => {
   return !normalized || normalized === 'clickhouse' || MYSQL_DASH_COMMENT_DIALECTS.has(normalized);
 };
 
-const isSqlDashLineCommentStart = (dbType: string, next2: string): boolean => {
+export const isSqlDashLineCommentStart = (dbType: string, next2: string): boolean => {
   const normalized = normalizeSqlLexicalDbType(dbType);
   return !MYSQL_DASH_COMMENT_DIALECTS.has(normalized) || !next2 || isWhitespace(next2);
 };
@@ -88,6 +120,40 @@ const hasExecutableSqlStatementContent = (sql: string, dbType = ''): boolean => 
     return true;
   }
   return false;
+};
+
+/**
+ * Remove only non-executable trivia before a statement keyword. Statement
+ * ranges intentionally retain comments for editor navigation, but the SQL
+ * sent to the driver should not include detached documentation comments.
+ */
+export const stripLeadingSqlTrivia = (sql: string, dbType = ''): string => {
+  const text = String(sql || '');
+  let index = 0;
+  while (index < text.length) {
+    const ch = text[index];
+    const next = text[index + 1] || '';
+    if (isWhitespace(ch)) {
+      index += 1;
+      continue;
+    }
+    if ((ch === '#' && supportsSqlHashLineComment(dbType))
+      || (ch === '-' && next === '-' && isSqlDashLineCommentStart(dbType, text[index + 2] || ''))) {
+      const lineEnd = text.indexOf('\n', index + (ch === '#' ? 1 : 2));
+      index = lineEnd < 0 ? text.length : lineEnd + 1;
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      if (isExecutableSqlBlockComment(text, index, dbType) || text.startsWith('/*+', index)) {
+        break;
+      }
+      const blockEnd = text.indexOf('*/', index + 2);
+      index = blockEnd < 0 ? text.length : blockEnd + 2;
+      continue;
+    }
+    break;
+  }
+  return text.slice(index).replace(/\s+$/, '');
 };
 
 const skipSqlWhitespaceAndComments = (text: string, position: number): number => {
@@ -302,11 +368,14 @@ const trimStatementRange = (sql: string, start: number, end: number, dbType = ''
 export const findSqlStatementRanges = (sql: string, dbType = ''): SqlStatementRange[] => {
   const text = String(sql || '').replace(/\r\n/g, '\n');
   const ranges: SqlStatementRange[] = [];
+  const bracketIdentifiers = supportsSqlBracketIdentifier(dbType);
+  const escapedBracketIdentifiers = supportsSqlEscapedBracketIdentifier(dbType);
 
   let statementStart = 0;
   let inSingle = false;
   let inDouble = false;
   let inBacktick = false;
+  let inBracket = false;
   let escaped = false;
   let inLineComment = false;
   let inBlockComment = false;
@@ -352,7 +421,45 @@ export const findSqlStatementRanges = (sql: string, dbType = ''): SqlStatementRa
       continue;
     }
 
-    if (!inSingle && !inDouble && !inBacktick) {
+    if (inDouble) {
+      // SQL delimited identifiers escape a double quote by doubling it.
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (ch === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (ch === '"' && next === '"') {
+        index++;
+        continue;
+      }
+      if (ch === '"') inDouble = false;
+      continue;
+    }
+
+    if (inBacktick) {
+      // MySQL-style identifiers escape a backtick by doubling it.
+      if (ch === '`' && next === '`') {
+        index++;
+        continue;
+      }
+      if (ch === '`') inBacktick = false;
+      continue;
+    }
+
+    if (bracketIdentifiers && inBracket) {
+      // SQL Server identifiers escape a closing bracket as `]]`.
+      if (escapedBracketIdentifiers && ch === ']' && next === ']') {
+        index++;
+        continue;
+      }
+      if (ch === ']') inBracket = false;
+      continue;
+    }
+
+    if (!inSingle && !inDouble && !inBacktick && !inBracket) {
       if (ch === '/' && next === '*') {
         index++;
         inBlockComment = true;
@@ -409,6 +516,10 @@ export const findSqlStatementRanges = (sql: string, dbType = ''): SqlStatementRa
     }
     if (!inSingle && !inDouble && ch === '`') {
       inBacktick = !inBacktick;
+      continue;
+    }
+    if (bracketIdentifiers && !inSingle && !inDouble && !inBacktick && ch === '[') {
+      inBracket = true;
       continue;
     }
 
@@ -479,12 +590,35 @@ export const findSqlStatementRanges = (sql: string, dbType = ''): SqlStatementRa
   return ranges;
 };
 
+/**
+ * Returns the executable statement currently being edited at the end of sql.
+ * Unlike cursor navigation, a completed statement followed by only trivia has
+ * no active statement and must not inherit the previous statement's context.
+ */
+export const resolveSqlStatementPrefix = (sql: string, dbType = ''): string => {
+  const text = String(sql || '').replace(/\r\n/g, '\n');
+  const ranges = findSqlStatementRanges(text, dbType);
+  const currentRange = ranges[ranges.length - 1];
+  const trimmedEnd = text.trimEnd().length;
+  return currentRange && currentRange.end === trimmedEnd ? text.slice(currentRange.start) : '';
+};
+
 export const resolveCurrentSqlStatementRange = (sql: string, cursorOffset: number, dbType = ''): SqlStatementRange | null => {
   const text = String(sql || '').replace(/\r\n/g, '\n');
   const offset = Math.max(0, Math.min(text.length, Number.isFinite(cursorOffset) ? cursorOffset : 0));
   const ranges = findSqlStatementRanges(text, dbType);
   if (ranges.length === 0) {
     return null;
+  }
+
+  // Monaco may report a caret clicked on a trailing semicolon as the offset
+  // immediately after it (for example, on the following newline). Keep that
+  // caret attached to the statement whose delimiter was clicked.
+  if (isDelimiterFollowupOffset(text, offset)) {
+    const delimiterStatement = findStatementBeforeDelimiter(text, ranges, offset - 1);
+    if (delimiterStatement) {
+      return delimiterStatement;
+    }
   }
 
   const containingRange = ranges.find((range) => offset >= range.start && offset <= range.end);
@@ -522,16 +656,24 @@ export const resolveExecutableSql = (
   if (ranges.length === 0) {
     return null;
   }
+
+  if (isDelimiterFollowupOffset(text, offset)) {
+    const delimiterStatement = findStatementBeforeDelimiter(text, ranges, offset - 1);
+    if (delimiterStatement?.text.trim()) {
+      return { sql: stripLeadingSqlTrivia(delimiterStatement.text, dbType), source: 'statement' };
+    }
+  }
+
   const statement = ranges.find((range) => offset >= range.start && offset <= range.end);
   if (statement?.text.trim()) {
-    return { sql: statement.text, source: 'statement' };
+    return { sql: stripLeadingSqlTrivia(statement.text, dbType), source: 'statement' };
   }
 
   const slashLine = resolveStandaloneSqlSlashLineAtOffset(text, offset);
   if (slashLine) {
     const previousStatement = findPreviousSqlStatementRange(ranges, slashLine.lineStart);
     return previousStatement?.text.trim()
-      ? { sql: previousStatement.text, source: 'statement' }
+      ? { sql: stripLeadingSqlTrivia(previousStatement.text, dbType), source: 'statement' }
       : null;
   }
 
@@ -540,9 +682,16 @@ export const resolveExecutableSql = (
   const lineEnd = nextLineBreak === -1 ? text.length : nextLineBreak;
   const line = text.slice(lineStart, lineEnd).trim();
   if (line) {
-    const lineStatement = [...ranges].reverse().find((range) => range.start < lineEnd && range.end >= lineStart);
+    const lineStatements = ranges.filter((range) => range.start < lineEnd && range.end >= lineStart);
+    // A caret immediately after a semicolon is still attached to the statement
+    // on its left. Prefer the nearest completed statement on this line so a
+    // toolbar click cannot move execution to the next statement.
+    const lineStatement = [...lineStatements]
+      .reverse()
+      .find((range) => range.end < offset)
+      || lineStatements[0];
     if (lineStatement?.text.trim()) {
-      return { sql: lineStatement.text, source: 'statement' };
+      return { sql: stripLeadingSqlTrivia(lineStatement.text, dbType), source: 'statement' };
     }
   }
   if (line) {

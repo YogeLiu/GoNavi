@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 
 import {
   coerceThinkingIntensityForProfile,
+  defaultThinkingIntensityForProfile,
+  resolveProviderThinkingIntensityControl,
   resolveThinkingIntensityOptions,
   resolveThinkingIntensityProfile,
 } from './aiThinkingIntensity';
@@ -33,6 +35,21 @@ describe('aiThinkingIntensity', () => {
     })).toBe('deepseek');
   });
 
+  it('keeps GLM models on the OpenAI vocabulary when routed through Responses', () => {
+    for (const model of ['glm-4-plus', 'z-ai/glm-5.3-free']) {
+      expect(resolveThinkingIntensityProfile({
+        type: 'custom',
+        apiFormat: 'openai-responses',
+        baseUrl: 'https://api.example.com/v1',
+        model,
+      })).toBe('openai');
+    }
+    expect(resolveThinkingIntensityOptions('openai').map((item) => item.value))
+      .toEqual(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
+    expect(coerceThinkingIntensityForProfile('max', 'openai')).toBe('xhigh');
+    expect(defaultThinkingIntensityForProfile('openai')).toBe('medium');
+  });
+
   it('exposes openai-style levels including xhigh', () => {
     const values = resolveThinkingIntensityOptions('openai').map((item) => item.value);
     expect(values).toEqual(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
@@ -47,5 +64,22 @@ describe('aiThinkingIntensity', () => {
     expect(coerceThinkingIntensityForProfile('off', 'openai')).toBe('none');
     expect(coerceThinkingIntensityForProfile('xhigh', 'deepseek')).toBe('high');
     expect(coerceThinkingIntensityForProfile('max', 'openai')).toBe('xhigh');
+  });
+
+  it('uses the active Codex model catalog instead of the generic four levels', () => {
+    const control = resolveProviderThinkingIntensityControl({
+      type: 'custom', authMode: 'local-cli', apiFormat: 'codex-cli', model: 'gpt-5.6-sol', effort: 'high',
+    }, {
+      supportsEffort: true,
+      effortValues: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+      defaultEffort: 'medium',
+    }, {
+      models: ['gpt-5.6-sol'], source: 'app-server', stale: false, defaultModel: 'gpt-5.6-sol',
+      modelCapabilities: {
+        'gpt-5.6-sol': { effortValues: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], defaultEffort: 'low' },
+      },
+    });
+    expect(control.options.map((item) => item.value)).toEqual(['default', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+    expect(control.defaultValue).toBe('high');
   });
 });

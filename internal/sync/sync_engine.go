@@ -51,9 +51,13 @@ type SyncConfig struct {
 	MongoCollectionName string                      `json:"mongoCollectionName,omitempty"`
 	TableOptions        map[string]TableOptions     `json:"tableOptions,omitempty"`
 	Mappings            []SyncObjectMapping         `json:"mappings,omitempty"`
-	BatchSize           int                         `json:"batchSize,omitempty"`
-	RowErrorPolicy      string                      `json:"rowErrorPolicy,omitempty"`
-	OnRowError          ChangeEventRowErrorFunc     `json:"-"`
+	// identityMappingTarget is populated only while a schema planner handles a
+	// column-identity object rename. It is intentionally not part of the public
+	// config payload: callers express it through Mappings.
+	identityMappingTarget SyncObjectRef
+	BatchSize             int                     `json:"batchSize,omitempty"`
+	RowErrorPolicy        string                  `json:"rowErrorPolicy,omitempty"`
+	OnRowError            ChangeEventRowErrorFunc `json:"-"`
 }
 
 // SyncResult holds the result of the sync operation
@@ -205,6 +209,8 @@ func (s *SyncEngine) runSync(config SyncConfig) SyncResult {
 	if err := s.contextError(); err != nil {
 		return s.fail(config.JobID, totalTables, result, err.Error())
 	}
+	db.BindMetadataContext(sourceDB, s.context())
+	defer db.ClearMetadataContext(sourceDB)
 
 	// Connect Target
 	s.appendLog(config.JobID, &result, "info", fmt.Sprintf("正在连接目标数据库: %s...", config.TargetConfig.Host))
@@ -217,6 +223,11 @@ func (s *SyncEngine) runSync(config SyncConfig) SyncResult {
 		return s.fail(config.JobID, totalTables, result, localizedSyncBackendDetailText("data_sync.backend.error.connect_target_failed", err))
 	}
 	defer targetDB.Close()
+	if err := s.contextError(); err != nil {
+		return s.fail(config.JobID, totalTables, result, err.Error())
+	}
+	db.BindMetadataContext(targetDB, s.context())
+	defer db.ClearMetadataContext(targetDB)
 
 	tableFailures := make([]string, 0)
 	for i, tableName := range config.Tables {
@@ -628,12 +639,15 @@ func (s *SyncEngine) runSync(config SyncConfig) SyncResult {
 								markTableFailure(message)
 								continue
 							}
-							alterSQL, err := buildAddColumnSQLForPair(sourceType, targetType, targetQueryTable, srcCol)
+							alterSQL, alterWarnings, err := buildAddColumnSQLForPair(sourceType, targetType, targetQueryTable, srcCol)
 							if err != nil {
 								message := fmt.Sprintf("自动补字段失败：字段=%s 错误=%v", colName, err)
 								s.appendLog(config.JobID, &result, "error", "  -> "+message)
 								markTableFailure(message)
 								continue
+							}
+							for _, warning := range alterWarnings {
+								s.appendLog(config.JobID, &result, "warn", "  -> "+warning)
 							}
 							if warning := relaxedNotNullAddColumnWarning(srcCol); warning != "" {
 								s.appendLog(config.JobID, &result, "warn", "  -> "+warning)

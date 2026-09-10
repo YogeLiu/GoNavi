@@ -3,7 +3,9 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  buildTabWorkbenchStyle,
   TAB_WORKBENCH_CLASS_NAME,
+  TAB_ENVIRONMENT_ACCENT_CSS_HEIGHT,
   handleTabDragPointerDown,
   resolveTabHoverOpen,
   resolveTabHoverTitle,
@@ -134,9 +136,27 @@ describe('TabManager hover info', () => {
     });
   });
 
-  it('keeps the tab workbench as a full-height flex child in legacy and v2 UI', () => {
+  it('keeps the tab workbench as a full-height flex child', () => {
 
     expect(TAB_WORKBENCH_CLASS_NAME).toBe('tab-workbench');
+  });
+
+  it('applies the persisted environment accent thickness', () => {
+    expect(buildTabWorkbenchStyle(260, 6)).toEqual({
+      '--gn-v2-tab-width': '260px',
+      '--gn-tab-environment-accent-thickness': '6px',
+    });
+    expect(buildTabWorkbenchStyle(260, 1)).toEqual({
+      '--gn-v2-tab-width': '260px',
+      '--gn-tab-environment-accent-thickness': '1px',
+    });
+    expect(buildTabWorkbenchStyle(180, 99)).toEqual({
+      '--gn-v2-tab-width': '180px',
+      '--gn-tab-environment-accent-thickness': '2px',
+    });
+    expect(TAB_ENVIRONMENT_ACCENT_CSS_HEIGHT).toBe(
+      'var(--gn-tab-environment-accent-thickness, 2px)',
+    );
   });
 
   it('renders en-US v2 tab hover context for table tabs while keeping raw values raw', () => {

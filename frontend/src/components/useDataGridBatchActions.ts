@@ -1,10 +1,37 @@
 import { useCallback, useEffect } from 'react';
 import type React from 'react';
 import { message } from 'antd';
-import { collectDataGridFillTemplateTargetRowKeys } from './DataGridCore';
+import {
+  buildDataGridCellSelectionRectangle,
+  collectDataGridFillTemplateTargetRowKeys,
+  filterDataGridCellSelectionToVisibleRows,
+} from './DataGridCore';
 import type { Item } from './DataGridCore';
 import { buildDataGridClipboardPasteRows, parseDataGridClipboardData } from './dataGridClipboardPaste';
 import { canSelectGridCellForClipboard } from './dataGridSelectionCopy';
+import {
+  clampDataGridSelectionAutoScrollDelta,
+  DATA_GRID_SELECTION_AUTO_SCROLL_EDGE_THRESHOLD_PX,
+  getDataGridSelectionAutoScrollStep,
+} from './dataGridSelectionAutoScroll';
+
+export type CellSelectionAutoScrollRect = Pick<
+  DOMRect,
+  'top' | 'right' | 'bottom' | 'left'
+> & Partial<Pick<DOMRect, 'width' | 'height'>>;
+
+export type CellSelectionAutoScrollViewport = {
+  rect: CellSelectionAutoScrollRect;
+  scrollTop: number;
+  scrollLeft: number;
+  maxScrollTop: number;
+  maxScrollLeft: number;
+};
+
+export type CellSelectionAutoScrollController = {
+  getViewport: () => CellSelectionAutoScrollViewport | null;
+  scrollBy: (deltaX: number, deltaY: number) => boolean;
+};
 
 type DataGridBatchActionsContext = Record<string, any> & {
   CELL_SELECTION_DRAG_THRESHOLD_PX: number;
@@ -25,8 +52,10 @@ type DataGridBatchActionsContext = Record<string, any> & {
     rowIndex: number;
     colIndex: number;
   } | null>;
+  cellSelectionAnchorSourceRef: React.MutableRefObject<'user' | 'page-find' | null>;
   cellEditModeRef: React.MutableRefObject<boolean>;
   cellSelectionAutoScrollRafRef: React.MutableRefObject<number | null>;
+  cellSelectionAutoScrollControllerRef?: React.MutableRefObject<CellSelectionAutoScrollController | null>;
   cellSelectionPointerRef: React.MutableRefObject<{ x: number; y: number } | null>;
   cellSelectionRafRef: React.MutableRefObject<number | null>;
   cellSelectionScrollRafRef: React.MutableRefObject<number | null>;
@@ -50,6 +79,7 @@ type DataGridBatchActionsContext = Record<string, any> & {
   setModifiedRows: React.Dispatch<React.SetStateAction<Record<string, any>>>;
   setSelectedCells: React.Dispatch<React.SetStateAction<Set<string>>>;
   markCellSelectionDeleteEligible: (eligible: boolean) => void;
+  markCellSelectionUserSelection: (active: boolean) => void;
   rowKeyStr: (key: React.Key) => string;
   resetCellSelection: (clearState?: boolean) => void;
   makeCellKey: (rowKey: string, colName: string) => string;
@@ -71,6 +101,7 @@ export const useDataGridBatchActions = (ctx: DataGridBatchActionsContext) => {
     cancelAnimationFrame,
     cellEditModeRef,
     cellSelectionAutoScrollRafRef,
+    cellSelectionAutoScrollControllerRef,
     cellSelectionPointerRef,
     cellSelectionRafRef,
     cellSelectionScrollRafRef,
@@ -99,6 +130,7 @@ export const useDataGridBatchActions = (ctx: DataGridBatchActionsContext) => {
     selectedCells,
     selectedRowKeysRef,
     selectionStartRef,
+    cellSelectionAnchorSourceRef,
     setAddedRows,
     setCellContextMenu,
     setCellEditMode,
@@ -107,6 +139,7 @@ export const useDataGridBatchActions = (ctx: DataGridBatchActionsContext) => {
     setModifiedRows,
     setSelectedCells,
     markCellSelectionDeleteEligible,
+    markCellSelectionUserSelection,
     splitCellKey,
     suppressCellSelectionClickRef,
     translateDataGrid,
@@ -205,8 +238,10 @@ const handleBatchFillCells = useCallback(() => {
     // 清除选中状态
     setSelectedCells(new Set());
     markCellSelectionDeleteEligible(false);
+    markCellSelectionUserSelection(false);
     currentSelectionRef.current = new Set();
     selectionStartRef.current = null;
+    cellSelectionAnchorSourceRef.current = null;
     isDraggingRef.current = false;
     cellSelectionPointerRef.current = null;
     if (cellSelectionAutoScrollRafRef.current !== null) {
@@ -214,7 +249,159 @@ const handleBatchFillCells = useCallback(() => {
       cellSelectionAutoScrollRafRef.current = null;
     }
     updateCellSelection(new Set());
-  }, [batchEditValue, batchEditSetNull, addedRows, modifiedRows, rowKeyStr, updateCellSelection, closeBatchEditModal, markCellSelectionDeleteEligible, translateDataGrid, canModifyData, effectiveEditLocator, isWritableResultColumn, splitCellKey]);
+  }, [batchEditValue, batchEditSetNull, addedRows, modifiedRows, rowKeyStr, updateCellSelection, closeBatchEditModal, markCellSelectionDeleteEligible, markCellSelectionUserSelection, translateDataGrid, canModifyData, effectiveEditLocator, isWritableResultColumn, splitCellKey]);
+
+  // Apply NULL to the active cell selection in one state transaction per store.
+  // The context-menu cell is only a fallback when there is no active selection
+  // (or when the user right-clicks outside the existing selection).
+  const handleSetNullForSelectedCells = useCallback((
+    fallbackCell?: { rowKey: React.Key; colName: string },
+  ) => {
+    if (!canModifyData) return;
+
+    const fallbackKey = fallbackCell?.colName
+      ? makeCellKey(rowKeyStr(fallbackCell.rowKey), fallbackCell.colName)
+      : null;
+    // Page Find and ordinary focus clicks also populate selectedCells, but they
+    // are not editable range selections. Only use the range for a batch NULL
+    // operation when it belongs to the current editable data source.
+    const selection = canUseCellSelectionAsFillTemplateTargets
+      ? (currentSelectionRef.current.size > 0 ? currentSelectionRef.current : selectedCells)
+      : new Set<string>();
+    const visibleSelection = filterDataGridCellSelectionToVisibleRows({
+      cellKeys: selection,
+      rows: displayDataRef.current,
+      rowKeyField: GONAVI_ROW_KEY,
+    });
+    const targetCells = visibleSelection.size > 0 && (!fallbackKey || visibleSelection.has(fallbackKey))
+      ? visibleSelection
+      : fallbackKey
+        ? new Set([fallbackKey])
+        : visibleSelection;
+
+    if (
+      fallbackCell
+      && (!fallbackKey || !visibleSelection.has(fallbackKey))
+      && !isWritableResultColumn(fallbackCell.colName, effectiveEditLocator)
+    ) {
+      void message.info(translateDataGrid('data_grid.message.current_field_not_editable'));
+      setCellContextMenu((prev: any) => ({ ...prev, visible: false }));
+      return;
+    }
+
+    if (targetCells.size === 0) {
+      void message.info(translateDataGrid('data_grid.message.select_cells_to_fill'));
+      setCellContextMenu((prev: any) => ({ ...prev, visible: false }));
+      return;
+    }
+
+    const addedRowMap = new Map<string, any>();
+    addedRows.forEach((row) => {
+      const key = row?.[GONAVI_ROW_KEY];
+      if (key === undefined || key === null) return;
+      addedRowMap.set(rowKeyStr(key), row);
+    });
+
+    const baseRowMap = new Map<string, any>();
+    displayDataRef.current.forEach((row) => {
+      const key = row?.[GONAVI_ROW_KEY];
+      if (key === undefined || key === null) return;
+      baseRowMap.set(rowKeyStr(key), row);
+    });
+
+    const patchesByRow = new Map<string, Record<string, any>>();
+    let updatedCount = 0;
+    Array.from(targetCells).forEach((cellKey) => {
+      const parts = splitCellKey(cellKey);
+      if (!parts || !isWritableResultColumn(parts.colName, effectiveEditLocator)) return;
+      const { rowKey, colName } = parts;
+      if (deletedRowKeys.has(rowKey)) return;
+      const addedRow = addedRowMap.get(rowKey);
+      const baseRow = baseRowMap.get(rowKey);
+      if (!addedRow && !baseRow) return;
+
+      const existing = modifiedRows[rowKey];
+      let currentValue: any;
+      if (addedRow) {
+        currentValue = addedRow[colName];
+      } else if (existing && Object.prototype.hasOwnProperty.call(existing as any, GONAVI_ROW_KEY)) {
+        currentValue = existing[colName];
+      } else if (existing && Object.prototype.hasOwnProperty.call(existing as any, colName)) {
+        currentValue = existing[colName];
+      } else {
+        currentValue = baseRow?.[colName];
+      }
+
+      if (isCellValueEqualForDiff(currentValue, null)) return;
+      const patch = patchesByRow.get(rowKey) || {};
+      patch[colName] = null;
+      patchesByRow.set(rowKey, patch);
+      updatedCount += 1;
+    });
+
+    if (updatedCount === 0) {
+      void message.info(translateDataGrid('data_grid.message.selected_cells_no_update'));
+      setCellContextMenu((prev: any) => ({ ...prev, visible: false }));
+      return;
+    }
+
+    setAddedRows((prev) => prev.map((row) => {
+      const key = row?.[GONAVI_ROW_KEY];
+      if (key === undefined || key === null) return row;
+      const patch = patchesByRow.get(rowKeyStr(key));
+      return patch ? { ...row, ...patch } : row;
+    }));
+
+    setModifiedRows((prev) => {
+      const next = { ...prev };
+      patchesByRow.forEach((patch, keyStr) => {
+        if (addedRowMap.has(keyStr)) return;
+
+        // Read the latest state inside the functional updater. A virtual-cell
+        // blur/save can be queued in the same React batch as this menu action;
+        // using the closure snapshot here would discard that other column.
+        const existing = prev[keyStr];
+        const merged = existing ? { ...(existing as any), ...patch } : { ...patch };
+        const baseRow = baseRowMap.get(keyStr);
+        const hasRowKey = Object.prototype.hasOwnProperty.call(merged, GONAVI_ROW_KEY);
+        const changedColumns = Object.keys(merged).filter((columnName) => (
+          columnName !== GONAVI_ROW_KEY
+          && isWritableResultColumn(columnName, effectiveEditLocator)
+          && !isCellValueEqualForDiff(baseRow?.[columnName], merged?.[columnName])
+        ));
+        if (changedColumns.length === 0) {
+          delete next[keyStr];
+          return;
+        }
+
+        next[keyStr] = hasRowKey
+          ? merged
+          : Object.fromEntries(changedColumns.map((columnName) => [columnName, merged[columnName]]));
+      });
+      return next;
+    });
+
+    setModifiedColumns((prev) => {
+      const next = { ...prev };
+      patchesByRow.forEach((patch, keyStr) => {
+        if (addedRowMap.has(keyStr)) return;
+
+        // Preserve columns that may have been marked by a concurrent edit and
+        // only adjust the cells this NULL action actually targets.
+        const columns = new Set(next[keyStr] || []);
+        const baseRow = baseRowMap.get(keyStr);
+        Object.keys(patch).forEach((columnName) => {
+          if (isCellValueEqualForDiff(baseRow?.[columnName], null)) columns.delete(columnName);
+          else columns.add(columnName);
+        });
+        if (columns.size > 0) next[keyStr] = columns;
+        else delete next[keyStr];
+      });
+      return next;
+    });
+
+    setCellContextMenu((prev: any) => ({ ...prev, visible: false }));
+  }, [GONAVI_ROW_KEY, addedRows, canModifyData, canUseCellSelectionAsFillTemplateTargets, currentSelectionRef, deletedRowKeys, displayDataRef, effectiveEditLocator, isCellValueEqualForDiff, isWritableResultColumn, makeCellKey, modifiedRows, rowKeyStr, selectedCells, setAddedRows, setCellContextMenu, setModifiedColumns, setModifiedRows, splitCellKey, translateDataGrid]);
 
   // 事件委托：在容器级别处理单元格拖选。可编辑结果会自动进入编辑模式，
   // 只读/聚合查询结果仅保留选区与复制能力，不触发任何数据修改入口。
@@ -222,9 +409,6 @@ const handleBatchFillCells = useCallback(() => {
     const container = containerRef.current;
     if (!isActive || !isTableSurfaceActive) return;
     if (!container) return;
-    const EDGE_THRESHOLD_PX = 28;
-    const MIN_SCROLL_STEP = 8;
-    const MAX_SCROLL_STEP = 24;
 
     const isInteractiveTarget = (target: HTMLElement | null): boolean => {
       if (!target) return false;
@@ -253,47 +437,57 @@ const handleBatchFillCells = useCallback(() => {
       return { rowKey, colName };
     };
 
-    const getCellInfoFromPoint = (x: number, y: number): { rowKey: string; colName: string } | null => {
-      const target = document.elementFromPoint(x, y) as HTMLElement | null;
-      return getCellInfo(target);
+    const getCellInfoFromPoint = (
+      x: number,
+      y: number,
+      fallbackRect?: Pick<DOMRect, 'top' | 'right' | 'bottom' | 'left'>,
+    ): { rowKey: string; colName: string } | null => {
+      const directCell = getCellInfo(document.elementFromPoint(x, y) as HTMLElement | null);
+      if (directCell || !fallbackRect) return directCell;
+
+      const clampToInterior = (value: number, start: number, end: number) => {
+        const inset = Math.min(1, Math.max(0, (end - start) / 2));
+        return Math.min(end - inset, Math.max(start + inset, value));
+      };
+      const fallbackX = clampToInterior(x, fallbackRect.left, fallbackRect.right);
+      const fallbackY = clampToInterior(y, fallbackRect.top, fallbackRect.bottom);
+      if (fallbackX === x && fallbackY === y) return null;
+
+      return getCellInfo(document.elementFromPoint(fallbackX, fallbackY) as HTMLElement | null);
     };
 
-    const applySelectionUpdate = (cellInfo: { rowKey: string; colName: string }) => {
+    const applySelectionUpdate = (cellInfo: { rowKey: string; colName: string }): boolean => {
       const start = selectionStartRef.current;
-      if (!start) return;
+      if (!start) return false;
 
       const currentData = displayDataRef.current;
-      const rowIndexMap = rowIndexMapRef.current;
-      const startRowIndex = start.rowIndex;
-      const endRowIndex = rowIndexMap.get(cellInfo.rowKey) ?? -1;
-      if (startRowIndex === -1 || endRowIndex === -1) return;
+      const startRowIndex = currentData.findIndex((row) => rowKeyStr(row?.[GONAVI_ROW_KEY]) === start.rowKey);
+      const endRowIndex = currentData.findIndex((row) => rowKeyStr(row?.[GONAVI_ROW_KEY]) === cellInfo.rowKey);
+      if (startRowIndex === -1 || endRowIndex === -1) return false;
 
-      const startColIndex = start.colIndex;
+      const startColIndex = columnIndexMap.get(start.colName) ?? -1;
       const endColIndex = columnIndexMap.get(cellInfo.colName) ?? -1;
-      if (startColIndex === -1 || endColIndex === -1) return;
+      if (startColIndex === -1 || endColIndex === -1) return false;
 
-      const minRowIndex = Math.min(startRowIndex, endRowIndex);
-      const maxRowIndex = Math.max(startRowIndex, endRowIndex);
-      const minColIndex = Math.min(startColIndex, endColIndex);
-      const maxColIndex = Math.max(startColIndex, endColIndex);
-
-      const newSelectedCells = new Set<string>();
-      for (let i = minRowIndex; i <= maxRowIndex; i++) {
-        const row = currentData[i];
-        const rKey = String(row?.[GONAVI_ROW_KEY]);
-        for (let j = minColIndex; j <= maxColIndex; j++) {
-          const colName = displayColumnNames[j];
-          if (!canSelectGridCellForClipboard({
-            canModifyData,
-            isDisplayedColumn: true,
-            isWritableColumn: isWritableResultColumn(colName, effectiveEditLocator),
-          })) continue;
-          newSelectedCells.add(makeCellKey(rKey, colName));
-        }
-      }
+      const newSelectedCells = buildDataGridCellSelectionRectangle({
+        startRowIndex,
+        startColIndex,
+        endRowIndex,
+        endColIndex,
+        rows: currentData,
+        columnNames: displayColumnNames,
+        rowKeyField: GONAVI_ROW_KEY,
+        canSelectColumn: (columnName) => canSelectGridCellForClipboard({
+          canModifyData,
+          isDisplayedColumn: true,
+          isWritableColumn: isWritableResultColumn(columnName, effectiveEditLocator),
+        }),
+      });
+      if (newSelectedCells.size === 0) return false;
 
       currentSelectionRef.current = newSelectedCells;
       updateCellSelection(newSelectedCells);
+      return true;
     };
 
     const scheduleSelectionUpdate = (cellInfo: { rowKey: string; colName: string }) => {
@@ -314,9 +508,32 @@ const handleBatchFillCells = useCallback(() => {
       }
     };
 
-    const getScrollStep = (distanceToEdge: number): number => {
-      const ratio = Math.min(1, Math.max(0, distanceToEdge / EDGE_THRESHOLD_PX));
-      return Math.round(MIN_SCROLL_STEP + (MAX_SCROLL_STEP - MIN_SCROLL_STEP) * ratio);
+    const getScrollViewport = (): {
+      viewport: CellSelectionAutoScrollViewport;
+      tableBody: HTMLElement | null;
+      controller: CellSelectionAutoScrollController | null;
+    } | null => {
+      const controller = cellSelectionAutoScrollControllerRef?.current || null;
+      const controlledViewport = controller?.getViewport() || null;
+      if (controlledViewport) {
+        return { viewport: controlledViewport, tableBody: null, controller };
+      }
+
+      const tableBody = container.querySelector('.ant-table-body') as HTMLElement | null;
+      if (!tableBody) return null;
+
+      const rect = tableBody.getBoundingClientRect();
+      return {
+        viewport: {
+          rect,
+          scrollTop: Number.isFinite(tableBody.scrollTop) ? tableBody.scrollTop : 0,
+          scrollLeft: Number.isFinite(tableBody.scrollLeft) ? tableBody.scrollLeft : 0,
+          maxScrollTop: Math.max(0, tableBody.scrollHeight - tableBody.clientHeight),
+          maxScrollLeft: Math.max(0, tableBody.scrollWidth - tableBody.clientWidth),
+        },
+        tableBody,
+        controller: null,
+      };
     };
 
     const autoScrollTick = () => {
@@ -326,53 +543,67 @@ const handleBatchFillCells = useCallback(() => {
       }
 
       const pointer = cellSelectionPointerRef.current;
-      const tableBody = container.querySelector('.ant-table-body') as HTMLElement | null;
-      if (!pointer || !tableBody) {
+      const scrollViewport = getScrollViewport();
+      if (!pointer || !scrollViewport) {
         cellSelectionAutoScrollRafRef.current = requestAnimationFrame(autoScrollTick);
         return;
       }
 
-      const rect = tableBody.getBoundingClientRect();
-      const maxScrollTop = Math.max(0, tableBody.scrollHeight - tableBody.clientHeight);
-      const maxScrollLeft = Math.max(0, tableBody.scrollWidth - tableBody.clientWidth);
+      const { viewport, tableBody, controller } = scrollViewport;
+      const { rect, scrollTop, scrollLeft, maxScrollTop, maxScrollLeft } = viewport;
+      const rectHeight = typeof rect.height === 'number' && Number.isFinite(rect.height)
+        ? rect.height
+        : rect.bottom - rect.top;
+      const rectWidth = typeof rect.width === 'number' && Number.isFinite(rect.width)
+        ? rect.width
+        : rect.right - rect.left;
+      const verticalEdgeThreshold = Math.min(
+        DATA_GRID_SELECTION_AUTO_SCROLL_EDGE_THRESHOLD_PX,
+        Math.max(0, rectHeight / 2),
+      );
+      const horizontalEdgeThreshold = Math.min(
+        DATA_GRID_SELECTION_AUTO_SCROLL_EDGE_THRESHOLD_PX,
+        Math.max(0, rectWidth / 2),
+      );
       let deltaY = 0;
       let deltaX = 0;
 
-      if (pointer.y < rect.top + EDGE_THRESHOLD_PX && tableBody.scrollTop > 0) {
-        const distance = rect.top + EDGE_THRESHOLD_PX - pointer.y;
-        deltaY = -getScrollStep(distance);
-      } else if (pointer.y > rect.bottom - EDGE_THRESHOLD_PX && tableBody.scrollTop < maxScrollTop) {
-        const distance = pointer.y - (rect.bottom - EDGE_THRESHOLD_PX);
-        deltaY = getScrollStep(distance);
+      if (pointer.y < rect.top + verticalEdgeThreshold) {
+        const distance = rect.top + verticalEdgeThreshold - pointer.y;
+        deltaY = -getDataGridSelectionAutoScrollStep(distance);
+      } else if (pointer.y > rect.bottom - verticalEdgeThreshold) {
+        const distance = pointer.y - (rect.bottom - verticalEdgeThreshold);
+        deltaY = getDataGridSelectionAutoScrollStep(distance);
       }
 
-      if (pointer.x < rect.left + EDGE_THRESHOLD_PX && tableBody.scrollLeft > 0) {
-        const distance = rect.left + EDGE_THRESHOLD_PX - pointer.x;
-        deltaX = -getScrollStep(distance);
-      } else if (pointer.x > rect.right - EDGE_THRESHOLD_PX && tableBody.scrollLeft < maxScrollLeft) {
-        const distance = pointer.x - (rect.right - EDGE_THRESHOLD_PX);
-        deltaX = getScrollStep(distance);
+      if (pointer.x < rect.left + horizontalEdgeThreshold) {
+        const distance = rect.left + horizontalEdgeThreshold - pointer.x;
+        deltaX = -getDataGridSelectionAutoScrollStep(distance);
+      } else if (pointer.x > rect.right - horizontalEdgeThreshold) {
+        const distance = pointer.x - (rect.right - horizontalEdgeThreshold);
+        deltaX = getDataGridSelectionAutoScrollStep(distance);
       }
 
       let didScroll = false;
-      if (deltaY !== 0) {
-        const nextTop = Math.max(0, Math.min(maxScrollTop, tableBody.scrollTop + deltaY));
-        if (nextTop !== tableBody.scrollTop) {
-          tableBody.scrollTop = nextTop;
+      const clampedDeltaY = clampDataGridSelectionAutoScrollDelta(deltaY, scrollTop, maxScrollTop);
+      const clampedDeltaX = clampDataGridSelectionAutoScrollDelta(deltaX, scrollLeft, maxScrollLeft);
+      if (controller) {
+        if (clampedDeltaX !== 0 || clampedDeltaY !== 0) {
+          didScroll = controller.scrollBy(clampedDeltaX, clampedDeltaY);
+        }
+      } else if (tableBody) {
+        if (clampedDeltaY !== 0) {
+          tableBody.scrollTop = scrollTop + clampedDeltaY;
           didScroll = true;
         }
-      }
-
-      if (deltaX !== 0) {
-        const nextLeft = Math.max(0, Math.min(maxScrollLeft, tableBody.scrollLeft + deltaX));
-        if (nextLeft !== tableBody.scrollLeft) {
-          tableBody.scrollLeft = nextLeft;
+        if (clampedDeltaX !== 0) {
+          tableBody.scrollLeft = scrollLeft + clampedDeltaX;
           didScroll = true;
         }
       }
 
       if (didScroll) {
-        const cellInfo = getCellInfoFromPoint(pointer.x, pointer.y);
+        const cellInfo = getCellInfoFromPoint(pointer.x, pointer.y, rect);
         if (cellInfo) scheduleSelectionUpdate(cellInfo);
       }
 
@@ -385,6 +616,7 @@ const handleBatchFillCells = useCallback(() => {
     };
 
     const beginCellSelection = (cellInfo: { rowKey: string; colName: string }, x: number, y: number) => {
+      markCellSelectionUserSelection(true);
       if (canModifyData && !cellEditModeRef.current) {
         cellEditModeRef.current = true;
         setCellEditMode(true);
@@ -407,6 +639,7 @@ const handleBatchFillCells = useCallback(() => {
       const startRowIndex = nextRowIndexMap.get(cellInfo.rowKey) ?? -1;
       const startColIndex = columnIndexMap.get(cellInfo.colName) ?? -1;
       selectionStartRef.current = { rowKey: cellInfo.rowKey, colName: cellInfo.colName, rowIndex: startRowIndex, colIndex: startColIndex };
+      cellSelectionAnchorSourceRef.current = 'user';
       currentSelectionRef.current = new Set([makeCellKey(cellInfo.rowKey, cellInfo.colName)]);
       updateCellSelection(currentSelectionRef.current);
       ensureAutoScroll();
@@ -425,9 +658,11 @@ const handleBatchFillCells = useCallback(() => {
         rowIndex,
         colIndex,
       };
+      cellSelectionAnchorSourceRef.current = 'user';
       currentSelectionRef.current = nextSelection;
       setSelectedCells(nextSelection);
       markCellSelectionDeleteEligible(false);
+      markCellSelectionUserSelection(false);
       updateCellSelection(nextSelection);
     };
 
@@ -507,6 +742,20 @@ const handleBatchFillCells = useCallback(() => {
       const cellInfo = getCellInfo(target);
       if (!cellInfo) return;
 
+      if (e.shiftKey && cellSelectionAnchorSourceRef.current === 'user' && selectionStartRef.current && applySelectionUpdate(cellInfo)) {
+        e.preventDefault();
+        pendingCellSelectionStartRef.current = null;
+        suppressCellSelectionClickRef.current = true;
+        if (canModifyData && !cellEditModeRef.current) {
+          cellEditModeRef.current = true;
+          setCellEditMode(true);
+        }
+        setSelectedCells(new Set(currentSelectionRef.current));
+        markCellSelectionDeleteEligible(canModifyData);
+        markCellSelectionUserSelection(true);
+        return;
+      }
+
       if (cellEditModeRef.current) {
         e.preventDefault();
         beginCellSelection(cellInfo, e.clientX, e.clientY);
@@ -537,7 +786,12 @@ const handleBatchFillCells = useCallback(() => {
       ensureAutoScroll();
 
       const target = e.target instanceof HTMLElement ? e.target : null;
-      const cellInfo = getCellInfo(target) || getCellInfoFromPoint(e.clientX, e.clientY);
+      const scrollViewport = getScrollViewport();
+      const cellInfo = getCellInfo(target) || getCellInfoFromPoint(
+        e.clientX,
+        e.clientY,
+        scrollViewport?.viewport.rect,
+      );
       if (!cellInfo) return;
       scheduleSelectionUpdate(cellInfo);
     };
@@ -561,12 +815,18 @@ const handleBatchFillCells = useCallback(() => {
       }
 
       const target = e.target instanceof HTMLElement ? e.target : null;
-      const cellInfo = getCellInfo(target) || getCellInfoFromPoint(e.clientX, e.clientY);
+      const scrollViewport = getScrollViewport();
+      const cellInfo = getCellInfo(target) || getCellInfoFromPoint(
+        e.clientX,
+        e.clientY,
+        scrollViewport?.viewport.rect,
+      );
       if (cellInfo) applySelectionUpdate(cellInfo);
 
       if (currentSelectionRef.current.size > 0) {
         setSelectedCells(new Set(currentSelectionRef.current));
         markCellSelectionDeleteEligible(canModifyData);
+        markCellSelectionUserSelection(true);
       }
     };
 
@@ -709,7 +969,7 @@ const handleBatchFillCells = useCallback(() => {
       cellSelectionPointerRef.current = null;
       isDraggingRef.current = false;
     };
-  }, [addedRows, canModifyData, deletedRowKeys, isActive, isTableSurfaceActive, displayColumnNames, columnIndexMap, effectiveEditLocator, isCellValueEqualForDiff, isWritableResultColumn, markCellSelectionDeleteEligible, modifiedRows, rowKeyStr, selectedCells, setAddedRows, setModifiedColumns, setModifiedRows, setSelectedCells, splitCellKey, translateDataGrid, updateCellSelection]);
+  }, [addedRows, canModifyData, deletedRowKeys, isActive, isTableSurfaceActive, displayColumnNames, columnIndexMap, effectiveEditLocator, isCellValueEqualForDiff, isWritableResultColumn, markCellSelectionDeleteEligible, markCellSelectionUserSelection, modifiedRows, rowKeyStr, selectedCells, setAddedRows, setModifiedColumns, setModifiedRows, setSelectedCells, splitCellKey, translateDataGrid, updateCellSelection]);
 
   const handleCopySelectedColumnsFromRow = useCallback(() => {
     const activeSelection = currentSelectionRef.current.size > 0 ? currentSelectionRef.current : selectedCells;
@@ -910,11 +1170,13 @@ const handleBatchFillCells = useCallback(() => {
       rowIndex: anchorRowIndex,
       colIndex,
     };
+    cellSelectionAnchorSourceRef.current = 'user';
     currentSelectionRef.current = nextSelection;
     setSelectedCells(nextSelection);
     markCellSelectionDeleteEligible(true);
+    markCellSelectionUserSelection(true);
     updateCellSelection(nextSelection);
-  }, [canModifyData, effectiveEditLocator, columnIndexMap, makeCellKey, markCellSelectionDeleteEligible, resetCellSelection, rowKeyStr, updateCellSelection]);
+  }, [canModifyData, effectiveEditLocator, columnIndexMap, makeCellKey, markCellSelectionDeleteEligible, markCellSelectionUserSelection, resetCellSelection, rowKeyStr, updateCellSelection]);
 
   // 批量填充到选中行
   const handleBatchFillToSelected = useCallback((sourceRecord: Item, dataIndex: string) => {
@@ -980,6 +1242,7 @@ const handleBatchFillCells = useCallback(() => {
 
   return {
     handleBatchFillCells,
+    handleSetNullForSelectedCells,
     handleCopySelectedColumnsFromRow,
     handlePasteCopiedColumnsToSelectedRows,
     handleBatchFillToSelected,

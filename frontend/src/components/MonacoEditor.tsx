@@ -27,6 +27,8 @@ const DEFAULT_FONT_SIZE = 14;
 const MIN_FONT_SIZE = 12;
 const MAX_FONT_SIZE = 20;
 const PRINTABLE_INPUT_FALLBACK_DELAY_MS = 80;
+const SHORTCUT_INPUT_GUARD_WINDOW_MS = 250;
+const NON_PRINTABLE_INPUT_PATTERN = /[\u0000-\u001f\u007f]/;
 let monacoConfiguredPromise: Promise<void> | null = null;
 let transparentThemesRegistered = false;
 
@@ -40,9 +42,6 @@ type MonacoWorkerFactory = () => Worker;
 interface MonacoWorkerFactories {
   editor: MonacoWorkerFactory;
   json: MonacoWorkerFactory;
-  css: MonacoWorkerFactory;
-  html: MonacoWorkerFactory;
-  typescript: MonacoWorkerFactory;
 }
 
 export const installMonacoWorkerEnvironment = (
@@ -53,9 +52,8 @@ export const installMonacoWorkerEnvironment = (
     ...(scope.MonacoEnvironment || {}),
     getWorker(_moduleId: string, label: string) {
       if (label === 'json') return workers.json();
-      if (label === 'css' || label === 'scss' || label === 'less') return workers.css();
-      if (label === 'html' || label === 'handlebars' || label === 'razor') return workers.html();
-      if (label === 'typescript' || label === 'javascript') return workers.typescript();
+      // css/html/typescript workers are intentionally not bundled: no editor
+      // instance uses those languages, so they fall back to the base worker.
       return workers.editor();
     },
   };
@@ -319,6 +317,9 @@ export const installPrintableInputFallback = (editor: any, monaco: any) => {
     text: string;
     timer: number | null;
   } | null = null;
+  let shortcutInputGuardKey = '';
+  let shortcutInputGuardUntil = 0;
+  let sqlInputFocused = true;
 
   const clearPendingInput = () => {
     if (!pendingInput) {
@@ -338,6 +339,88 @@ export const installPrintableInputFallback = (editor: any, monaco: any) => {
       clearTimeout(pendingSelectionInput.timer);
     }
     pendingSelectionInput = null;
+  };
+
+  const clearPendingInputs = () => {
+    clearPendingInput();
+    clearPendingSelectionInput();
+  };
+
+  const resolveKeyboardEvent = (rawEvent: any): any => (
+    rawEvent?.browserEvent || rawEvent?.event || rawEvent
+  );
+
+  const hasModifier = (event: any, modifier: 'Alt' | 'Control' | 'Meta') => {
+    const property = modifier === 'Control'
+      ? 'ctrlKey'
+      : modifier === 'Meta'
+        ? 'metaKey'
+        : 'altKey';
+    if (event?.[property] === true) {
+      return true;
+    }
+    try {
+      return event?.getModifierState?.(modifier) === true;
+    } catch {
+      return false;
+    }
+  };
+
+  const isAltGraphKeyEvent = (event: any): boolean => (
+    hasModifier(event, 'Control')
+    && hasModifier(event, 'Alt')
+    && !hasModifier(event, 'Meta')
+  );
+
+  const isModifierOnlyKey = (event: any): boolean => {
+    const key = String(event?.key || '').trim().toLowerCase();
+    const code = String(event?.code || '').trim().toLowerCase();
+    return key === 'control'
+      || key === 'ctrl'
+      || key === 'meta'
+      || key === 'command'
+      || key === 'os'
+      || key === 'shift'
+      || key === 'alt'
+      || code.startsWith('control')
+      || code.startsWith('meta')
+      || code.startsWith('shift')
+      || code.startsWith('alt');
+  };
+
+  const markShortcutKeyDown = (rawEvent: any) => {
+    const event = resolveKeyboardEvent(rawEvent);
+    if (!event || String(event.type || '').toLowerCase() === 'keyup') {
+      return;
+    }
+    const hasControlModifier = hasModifier(event, 'Control') || hasModifier(event, 'Meta');
+    if (!hasControlModifier || isAltGraphKeyEvent(event) || isModifierOnlyKey(event)) {
+      return;
+    }
+    shortcutInputGuardKey = String(event.key || '').trim().toLowerCase();
+    shortcutInputGuardUntil = Date.now() + SHORTCUT_INPUT_GUARD_WINDOW_MS;
+    clearPendingInputs();
+  };
+
+  const isShortcutInputEvent = (rawEvent: any, text: string): boolean => {
+    const event = resolveKeyboardEvent(rawEvent);
+    const hasControlModifier = hasModifier(event, 'Control') || hasModifier(event, 'Meta');
+    if (hasControlModifier && !isAltGraphKeyEvent(event)) {
+      return true;
+    }
+    if (shortcutInputGuardUntil <= Date.now()) {
+      shortcutInputGuardKey = '';
+      return false;
+    }
+    const normalizedText = String(text || '').toLowerCase();
+    const matchesShortcutKey = Boolean(
+      shortcutInputGuardKey
+      && normalizedText.length === 1
+      && normalizedText === shortcutInputGuardKey,
+    );
+    shortcutInputGuardKey = '';
+    shortcutInputGuardUntil = 0;
+    return matchesShortcutKey;
   };
 
   const getPendingNativeInputDelta = (pending: NonNullable<typeof pendingInput>) => {
@@ -560,13 +643,31 @@ export const installPrintableInputFallback = (editor: any, monaco: any) => {
     }
   };
 
+  const isFindWidgetFocused = (): boolean => {
+    const activeElement = editorDomNode?.ownerDocument?.activeElement
+      || (typeof document !== 'undefined' ? document.activeElement : null);
+    try {
+      return Boolean(activeElement?.closest?.(
+        '.find-widget, .monaco-inputbox, .find-part, .replace-part',
+      ));
+    } catch {
+      return false;
+    }
+  };
+
   const handleBeforeInput = (event: InputEvent) => {
     const text = String(event.data || '');
+    if (!sqlInputFocused || isFindWidgetFocused()) {
+      clearPendingInputs();
+      return;
+    }
     if (
       event.isComposing
       || event.inputType !== 'insertText'
       || !text
       || text.length > 8
+      || NON_PRINTABLE_INPUT_PATTERN.test(text)
+      || isShortcutInputEvent(event, text)
       || isReadOnly()
     ) {
       return;
@@ -622,7 +723,13 @@ export const installPrintableInputFallback = (editor: any, monaco: any) => {
         }
         pendingSelectionInput = null;
         const domNode = editor.getDomNode?.();
-        if (!(domNode instanceof HTMLElement) || !domNode.isConnected || isReadOnly()) {
+        if (
+          !(domNode instanceof HTMLElement)
+          || !domNode.isConnected
+          || isReadOnly()
+          || !sqlInputFocused
+          || isFindWidgetFocused()
+        ) {
           return;
         }
         if (document.activeElement && !domNode.contains(document.activeElement)) {
@@ -681,7 +788,13 @@ export const installPrintableInputFallback = (editor: any, monaco: any) => {
       }
       pendingInput = null;
       const domNode = editor.getDomNode?.();
-      if (!(domNode instanceof HTMLElement) || !domNode.isConnected || isReadOnly()) {
+      if (
+        !(domNode instanceof HTMLElement)
+        || !domNode.isConnected
+        || isReadOnly()
+        || !sqlInputFocused
+        || isFindWidgetFocused()
+      ) {
         return;
       }
       if (document.activeElement && !domNode.contains(document.activeElement)) {
@@ -700,7 +813,20 @@ export const installPrintableInputFallback = (editor: any, monaco: any) => {
     }, PRINTABLE_INPUT_FALLBACK_DELAY_MS);
   };
 
+  const handleInputBlur = () => {
+    // A shortcut can move focus to Monaco's find/replace widget while a fallback timer is pending.
+    // Never replay that stale input into the editor after the focus transition.
+    sqlInputFocused = false;
+    clearPendingInputs();
+  };
+  const handleInputFocus = () => {
+    sqlInputFocused = true;
+  };
+  input.addEventListener('keydown', markShortcutKeyDown, true);
   input.addEventListener('beforeinput', handleBeforeInput);
+  input.addEventListener('focus', handleInputFocus);
+  input.addEventListener('blur', handleInputBlur);
+  const keyDownDisposable = editor.onKeyDown?.(markShortcutKeyDown);
   const modelContentDisposable = editor.onDidChangeModelContent?.(() => {
     if (pendingInput && hasNativeInputApplied(pendingInput)) {
       clearPendingInput();
@@ -710,10 +836,13 @@ export const installPrintableInputFallback = (editor: any, monaco: any) => {
     }
   });
   editor.onDidDispose?.(() => {
-    clearPendingInput();
-    clearPendingSelectionInput();
+    clearPendingInputs();
+    keyDownDisposable?.dispose?.();
     modelContentDisposable?.dispose?.();
+    input.removeEventListener('keydown', markShortcutKeyDown, true);
     input.removeEventListener('beforeinput', handleBeforeInput);
+    input.removeEventListener('focus', handleInputFocus);
+    input.removeEventListener('blur', handleInputBlur);
   });
 };
 
@@ -771,20 +900,22 @@ const ensureMonacoConfigured = (): Promise<void> => {
   if (!monacoConfiguredPromise) {
     monacoConfiguredPromise = import('monaco-editor/esm/nls.messages.zh-cn')
       .then(() => Promise.all([
-        import('monaco-editor'),
+        import('monaco-editor/esm/vs/editor/editor.api.js'),
         import('monaco-editor/esm/vs/editor/editor.worker?worker'),
         import('monaco-editor/esm/vs/language/json/json.worker?worker'),
-        import('monaco-editor/esm/vs/language/css/css.worker?worker'),
-        import('monaco-editor/esm/vs/language/html/html.worker?worker'),
-        import('monaco-editor/esm/vs/language/typescript/ts.worker?worker'),
+        // 编辑器组件与内置语言高亮按需引入(纯副作用)。刻意不引整包
+        // monaco-editor:其 editor.main 附带 TS/CSS/HTML 语言服务及对应
+        // worker(约 8MB),而本应用只用 sql/mysql/redis/json 语言。
+        import('monaco-editor/esm/vs/editor/editor.all.js'),
+        import('monaco-editor/esm/vs/basic-languages/sql/sql.contribution.js'),
+        import('monaco-editor/esm/vs/basic-languages/mysql/mysql.contribution.js'),
+        import('monaco-editor/esm/vs/basic-languages/redis/redis.contribution.js'),
+        import('monaco-editor/esm/vs/language/json/monaco.contribution.js'),
       ]))
-      .then(([monaco, editorWorker, jsonWorker, cssWorker, htmlWorker, typescriptWorker]) => {
+      .then(([monaco, editorWorker, jsonWorker]) => {
         installMonacoWorkerEnvironment(globalThis as unknown as Record<string, any>, {
           editor: () => new editorWorker.default(),
           json: () => new jsonWorker.default(),
-          css: () => new cssWorker.default(),
-          html: () => new htmlWorker.default(),
-          typescript: () => new typescriptWorker.default(),
         });
         loader.config({ monaco });
       });
@@ -808,7 +939,6 @@ const MonacoEditor: React.FC<MonacoEditorProps> = ({
 }) => {
   const [ready, setReady] = useState(isTestRuntime);
   const appTheme = useStore((state) => state.theme);
-  const uiVersion = useStore((state) => state.appearance.uiVersion);
   const dataTableFontSize = useStore((state) => state.appearance.dataTableFontSize);
   const dataTableFontSizeFollowGlobal = useStore((state) => state.appearance.dataTableFontSizeFollowGlobal);
   const sqlEditorFontSize = useStore((state) => state.appearance.sqlEditorFontSize);
@@ -896,13 +1026,6 @@ const MonacoEditor: React.FC<MonacoEditorProps> = ({
   }, [onMount, replaceClipboardPasteHandler]);
 
   const resolvedOptions = useMemo(() => {
-    if (uiVersion !== 'v2') {
-      return {
-        ...options,
-        editContext: false,
-      };
-    }
-
     const effectiveGlobalFontSize = Math.min(
       MAX_FONT_SIZE,
       Math.max(MIN_FONT_SIZE, Math.round(Number(globalFontSize) || DEFAULT_FONT_SIZE)),
@@ -945,10 +1068,9 @@ const MonacoEditor: React.FC<MonacoEditorProps> = ({
     options,
     sqlEditorFontSize,
     sqlEditorFontSizeFollowGlobal,
-    uiVersion,
   ]);
 
-  const suggestionLayout = uiVersion === 'v2' && gonaviTypography === 'sql'
+  const suggestionLayout = gonaviTypography === 'sql'
     ? resolveSqlEditorSuggestionLayout(resolvedOptions.fontSize)
     : null;
 

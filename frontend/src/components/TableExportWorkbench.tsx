@@ -46,6 +46,7 @@ import {
   DATA_EXPORT_FORMAT_OPTIONS,
   DEFAULT_DATA_EXPORT_FORMAT,
   DEFAULT_XLSX_ROWS_PER_SHEET,
+  DataExportColumnSelect,
   MAX_XLSX_ROWS_PER_SHEET,
   resolveDataExportColumns,
   type DataExportFormat,
@@ -399,6 +400,10 @@ const TableExportWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
   const [databaseLoadError, setDatabaseLoadError] = useState('');
   const [objectLoadError, setObjectLoadError] = useState('');
   const [columnLoadError, setColumnLoadError] = useState('');
+  const [databaseReloadRevision, setDatabaseReloadRevision] = useState(0);
+  const [objectReloadRevision, setObjectReloadRevision] = useState(0);
+  const [columnReloadRevision, setColumnReloadRevision] = useState(0);
+  const successfulColumnRequestKeyRef = useRef('');
   const [destructiveOperation, setDestructiveOperation] = useState<BatchDestructiveOperation | null>(null);
   const [appliedLaunchKey, setAppliedLaunchKey] = useState(() => (
     String(tab.tableExportRequestKey || tab.tableExportLaunchKey || '').trim()
@@ -543,6 +548,7 @@ const TableExportWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
   useEffect(() => {
     const objectName = String(tab.tableName || '').trim();
     if (!isSingleWorkbench || !connectionConfig || !objectName) {
+      successfulColumnRequestKeyRef.current = '';
       setAvailableColumns([]);
       setSelectedColumns([]);
       setColumnLoadError('');
@@ -551,6 +557,12 @@ const TableExportWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
     }
 
     let alive = true;
+    const requestKey = [effectiveConnectionId, effectiveDbName, objectName].join('\u0000');
+    if (successfulColumnRequestKeyRef.current && successfulColumnRequestKeyRef.current !== requestKey) {
+      successfulColumnRequestKeyRef.current = '';
+      setAvailableColumns([]);
+      setSelectedColumns([]);
+    }
     setLoadingColumns(true);
     setColumnLoadError('');
     DBGetColumns(buildRpcConnectionConfig(connectionConfig) as any, effectiveDbName, objectName)
@@ -558,21 +570,28 @@ const TableExportWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
         if (!alive) return;
         if (!res.success) {
           setAvailableColumns([]);
-          setSelectedColumns([]);
           setColumnLoadError(res.message || t('data_export.message.load_columns_failed'));
           return;
         }
         const nextColumns = resolveTableExportColumnNames(res.data);
-        setAvailableColumns(nextColumns);
-        setSelectedColumns(nextColumns);
         if (nextColumns.length === 0) {
+          setAvailableColumns([]);
           setColumnLoadError(t('data_export.message.load_columns_failed'));
+          return;
         }
+        const availableNameSet = new Set(nextColumns);
+        const preserveExistingSelection = successfulColumnRequestKeyRef.current === requestKey;
+        setAvailableColumns(nextColumns);
+        setSelectedColumns((prev) => (
+          preserveExistingSelection
+            ? prev.filter((name) => availableNameSet.has(name))
+            : nextColumns
+        ));
+        successfulColumnRequestKeyRef.current = requestKey;
       })
       .catch((error: any) => {
         if (!alive) return;
         setAvailableColumns([]);
-        setSelectedColumns([]);
         setColumnLoadError(error?.message || t('data_export.message.load_columns_failed'));
       })
       .finally(() => {
@@ -582,7 +601,7 @@ const TableExportWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
     return () => {
       alive = false;
     };
-  }, [connectionConfig, effectiveDbName, isSingleWorkbench, tab.tableName]);
+  }, [columnReloadRevision, connectionConfig, effectiveConnectionId, effectiveDbName, isSingleWorkbench, tab.tableName]);
 
   useEffect(() => {
     if (!progressState.startedAt || progressState.finishedAt > 0) return undefined;
@@ -623,12 +642,6 @@ const TableExportWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
         if (!alive) return;
         if (!res.success) {
           setAvailableDatabases([]);
-          setSelectedDatabaseNames([]);
-          if (isBatchTablesWorkbench) {
-            setSelectedDbName('');
-            setAvailableObjects([]);
-            setSelectedObjectNames([]);
-          }
           setDatabaseLoadError(res.message || t('data_export.message.load_databases_failed'));
           return;
         }
@@ -654,12 +667,6 @@ const TableExportWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
       .catch((error: any) => {
         if (!alive) return;
         setAvailableDatabases([]);
-        setSelectedDatabaseNames([]);
-        if (isBatchTablesWorkbench) {
-          setSelectedDbName('');
-          setAvailableObjects([]);
-          setSelectedObjectNames([]);
-        }
         setDatabaseLoadError(error?.message || t('data_export.message.load_databases_failed'));
       })
       .finally(() => {
@@ -675,6 +682,7 @@ const TableExportWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
     connection?.includeDatabasePatterns,
     connection?.includeDatabases,
     connectionConfig,
+    databaseReloadRevision,
     isBatchDatabasesWorkbench,
     isBatchTablesWorkbench,
   ]);
@@ -699,7 +707,6 @@ const TableExportWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
         if (!alive) return;
         if (!res.success) {
           setAvailableObjects([]);
-          setSelectedObjectNames([]);
           setObjectLoadError(res.message || t('data_export.message.load_objects_failed'));
           return;
         }
@@ -719,7 +726,6 @@ const TableExportWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
       .catch((error: any) => {
         if (!alive) return;
         setAvailableObjects([]);
-        setSelectedObjectNames([]);
         setObjectLoadError(error?.message || t('data_export.message.load_objects_failed'));
       })
       .finally(() => {
@@ -730,7 +736,7 @@ const TableExportWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
     return () => {
       alive = false;
     };
-  }, [connection, connectionConfig, isBatchTablesWorkbench, selectedDbName]);
+  }, [connection, connectionConfig, isBatchTablesWorkbench, objectReloadRevision, selectedDbName]);
 
   const hostSummary = useMemo(
     () => resolveConnectionHostSummary(connection?.config),
@@ -889,9 +895,14 @@ const TableExportWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
     || destructiveOperation !== null
     || loadingDatabases
     || loadingObjects;
+  const hasBatchTableMetadataError = Boolean(databaseLoadError || objectLoadError);
+  const hasBatchDatabaseMetadataError = Boolean(databaseLoadError);
+  const hasBlockingMetadataError = (isSingleWorkbench && !!columnLoadError)
+    || (isBatchTablesWorkbench && hasBatchTableMetadataError)
+    || (isBatchDatabasesWorkbench && hasBatchDatabaseMetadataError);
 
   const canStart = useMemo(() => {
-    if (!connectionConfig || isConfigurationLocked) {
+    if (!connectionConfig || isConfigurationLocked || hasBlockingMetadataError) {
       return false;
     }
     if (isSingleWorkbench) {
@@ -914,6 +925,7 @@ const TableExportWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
     activeScopeQuery,
     connectionConfig,
     effectiveDbName,
+    hasBlockingMetadataError,
     isBatchTablesWorkbench,
     isDirectDatabaseWorkbench,
     isDirectSQLWorkbench,
@@ -955,6 +967,7 @@ const TableExportWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
       || !selectedDbName
       || !isDatabaseVisible(connection, selectedDbName)
       || selectedTableNames.length === 0
+      || hasBatchTableMetadataError
       || isConfigurationLocked
     ) return;
     if (action === 'truncate' && !supportsTableTruncateAction(connectionConfig.type, connectionConfig.driver)) {
@@ -1079,6 +1092,7 @@ const TableExportWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
       || !selectedDbName
       || !isDatabaseVisible(connection, selectedDbName)
       || selectedTableNames.length === 0
+      || hasBatchTableMetadataError
       || isConfigurationLocked
     ) return;
     const confirmed = await confirmDestructiveAction({
@@ -1158,6 +1172,7 @@ const TableExportWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
       || !connection
       || selectedDatabaseNames.length === 0
       || filterVisibleDatabaseNames(connection, selectedDatabaseNames).length !== selectedDatabaseNames.length
+      || hasBatchDatabaseMetadataError
       || isConfigurationLocked
     ) return;
     const confirmed = await confirmDestructiveAction({
@@ -1225,7 +1240,7 @@ const TableExportWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
   };
 
   const handleStartSingleExport = async () => {
-    if (!connectionConfig) {
+    if (!connectionConfig || !!columnLoadError || loadingColumns || selectedColumns.length === 0) {
       return;
     }
     const objectName = String(tab.tableName || '').trim();
@@ -1288,6 +1303,7 @@ const TableExportWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
       || selectedObjectNames.length === 0
       || loadingDatabases
       || loadingObjects
+      || hasBatchTableMetadataError
     ) {
       return;
     }
@@ -1323,6 +1339,7 @@ const TableExportWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
       || selectedDatabaseNames.length === 0
       || filterVisibleDatabaseNames(connection, selectedDatabaseNames).length !== selectedDatabaseNames.length
       || loadingDatabases
+      || hasBatchDatabaseMetadataError
     ) {
       return;
     }
@@ -1684,6 +1701,18 @@ const TableExportWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
               showIcon
               message={t('data_export.workbench.alert.database_load_failed')}
               description={databaseLoadError}
+              action={(
+                <Button
+                  size="small"
+                  icon={<ReloadOutlined />}
+                  data-export-retry-databases="true"
+                  disabled={isRunning || destructiveOperation !== null || loadingDatabases}
+                  loading={loadingDatabases}
+                  onClick={() => setDatabaseReloadRevision((current) => current + 1)}
+                >
+                  {t('common.retry')}
+                </Button>
+              )}
             />
           ) : null}
 
@@ -1693,6 +1722,18 @@ const TableExportWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
               showIcon
               message={t('data_export.workbench.alert.object_load_failed')}
               description={objectLoadError}
+              action={(
+                <Button
+                  size="small"
+                  icon={<ReloadOutlined />}
+                  data-export-retry-objects="true"
+                  disabled={isRunning || destructiveOperation !== null || loadingObjects}
+                  loading={loadingObjects}
+                  onClick={() => setObjectReloadRevision((current) => current + 1)}
+                >
+                  {t('common.retry')}
+                </Button>
+              )}
             />
           ) : null}
 
@@ -1702,6 +1743,18 @@ const TableExportWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
               showIcon
               message={t('data_export.dialog.field.columns')}
               description={columnLoadError}
+              action={(
+                <Button
+                  size="small"
+                  icon={<ReloadOutlined />}
+                  data-export-retry-columns="true"
+                  disabled={isRunning || loadingColumns}
+                  loading={loadingColumns}
+                  onClick={() => setColumnReloadRevision((current) => current + 1)}
+                >
+                  {t('common.retry')}
+                </Button>
+              )}
             />
           ) : null}
 
@@ -1760,14 +1813,11 @@ const TableExportWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
                 {format !== 'sql' || activeScopeQuery ? (
                   <div>
                     <div style={{ marginBottom: 6, fontSize: 12, color: secondaryTextColor }}>{t('data_export.dialog.field.columns')}</div>
-                    <Select
-                      style={{ width: '100%' }}
-                      mode="multiple"
+                    <DataExportColumnSelect
+                      availableColumns={availableColumns}
                       value={selectedColumns}
                       loading={loadingColumns}
                       disabled={isConfigurationLocked}
-                      options={availableColumns.map((column) => ({ value: column, label: column }))}
-                      maxTagCount="responsive"
                       onChange={(columns) => setSelectedColumns(
                         resolveDataExportColumns(columns, availableColumns) || [],
                       )}
@@ -2235,7 +2285,7 @@ const TableExportWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
                     size="large"
                     icon={<DeleteOutlined />}
                     data-batch-truncate-tables="true"
-                    disabled={connectionCapabilities.forceReadOnlyQueryResult || isConfigurationLocked || selectedTableNames.length === 0}
+                    disabled={connectionCapabilities.forceReadOnlyQueryResult || isConfigurationLocked || hasBatchTableMetadataError || selectedTableNames.length === 0}
                     loading={destructiveOperation === 'truncate-tables'}
                     onClick={() => { void handleTruncateSelectedTables(); }}
                     style={{ flex: 1 }}
@@ -2248,7 +2298,7 @@ const TableExportWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
                   size="large"
                   icon={<DeleteOutlined />}
                   data-batch-clear-tables="true"
-                  disabled={connectionCapabilities.forceReadOnlyQueryResult || isConfigurationLocked || selectedTableNames.length === 0}
+                  disabled={connectionCapabilities.forceReadOnlyQueryResult || isConfigurationLocked || hasBatchTableMetadataError || selectedTableNames.length === 0}
                   loading={destructiveOperation === 'clear-tables'}
                   onClick={() => { void handleClearSelectedTables(); }}
                   style={{ flex: 1 }}
@@ -2261,7 +2311,7 @@ const TableExportWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
                   size="large"
                   icon={<DeleteOutlined />}
                   data-batch-delete-tables="true"
-                  disabled={connectionCapabilities.forceReadOnlyStructureDesigner || isConfigurationLocked || selectedTableNames.length === 0}
+                  disabled={connectionCapabilities.forceReadOnlyStructureDesigner || isConfigurationLocked || hasBatchTableMetadataError || selectedTableNames.length === 0}
                   loading={destructiveOperation === 'delete-tables'}
                   onClick={() => { void handleDeleteSelectedTables(); }}
                   style={{ flex: 1 }}
@@ -2279,7 +2329,7 @@ const TableExportWorkbench: React.FC<{ tab: TabData }> = ({ tab }) => {
                   block
                   icon={<DeleteOutlined />}
                   data-batch-delete-databases="true"
-                  disabled={!connectionCapabilities.supportsDropDatabase || isConfigurationLocked || selectedDatabaseNames.length === 0}
+                  disabled={!connectionCapabilities.supportsDropDatabase || isConfigurationLocked || hasBatchDatabaseMetadataError || selectedDatabaseNames.length === 0}
                   loading={destructiveOperation === 'delete-databases'}
                   onClick={() => { void handleDeleteSelectedDatabases(); }}
                 >

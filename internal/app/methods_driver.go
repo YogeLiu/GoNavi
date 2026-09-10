@@ -220,6 +220,7 @@ type driverStatusItem struct {
 	NeedsUpdate         bool   `json:"needsUpdate,omitempty"`
 	UpdateReason        string `json:"updateReason,omitempty"`
 	AffectedConnections int    `json:"affectedConnections,omitempty"`
+	ActiveConnections   int    `json:"activeConnections,omitempty"`
 	ReasonCode          string `json:"reasonCode,omitempty"`
 	Message             string `json:"message,omitempty"`
 }
@@ -937,14 +938,8 @@ func (a *App) localizeDriverRuntimeReason(definition driverDefinition, reason st
 }
 
 func (a *App) localizedDriverNeedsUpdateTexts(actual string, expected string, affectedConnections int) (string, string) {
-	reasonParts := []string{a.appText("driver_manager.backend.status.needs_update", nil)}
-	if strings.TrimSpace(actual) != "" {
-		reasonParts = append(reasonParts, a.appText("driver_manager.backend.status.installed_revision", map[string]any{"revision": strings.TrimSpace(actual)}))
-	}
-	if strings.TrimSpace(expected) != "" {
-		reasonParts = append(reasonParts, a.appText("driver_manager.backend.status.expected_revision", map[string]any{"revision": strings.TrimSpace(expected)}))
-	}
-	reason := strings.Join(reasonParts, " ")
+	// revision 细节不再拼进用户可见的状态文案。
+	reason := a.appText("driver_manager.backend.status.needs_update", nil)
 	messageParts := []string{reason}
 	if affectedConnections > 0 {
 		messageParts = append(messageParts, a.appText("driver_manager.backend.status.affected_connections", map[string]any{"count": affectedConnections}))
@@ -1218,6 +1213,7 @@ func (a *App) GetDriverStatusList(downloadDir string, manifestURL string) connec
 	triggerDriverVersionMetadataWarmup(definitions)
 	packageSizeBytesMap := readCachedOptionalDriverPackageSizes(definitions)
 	usageCounts := a.savedConnectionDriverUsageCounts()
+	activeUsageCounts := a.activeConnectionDriverUsageCounts()
 	items := make([]driverStatusItem, 0, len(definitions))
 	for _, definition := range definitions {
 		engine := effectiveDriverEngine(definition)
@@ -1247,6 +1243,7 @@ func (a *App) GetDriverStatusList(downloadDir string, manifestURL string) connec
 			NeedsUpdate:         needsUpdate,
 			UpdateReason:        updateReason,
 			AffectedConnections: usageCounts[normalizeDriverType(definition.Type)],
+			ActiveConnections:   activeUsageCounts[normalizeDriverType(definition.Type)],
 		}
 		if !runtimeAvailable && db.IsOptionalGoDriver(definition.Type) && !db.IsOptionalGoDriverBuildIncluded(definition.Type) {
 			item.ReasonCode = driverStatusReasonSlimBuildMissingDriver
@@ -1446,6 +1443,9 @@ func (a *App) checkDriverNetworkStatusWithProbe(probe driverNetworkProbeFunc) co
 }
 
 func (a *App) InstallLocalDriverPackage(driverType string, filePath string, downloadDir string, version string) connection.QueryResult {
+	a.driverInstallMu.Lock()
+	defer a.driverInstallMu.Unlock()
+
 	definition, ok := resolveDriverDefinition(driverType)
 	if !ok {
 		return connection.QueryResult{Success: false, Message: a.appText("driver_manager.backend.error.unsupported_driver_type", nil)}
@@ -1475,7 +1475,7 @@ func (a *App) InstallLocalDriverPackage(driverType string, filePath string, down
 	if err := a.localizeDriverSelectionError(definition, validateDriverSelectedVersion(definition, selectedVersion)); err != nil {
 		return connection.QueryResult{Success: false, Message: err.Error()}
 	}
-	meta, installErr := installOptionalDriverAgentFromLocalPath(definition, filePath, resolvedDir, selectedVersion)
+	meta, installErr := installOptionalDriverAgentFromLocalPath(a, definition, filePath, resolvedDir, selectedVersion)
 	if installErr != nil {
 		errText := localizedDriverBackendErrorMessage(a, installErr)
 		a.emitDriverDownloadProgress(definition.Type, "error", 0, 0, errText)
@@ -1507,6 +1507,9 @@ func (a *App) InstallLocalDriverPackage(driverType string, filePath string, down
 }
 
 func (a *App) DownloadDriverPackage(driverType string, version string, downloadURL string, downloadDir string) connection.QueryResult {
+	a.driverInstallMu.Lock()
+	defer a.driverInstallMu.Unlock()
+
 	definition, ok := resolveDriverDefinition(driverType)
 	if !ok {
 		return connection.QueryResult{Success: false, Message: a.appText("driver_manager.backend.error.unsupported_driver_type", nil)}
@@ -1542,10 +1545,14 @@ func (a *App) DownloadDriverPackage(driverType string, version string, downloadU
 
 	if db.IsOptionalGoDriver(definition.Type) {
 		displayName := a.driverStatusDisplayName(definition)
-		a.emitDriverDownloadProgress(definition.Type, "start", 0, 100, a.appText("driver_manager.progress.agent_install_start", map[string]any{"name": displayName}))
+		startMessage := a.appText("driver_manager.progress.agent_install_start", map[string]any{"name": displayName})
+		if v := strings.TrimSpace(selectedVersion); v != "" {
+			startMessage = a.appText("driver_manager.progress.agent_install_start_with_version", map[string]any{"name": displayName, "version": v})
+		}
+		a.emitDriverDownloadProgress(definition.Type, "start", 0, 100, startMessage)
 		meta, installErr := installOptionalDriverAgentPackage(a, definition, selectedVersion, resolvedDir, urlText)
 		if installErr != nil {
-			errText := normalizeErrorMessage(installErr)
+			errText := normalizeMixedEncodingText(localizedDriverBackendErrorMessage(a, installErr))
 			a.emitDriverDownloadProgress(definition.Type, "error", 0, 0, errText)
 			return connection.QueryResult{
 				Success: false,
@@ -1603,6 +1610,9 @@ func (a *App) DownloadDriverPackage(driverType string, version string, downloadU
 }
 
 func (a *App) RemoveDriverPackage(driverType string, downloadDir string) connection.QueryResult {
+	a.driverInstallMu.Lock()
+	defer a.driverInstallMu.Unlock()
+
 	definition, ok := resolveDriverDefinition(driverType)
 	if !ok {
 		return connection.QueryResult{Success: false, Message: a.appText("driver_manager.backend.error.unsupported_driver_type", nil)}
@@ -1777,7 +1787,11 @@ func resolveDriverProbeDialAddress(rawURL string) (string, error) {
 		}
 	}
 
-	if proxyURL := resolveDriverProbeProxyURL(parsed); proxyURL != nil {
+	proxyURL, proxyErr := resolveDriverProbeProxyURL(parsed)
+	if proxyErr != nil {
+		return "", proxyErr
+	}
+	if proxyURL != nil {
 		proxyHost := strings.TrimSpace(proxyURL.Hostname())
 		if proxyHost == "" {
 			return net.JoinHostPort(targetHost, targetPort), nil
@@ -1792,25 +1806,21 @@ func resolveDriverProbeDialAddress(rawURL string) (string, error) {
 	return net.JoinHostPort(targetHost, targetPort), nil
 }
 
-func resolveDriverProbeProxyURL(target *url.URL) *url.URL {
+func resolveDriverProbeProxyURL(target *url.URL) (*url.URL, error) {
 	if target == nil {
-		return nil
+		return nil, nil
 	}
 
 	snapshot := currentGlobalProxyConfig()
 	if snapshot.Enabled {
 		proxyURL, err := buildProxyURLFromConfig(snapshot.Proxy)
 		if err == nil {
-			return proxyURL
+			return proxyURL, nil
 		}
 	}
 
 	req := &http.Request{URL: target}
-	proxyURL, err := http.ProxyFromEnvironment(req)
-	if err != nil {
-		return nil
-	}
-	return proxyURL
+	return defaultHTTPProxyFunc()(req)
 }
 
 func defaultPortForScheme(scheme string) string {
@@ -3602,17 +3612,48 @@ func restoreOptionalDriverInstallTargets(snapshots []optionalDriverInstallSnapsh
 	return errors.Join(restoreErrs...)
 }
 
-func promoteOptionalDriverAgentFromStaging(driverType string, stagingPath string, installPath string, runtimePath string, selectedVersion string) error {
+func localizeOptionalDriverActivateError(displayName string, activateErr error) error {
+	if activateErr == nil {
+		return nil
+	}
+	wrapped := wrapDriverInstallReplaceError(activateErr)
+	var localized *localizedDriverBackendError
+	if errors.As(wrapped, &localized) && localized != nil && strings.TrimSpace(localized.key) != "" {
+		return wrapped
+	}
+	name := strings.TrimSpace(displayName)
+	if name == "" {
+		name = "driver"
+	}
+	return newLocalizedDriverBackendError("driver_manager.backend.error.activate_agent_failed", map[string]any{"name": name}, wrapped)
+}
+
+func promoteOptionalDriverAgentFromStaging(a *App, driverType string, stagingPath string, installPath string, runtimePath string, selectedVersion string) error {
 	targetPaths := optionalDriverInstallTargetPaths(driverType, installPath, runtimePath)
 	snapshots, err := snapshotOptionalDriverInstallTargets(filepath.Dir(stagingPath), targetPaths)
 	if err != nil {
 		return err
 	}
+	if a != nil {
+		_, finish, prepareErr := a.beginOptionalDriverReplacement(driverType, targetPaths)
+		if prepareErr != nil {
+			return prepareErr
+		}
+		defer finish()
+	}
 	rollback := func(installErr error) error {
 		if restoreErr := restoreOptionalDriverInstallTargets(snapshots); restoreErr != nil {
-			return errors.Join(installErr, fmt.Errorf("restore previous driver installation: %w", restoreErr))
+			wrappedInstall := wrapDriverInstallReplaceError(installErr)
+			wrappedRestore := wrapDriverInstallReplaceError(restoreErr)
+			if isDriverInstallFileBusyError(wrappedInstall) || isDriverInstallFileBusyError(wrappedRestore) {
+				if isDriverInstallFileBusyError(wrappedInstall) {
+					return wrappedInstall
+				}
+				return wrappedRestore
+			}
+			return errors.Join(wrappedInstall, fmt.Errorf("restore previous driver installation: %w", wrappedRestore))
 		}
-		return installErr
+		return wrapDriverInstallReplaceError(installErr)
 	}
 
 	if err := activateOptionalDriverAgentBinary(driverType, stagingPath, installPath); err != nil {
@@ -3661,8 +3702,8 @@ func installOptionalDriverAgentPackage(a *App, definition driverDefinition, sele
 			return installedDriverPackage{}, newLocalizedDriverBackendError("driver_manager.backend.error.named_agent_hash_failed", map[string]any{"name": resolveDriverDisplayName(definition)}, err)
 		}
 	}
-	if activateErr := promoteOptionalDriverAgentFromStaging(driverType, stagingPath, installPath, runtimePath, selectedVersion); activateErr != nil {
-		return installedDriverPackage{}, fmt.Errorf("activate %s driver agent failed: %w", resolveDriverDisplayName(definition), activateErr)
+	if activateErr := promoteOptionalDriverAgentFromStaging(a, driverType, stagingPath, installPath, runtimePath, selectedVersion); activateErr != nil {
+		return installedDriverPackage{}, localizeOptionalDriverActivateError(resolveDriverDisplayName(definition), activateErr)
 	}
 	if strings.TrimSpace(downloadSource) == "" {
 		downloadSource = strings.TrimSpace(downloadURL)
@@ -3680,7 +3721,7 @@ func installOptionalDriverAgentPackage(a *App, definition driverDefinition, sele
 	}, nil
 }
 
-func installOptionalDriverAgentFromLocalPath(definition driverDefinition, filePath string, resolvedDir string, selectedVersion string) (installedDriverPackage, error) {
+func installOptionalDriverAgentFromLocalPath(a *App, definition driverDefinition, filePath string, resolvedDir string, selectedVersion string) (installedDriverPackage, error) {
 	driverType := normalizeDriverType(definition.Type)
 	displayName := resolveDriverDisplayName(definition)
 	pathText := strings.TrimSpace(filePath)
@@ -3757,8 +3798,8 @@ func installOptionalDriverAgentFromLocalPath(definition driverDefinition, filePa
 	if hashErr != nil {
 		return installedDriverPackage{}, newLocalizedDriverBackendError("driver_manager.backend.error.named_agent_hash_failed", map[string]any{"name": displayName}, hashErr)
 	}
-	if activateErr := promoteOptionalDriverAgentFromStaging(driverType, stagingPath, installPath, runtimePath, selectedVersion); activateErr != nil {
-		return installedDriverPackage{}, fmt.Errorf("activate %s driver agent failed: %w", displayName, activateErr)
+	if activateErr := promoteOptionalDriverAgentFromStaging(a, driverType, stagingPath, installPath, runtimePath, selectedVersion); activateErr != nil {
+		return installedDriverPackage{}, localizeOptionalDriverActivateError(displayName, activateErr)
 	}
 	return installedDriverPackage{
 		DriverType:     driverType,
@@ -4009,7 +4050,7 @@ func installOptionalDriverAgentFromLocalZip(zipPath string, definition driverDef
 	}
 	if err := os.Rename(tempPath, executablePath); err != nil {
 		_ = os.Remove(tempPath)
-		return "", newLocalizedDriverBackendError("driver_manager.backend.error.replace_agent_failed", nil, err)
+		return "", wrapDriverInstallReplaceErrorOr(err, "driver_manager.backend.error.replace_agent_failed")
 	}
 	if chmodErr := os.Chmod(executablePath, 0o755); chmodErr != nil && stdRuntime.GOOS != "windows" {
 		return "", newLocalizedDriverBackendError("driver_manager.backend.error.chmod_agent_failed", nil, chmodErr)
@@ -4100,9 +4141,16 @@ func buildOptionalDriverFallbackProgressMessage(text func(string, map[string]any
 	return localizedDriverProgressText(text, "driver_manager.progress.fallback.source_build", params)
 }
 
+var downloadOptionalDriverAgentBinaryForInstall = downloadOptionalDriverAgentBinaryWithMetadata
+
+var fetchMirrorDriverReleaseByTagForDriverDownload = fetchMirrorDriverReleaseByTag
+
 func ensureOptionalDriverAgentBinary(a *App, definition driverDefinition, executablePath string, downloadURL string, selectedVersion string) (string, string, error) {
 	driverType := normalizeDriverType(definition.Type)
 	displayName := resolveDriverDisplayName(definition)
+	if _, recognized, dispatcherErr := parseDownloadDispatcherAssetPath(downloadURL); recognized && dispatcherErr != nil {
+		return "", "", newLocalizedDriverBackendError("driver_manager.backend.error.download_failed", nil, dispatcherErr)
+	}
 	forceSourceBuild := shouldForceSourceBuildForResolvedDownload(driverType, selectedVersion, downloadURL)
 	buildType := ""
 	if a != nil {
@@ -4113,10 +4161,28 @@ func ensureOptionalDriverAgentBinary(a *App, definition driverDefinition, execut
 	skipReuseCandidate := shouldSkipReusableAgentCandidate(driverType, selectedVersion)
 	restrictToExplicitArtifact := shouldRestrictToExplicitVersionArtifact(definition, selectedVersion)
 	downloadURLs := []string{}
+	downloadCandidates := []optionalDriverDownloadCandidate{}
 	bundleURLs := []string{}
 	if !forceSourceBuild {
-		downloadURLs = resolveOptionalDriverAgentDownloadURLs(definition, downloadURL, selectedVersion)
+		rawDownloadURLs := resolveOptionalDriverAgentDownloadURLs(definition, downloadURL, selectedVersion)
+		var expandErr error
+		downloadCandidates, expandErr = expandOptionalDriverDownloadCandidates(rawDownloadURLs)
+		if expandErr != nil {
+			return "", "", newLocalizedDriverBackendError("driver_manager.backend.error.download_failed", nil, expandErr)
+		}
+		preferredSource := DownloadSourceCst
+		if a != nil {
+			preferredSource = a.preferredDownloadSource()
+		}
+		downloadCandidates = reorderOptionalDriverDownloadCandidates(downloadCandidates, preferredSource)
+		downloadURLs = make([]string, 0, len(downloadCandidates))
+		for _, candidate := range downloadCandidates {
+			downloadURLs = append(downloadURLs, candidate.URL)
+		}
 		if shouldUseOptionalDriverBundleFallback(driverType, restrictToExplicitArtifact, len(downloadURLs)) {
+			// Bundle candidates keep the Dispatcher URL first. The preferred source is
+			// applied inside its gated candidate resolution, while the direct GitHub
+			// URL remains the final fallback if the dispatcher is unavailable.
 			bundleURLs = resolveOptionalDriverBundleDownloadURLs()
 		}
 	}
@@ -4141,9 +4207,6 @@ func ensureOptionalDriverAgentBinary(a *App, definition driverDefinition, execut
 
 	if mkErr := os.MkdirAll(filepath.Dir(executablePath), 0o755); mkErr != nil {
 		return "", "", newLocalizedDriverBackendError("driver_manager.backend.error.create_named_directory_failed", map[string]any{"name": displayName}, mkErr)
-	}
-	if a != nil {
-		a.emitDriverDownloadProgress(driverType, "downloading", 10, 100, planMessage)
 	}
 	cleanupCandidate := func() {
 		_ = os.Remove(executablePath)
@@ -4209,13 +4272,13 @@ func ensureOptionalDriverAgentBinary(a *App, definition driverDefinition, execut
 	}
 
 	if !forceSourceBuild {
-		downloadURLs = keepOptionalDriverDownloadURLOrder(downloadURLs)
-		if len(downloadURLs) > 0 {
-			for _, candidateURL := range downloadURLs {
+		if len(downloadCandidates) > 0 {
+			for _, candidate := range downloadCandidates {
+				candidateURL := candidate.URL
 				if a != nil {
 					a.emitDriverDownloadProgress(driverType, "downloading", 20, 100, a.appText("driver_manager.progress.download_prebuilt_agent", map[string]any{"name": displayName}))
 				}
-				hash, dlErr := downloadOptionalDriverAgentBinary(a, definition, candidateURL, executablePath, selectedVersion)
+				hash, dlErr := downloadOptionalDriverAgentBinaryForInstall(a, definition, candidateURL, candidate.MetadataURL, executablePath, selectedVersion)
 				if dlErr == nil {
 					if revisionErr := validateCandidateRevision(); revisionErr != nil {
 						logger.Warnf("预编译 %s 驱动代理 revision 校验失败，url=%s err=%v", displayName, candidateURL, revisionErr)
@@ -4347,6 +4410,10 @@ func isOptionalDriverDownloadZipURL(urlText string) bool {
 }
 
 func downloadOptionalDriverAgentBinary(a *App, definition driverDefinition, urlText string, executablePath string, selectedVersion string) (string, error) {
+	return downloadOptionalDriverAgentBinaryWithMetadata(a, definition, urlText, urlText, executablePath, selectedVersion)
+}
+
+func downloadOptionalDriverAgentBinaryWithMetadata(a *App, definition driverDefinition, urlText string, metadataURL string, executablePath string, selectedVersion string) (string, error) {
 	driverType := normalizeDriverType(definition.Type)
 	displayName := resolveDriverDisplayName(definition)
 	trimmedURL := strings.TrimSpace(urlText)
@@ -4357,7 +4424,7 @@ func downloadOptionalDriverAgentBinary(a *App, definition driverDefinition, urlT
 		tempPath := executablePath + ".download.zip"
 		_ = os.Remove(tempPath)
 
-		downloadHash, err := downloadFileWithHash(trimmedURL, tempPath, func(downloaded, total int64) {
+		downloadHash, err := downloadFileWithHashPreferredForApp(a, trimmedURL, tempPath, func(downloaded, total int64) {
 			if a == nil {
 				return
 			}
@@ -4368,7 +4435,11 @@ func downloadOptionalDriverAgentBinary(a *App, definition driverDefinition, urlT
 			_ = os.Remove(tempPath)
 			return "", newLocalizedDriverBackendError("driver_manager.backend.error.download_failed", nil, err)
 		}
-		if expectedSize, expectedHash, ok := expectedDriverReleaseAssetMetadata(trimmedURL); ok {
+		metadataSource := strings.TrimSpace(metadataURL)
+		if metadataSource == "" {
+			metadataSource = trimmedURL
+		}
+		if expectedSize, expectedHash, ok := expectedDriverReleaseAssetMetadata(metadataSource); ok {
 			if metadataErr := validateDownloadedDriverAssetMetadata(tempPath, downloadHash, expectedSize, expectedHash); metadataErr != nil {
 				_ = os.Remove(tempPath)
 				return "", newLocalizedDriverBackendError(
@@ -4411,7 +4482,7 @@ func downloadOptionalDriverAgentBinary(a *App, definition driverDefinition, urlT
 	tempPath := executablePath + ".tmp"
 	_ = os.Remove(tempPath)
 
-	hash, err := downloadFileWithHash(trimmedURL, tempPath, func(downloaded, total int64) {
+	hash, err := downloadFileWithHashPreferredForApp(a, trimmedURL, tempPath, func(downloaded, total int64) {
 		if a == nil {
 			return
 		}
@@ -4429,7 +4500,7 @@ func downloadOptionalDriverAgentBinary(a *App, definition driverDefinition, urlT
 	}
 	if renameErr := os.Rename(tempPath, executablePath); renameErr != nil {
 		_ = os.Remove(tempPath)
-		return "", newLocalizedDriverBackendError("driver_manager.backend.error.replace_agent_failed", nil, renameErr)
+		return "", wrapDriverInstallReplaceErrorOr(renameErr, "driver_manager.backend.error.replace_agent_failed")
 	}
 	if chmodErr := os.Chmod(executablePath, 0o755); chmodErr != nil && stdRuntime.GOOS != "windows" {
 		return "", newLocalizedDriverBackendError("driver_manager.backend.error.chmod_agent_failed", nil, chmodErr)
@@ -4463,7 +4534,11 @@ func downloadOptionalDriverAgentFromBundle(a *App, definition driverDefinition, 
 		return "", "", newLocalizedDriverBackendError("driver_manager.backend.error.bundle_url_empty", nil, nil)
 	}
 
-	bundlePath, err := acquireOptionalDriverBundlePath(trimmedURL, func(downloaded, total int64) {
+	preferredSource := DownloadSourceCst
+	if a != nil {
+		preferredSource = a.preferredDownloadSource()
+	}
+	bundlePath, err := acquireOptionalDriverBundlePathPreferred(trimmedURL, func(downloaded, total int64) {
 		if a == nil {
 			return
 		}
@@ -4474,7 +4549,7 @@ func downloadOptionalDriverAgentFromBundle(a *App, definition driverDefinition, 
 			return
 		}
 		a.emitDriverDownloadProgress(driverType, "downloading", 20, 100, a.appText("driver_manager.progress.wait_bundle", map[string]any{"name": displayName}))
-	})
+	}, preferredSource)
 	if err != nil {
 		return "", "", newLocalizedDriverBackendError("driver_manager.backend.error.bundle_download_failed", nil, err)
 	}
@@ -4559,7 +4634,7 @@ func downloadOptionalDriverAgentFromBundle(a *App, definition driverDefinition, 
 	}
 	if err := os.Rename(tempPath, executablePath); err != nil {
 		_ = os.Remove(tempPath)
-		return "", "", newLocalizedDriverBackendError("driver_manager.backend.error.replace_agent_failed", nil, err)
+		return "", "", wrapDriverInstallReplaceErrorOr(err, "driver_manager.backend.error.replace_agent_failed")
 	}
 	if chmodErr := os.Chmod(executablePath, 0o755); chmodErr != nil && stdRuntime.GOOS != "windows" {
 		return "", "", newLocalizedDriverBackendError("driver_manager.backend.error.chmod_agent_failed", nil, chmodErr)

@@ -7,6 +7,8 @@ export type PaginationStateLike = {
   approximateTotal?: number;
   totalCountLoading?: boolean;
   totalCountCancelled?: boolean;
+  totalCountUnavailableLabel?: string;
+  totalCountUnavailableReason?: string;
 };
 
 export type PaginationI18nParams = Record<string, string | number | boolean | null | undefined>;
@@ -27,6 +29,7 @@ const resolveApproximateTotal = (pagination: PaginationStateLike): number | null
 
 const resolveCurrentCount = (pagination: PaginationStateLike): number => {
   const total = toFiniteNonNegativeNumber(pagination.total) ?? 0;
+  if (pagination.pageSize <= 0) return total;
   const rangeStart = Math.max(0, (pagination.current - 1) * pagination.pageSize + (total > 0 ? 1 : 0));
   const hasValidRange = total > 0 && rangeStart > 0;
   if (!hasValidRange) return 0;
@@ -44,6 +47,13 @@ export const resolvePaginationSummaryText = (params: {
   const currentCount = resolveCurrentCount(pagination);
   const total = toFiniteNonNegativeNumber(pagination.total) ?? 0;
   const approximateTotal = resolveApproximateTotal(pagination);
+
+  if (pagination.totalCountUnavailableLabel) {
+    return translate('data_grid.pagination.summary.total_unavailable', {
+      current: currentCount,
+      label: pagination.totalCountUnavailableLabel,
+    });
+  }
 
   if (pagination.totalKnown === false) {
     if (pagination.totalCountLoading) {
@@ -79,6 +89,10 @@ export const resolvePaginationPageText = (params: {
       : supportsApproximateTotalPages && approximateTotal !== null
         ? approximateTotal
         : 0;
+
+  if (pagination.pageSize <= 0) {
+    return translate('data_grid.pagination.page.known', { current: pagination.current, totalPages: 1 });
+  }
 
   if (effectiveTotal <= 0) return translate('data_grid.pagination.page.current', { current: pagination.current });
 

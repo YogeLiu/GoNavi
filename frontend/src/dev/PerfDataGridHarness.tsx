@@ -1,15 +1,15 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Alert, Button, Card, InputNumber, Segmented, Select, Space, Typography } from 'antd';
+import { Alert, Button, Card, InputNumber, Select, Space, Typography } from 'antd';
 
 import DataGrid, { GONAVI_ROW_KEY } from '../components/DataGrid';
 import { t } from '../i18n';
 import { useStore } from '../store';
+import type { SavedConnection } from '../types';
 import type { EditRowLocator } from '../utils/rowLocator';
 import type { DataTableDensity } from '../utils/dataGridDisplay';
 
 const { Text } = Typography;
 
-type HarnessUiVersion = 'legacy' | 'v2';
 type HarnessTheme = 'light' | 'dark';
 
 type HarnessRow = Record<string, any> & {
@@ -17,7 +17,6 @@ type HarnessRow = Record<string, any> & {
 };
 
 type HarnessRuntimeConfig = {
-  uiVersion: HarnessUiVersion;
   density: DataTableDensity;
   theme: HarnessTheme;
   uiScale: number;
@@ -25,6 +24,7 @@ type HarnessRuntimeConfig = {
 };
 
 type HarnessRestoreSnapshot = {
+  connections: SavedConnection[];
   appearance: ReturnType<typeof useStore.getState>['appearance'];
   theme: ReturnType<typeof useStore.getState>['theme'];
   uiScale: number;
@@ -35,19 +35,29 @@ type HarnessRestoreSnapshot = {
   rootVars: Record<string, string>;
 };
 
+const HARNESS_CONNECTION: SavedConnection = {
+  id: 'perf-conn',
+  name: 'Perf Data Grid',
+  config: {
+    id: 'perf-conn',
+    type: 'mysql',
+    host: '127.0.0.1',
+    port: 3306,
+    user: 'root',
+    database: 'perf_lab',
+  },
+};
+
 const hasHarnessAppearanceDrift = (
   appearance: ReturnType<typeof useStore.getState>['appearance'],
-  uiVersion: HarnessUiVersion,
   density: DataTableDensity,
 ): boolean => (
-  appearance.uiVersion !== uiVersion
-  || appearance.dataTableDensity !== density
+  appearance.dataTableDensity !== density
   || appearance.dataTableFontSize !== null
   || appearance.dataTableFontSizeFollowGlobal !== true
 );
 
 const DEFAULT_HARNESS_CONFIG: HarnessRuntimeConfig = {
-  uiVersion: 'legacy',
   density: 'comfortable',
   theme: 'light',
   uiScale: 1,
@@ -91,14 +101,12 @@ const readHarnessRuntimeConfig = (): HarnessRuntimeConfig => {
   }
   try {
     const searchParams = new URLSearchParams(window.location.search);
-    const uiVersion = searchParams.get('uiVersion') === 'v2' ? 'v2' : DEFAULT_HARNESS_CONFIG.uiVersion;
     const densityRaw = searchParams.get('density');
     const density: DataTableDensity = densityRaw === 'compact' || densityRaw === 'standard'
       ? densityRaw
       : DEFAULT_HARNESS_CONFIG.density;
     const theme = searchParams.get('theme') === 'dark' ? 'dark' : DEFAULT_HARNESS_CONFIG.theme;
     return {
-      uiVersion,
       density,
       theme,
       uiScale: clampHarnessUiScale(searchParams.get('uiScale')),
@@ -126,7 +134,8 @@ const buildHarnessColumns = (count: number): string[] => {
     if (index === 0) return 'id';
     if (index === 1) return 'created_at';
     if (index === 2) return 'updated_at';
-    if (index === 3) return 'status';
+    if (index === 3) return 'register_date';
+    if (index === 4) return 'status';
     return `col_${String(index + 1).padStart(2, '0')}`;
   });
 };
@@ -140,6 +149,7 @@ const buildHarnessData = (rowCount: number, columnNames: string[]): HarnessRow[]
       id: rowNumber,
       created_at: `2026-05-${String((rowNumber % 28) + 1).padStart(2, '0')} 09:${String(rowNumber % 60).padStart(2, '0')}:12`,
       updated_at: `2026-05-${String((rowNumber % 28) + 1).padStart(2, '0')} 18:${String((rowNumber * 3) % 60).padStart(2, '0')}:45`,
+      register_date: `2026-05-${String((rowNumber % 28) + 1).padStart(2, '0')} 09:10:11`,
       status: rowNumber % 3 === 0 ? 'active' : (rowNumber % 3 === 1 ? 'pending' : 'archived'),
     };
     columnNames.forEach((columnName, columnIndex) => {
@@ -179,7 +189,6 @@ const PerfDataGridHarness: React.FC = () => {
   const setFontSize = useStore((state) => state.setFontSize);
   const [rowCount, setRowCount] = useState(readHarnessRowCount);
   const [columnCount, setColumnCount] = useState(24);
-  const [uiVersion, setUiVersion] = useState<HarnessUiVersion>(initialConfig.uiVersion);
   const [density, setDensity] = useState<DataTableDensity>(initialConfig.density);
   const restoreSnapshotRef = useRef<HarnessRestoreSnapshot | null>(null);
 
@@ -193,6 +202,7 @@ const PerfDataGridHarness: React.FC = () => {
     if (restoreSnapshotRef.current) return;
     const currentState = useStore.getState();
     restoreSnapshotRef.current = {
+      connections: currentState.connections,
       appearance: { ...currentState.appearance },
       theme: currentState.theme,
       uiScale: currentState.uiScale,
@@ -204,10 +214,12 @@ const PerfDataGridHarness: React.FC = () => {
         DOCUMENT_ROOT_VAR_KEYS.map((key) => [key, document.documentElement.style.getPropertyValue(key)])
       ),
     };
+    currentState.replaceConnections([HARNESS_CONNECTION]);
 
     return () => {
       const snapshot = restoreSnapshotRef.current;
       if (!snapshot) return;
+      useStore.getState().replaceConnections(snapshot.connections);
       useStore.getState().setAppearance(snapshot.appearance);
       useStore.getState().setTheme(snapshot.theme);
       useStore.getState().setUiScale(snapshot.uiScale);
@@ -237,9 +249,8 @@ const PerfDataGridHarness: React.FC = () => {
 
   useEffect(() => {
     const currentState = useStore.getState();
-    if (hasHarnessAppearanceDrift(currentState.appearance, uiVersion, density)) {
+    if (hasHarnessAppearanceDrift(currentState.appearance, density)) {
       setAppearance({
-        uiVersion,
         dataTableDensity: density,
         dataTableFontSize: null,
         dataTableFontSizeFollowGlobal: true,
@@ -263,12 +274,11 @@ const PerfDataGridHarness: React.FC = () => {
     setFontSize,
     setTheme,
     setUiScale,
-    uiVersion,
   ]);
 
   useEffect(() => {
     document.body.setAttribute('data-theme', initialConfig.theme);
-    document.body.setAttribute('data-ui-version', uiVersion);
+    document.body.setAttribute('data-ui-version', 'v2');
     document.body.style.fontSize = `${effectiveFontSize}px`;
     document.documentElement.style.setProperty('--gonavi-font-size', `${effectiveFontSize}px`);
     document.documentElement.style.setProperty('--gn-ui-scale', `${effectiveUiScale}`);
@@ -278,7 +288,7 @@ const PerfDataGridHarness: React.FC = () => {
     document.documentElement.style.setProperty('--gn-font-size-mono', `${Math.max(10, Math.round(effectiveDataTableFontSize * 0.92))}px`);
     document.documentElement.style.setProperty('--gn-data-table-font-size', `${effectiveDataTableFontSize}px`);
     document.documentElement.style.setProperty('--gn-sidebar-tree-font-size', `${effectiveFontSize}px`);
-  }, [effectiveDataTableFontSize, effectiveFontSize, effectiveUiScale, initialConfig.theme, uiVersion]);
+  }, [effectiveDataTableFontSize, effectiveFontSize, effectiveUiScale, initialConfig.theme]);
 
   return (
     <div style={{ height: '100vh', overflow: 'hidden', background: '#0b1220', padding: 16, boxSizing: 'border-box' }}>
@@ -301,14 +311,6 @@ const PerfDataGridHarness: React.FC = () => {
       >
         <Space wrap align="center" size={12}>
           <Text strong>{t('dev.perf_data_grid.title')}</Text>
-          <Segmented
-            value={uiVersion}
-            onChange={(value) => setUiVersion(value as HarnessUiVersion)}
-            options={[
-              { label: t('dev.perf_data_grid.ui_version.legacy'), value: 'legacy' },
-              { label: t('dev.perf_data_grid.ui_version.v2'), value: 'v2' },
-            ]}
-          />
           <InputNumber
             min={0}
             max={50000}
@@ -348,9 +350,6 @@ const PerfDataGridHarness: React.FC = () => {
           showIcon
           message={t('dev.perf_data_grid.notice.message')}
           description={t('dev.perf_data_grid.notice.description', {
-            uiVersion: uiVersion === 'v2'
-              ? t('dev.perf_data_grid.ui_version.v2_short')
-              : t('dev.perf_data_grid.ui_version.legacy_short'),
             rows: data.length,
             columns: columnNames.length,
           })}

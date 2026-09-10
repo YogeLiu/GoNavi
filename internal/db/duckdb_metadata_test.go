@@ -240,6 +240,95 @@ func TestNormalizeDuckDBObjectPath_DoesNotTreatMainDatabaseAsExternalCatalog(t *
 	}
 }
 
+func TestNormalizeDuckDBObjectPath_TracksExplicitQualification(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		dbName    string
+		tableName string
+		explicit  bool
+	}{
+		{name: "plain table", tableName: "events", explicit: false},
+		{name: "schema argument", dbName: "main", tableName: "events", explicit: true},
+		{name: "qualified schema", tableName: "analytics.events", explicit: true},
+		{name: "catalog and schema", dbName: "analytics", tableName: "main.events", explicit: true},
+		{name: "quoted qualified name", tableName: `"analytics.schema"."daily.events"`, explicit: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			path := normalizeDuckDBObjectPath(tc.dbName, tc.tableName)
+			if path.ExplicitlyQualified != tc.explicit {
+				t.Fatalf("normalizeDuckDBObjectPath(%q, %q) explicit=%v, want %v: %+v", tc.dbName, tc.tableName, path.ExplicitlyQualified, tc.explicit, path)
+			}
+		})
+	}
+}
+
+func TestBuildDuckDBCreateStatementQueryCandidates_DoesNotDropExplicitSchema(t *testing.T) {
+	t.Parallel()
+
+	queries := buildDuckDBCreateStatementQueryCandidates(duckDBObjectPath{
+		Schema:              "missing",
+		Object:              "events",
+		ExplicitlyQualified: true,
+	})
+
+	if len(queries) != 2 {
+		t.Fatalf("explicit schema query count = %d, want 2: %#v", len(queries), queries)
+	}
+	if !duckDBTestContainsQuery(queries, "SELECT sql FROM duckdb_tables() WHERE table_name = 'events' AND schema_name = 'missing' LIMIT 1") {
+		t.Fatalf("explicit schema query missing: %#v", queries)
+	}
+	if !duckDBTestContainsQuery(queries, `SHOW CREATE TABLE "missing"."events"`) {
+		t.Fatalf("qualified SHOW CREATE query missing: %#v", queries)
+	}
+	if duckDBTestContainsQuery(queries, "SELECT sql FROM duckdb_tables() WHERE table_name = 'events' LIMIT 1") {
+		t.Fatalf("explicit schema unexpectedly falls back to an unqualified query: %#v", queries)
+	}
+}
+
+func TestBuildDuckDBCreateStatementQueryCandidates_DoesNotDropExplicitCatalog(t *testing.T) {
+	t.Parallel()
+
+	queries := buildDuckDBCreateStatementQueryCandidates(duckDBObjectPath{
+		Catalog:             "missing_catalog",
+		Schema:              "main",
+		Object:              "events",
+		ExplicitlyQualified: true,
+	})
+
+	if len(queries) != 2 {
+		t.Fatalf("explicit catalog query count = %d, want 2: %#v", len(queries), queries)
+	}
+	if !duckDBTestContainsQuery(queries, `SHOW CREATE TABLE "missing_catalog"."main"."events"`) {
+		t.Fatalf("qualified catalog SHOW CREATE query missing: %#v", queries)
+	}
+	if !duckDBTestContainsQuery(queries, "SELECT sql FROM duckdb_tables() WHERE table_name = 'events' AND schema_name = 'main' AND database_name = 'missing_catalog' LIMIT 1") {
+		t.Fatalf("explicit catalog metadata query missing: %#v", queries)
+	}
+	for _, query := range queries {
+		if query == "SELECT sql FROM duckdb_tables() WHERE table_name = 'events' LIMIT 1" || query == "SELECT sql FROM duckdb_tables() WHERE table_name = 'events' AND schema_name = 'main' LIMIT 1" || query == `SHOW CREATE TABLE "main"."events"` {
+			t.Fatalf("explicit catalog unexpectedly drops its catalog: %#v", queries)
+		}
+	}
+}
+
+func TestBuildDuckDBCreateStatementQueryCandidates_PreservesUnqualifiedCompatibility(t *testing.T) {
+	t.Parallel()
+
+	queries := buildDuckDBCreateStatementQueryCandidates(duckDBObjectPath{
+		Schema: "main",
+		Object: "events",
+	})
+
+	if !duckDBTestContainsQuery(queries, "SELECT sql FROM duckdb_tables() WHERE table_name = 'events' LIMIT 1") {
+		t.Fatalf("unqualified compatibility query missing: %#v", queries)
+	}
+}
+
 func TestParseDuckDBExpressionList_KeepsQuotedExpressionsIntact(t *testing.T) {
 	t.Parallel()
 
@@ -270,4 +359,45 @@ func containsAll(source string, needles ...string) bool {
 		}
 	}
 	return true
+}
+
+func duckDBTestContainsQuery(queries []string, target string) bool {
+	for _, query := range queries {
+		if query == target {
+			return true
+		}
+	}
+	return false
+}
+
+// TestBuildDuckDBColumnDefinitions_MarksSerialAutoIncrement 锁住 SERIAL 列的
+// 自增识别：DuckDB 的 serial 实际是整数列 + nextval 序列默认值，
+// information_schema 不回显 serial 类型名，只能从默认值识别。
+func TestBuildDuckDBColumnDefinitions_MarksSerialAutoIncrement(t *testing.T) {
+	t.Parallel()
+
+	columns := buildDuckDBColumnDefinitions(
+		[]map[string]interface{}{
+			{
+				"column_name":    "id",
+				"data_type":      "BIGINT",
+				"is_nullable":    "NO",
+				"column_default": "nextval('t_id_seq')",
+			},
+			{
+				"column_name":    "name",
+				"data_type":      "VARCHAR",
+				"is_nullable":    "YES",
+				"column_default": nil,
+			},
+		},
+		[]map[string]interface{}{},
+	)
+
+	if columns[0].Extra != "auto_increment" {
+		t.Fatalf("nextval 默认值未标记 auto_increment: %+v", columns[0])
+	}
+	if columns[1].Extra != "" {
+		t.Fatalf("普通列被误标记自增: %+v", columns[1])
+	}
 }

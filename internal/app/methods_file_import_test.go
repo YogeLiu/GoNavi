@@ -209,6 +209,20 @@ type issue1025CapturingImportDB struct {
 	batchChanges []connection.ChangeSet
 }
 
+type sameSessionImportMetadataDB struct {
+	issue1025CapturingImportDB
+	contextValue any
+	contextCalls int
+}
+
+func (database *sameSessionImportMetadataDB) GetColumnsContext(ctx context.Context, _, _ string) ([]connection.ColumnDefinition, error) {
+	database.contextCalls++
+	database.contextValue = ctx.Value(importMetadataContextKey{})
+	return append([]connection.ColumnDefinition(nil), database.columns...), ctx.Err()
+}
+
+type importMetadataContextKey struct{}
+
 func (database *issue1025CapturingImportDB) ApplyChanges(_ string, changes connection.ChangeSet) error {
 	database.batchChanges = append(database.batchChanges, changes)
 	return nil
@@ -221,7 +235,7 @@ func (database *issue1025CapturingImportDB) ApplyChangesContext(ctx context.Cont
 	return database.ApplyChanges(tableName, changes)
 }
 
-func TestIssue1025BlankNullableXLSXCellsBecomeSQLNull(t *testing.T) {
+func TestIssue1025BlankLikeNullableXLSXCellsBecomeSQLNull(t *testing.T) {
 	database := &issue1025CapturingImportDB{fakeMetadataRetryDB: fakeMetadataRetryDB{
 		columns: []connection.ColumnDefinition{
 			{Name: "id", Type: "bigint", Nullable: "NO"},
@@ -250,6 +264,10 @@ func TestIssue1025BlankNullableXLSXCellsBecomeSQLNull(t *testing.T) {
 		_ = file.Close()
 		t.Fatalf("write xlsx row: %v", err)
 	}
+	if err := writer.ConsumeRowValues([]interface{}{"2", " \t", "\u00a0", " \t"}); err != nil {
+		_ = file.Close()
+		t.Fatalf("write whitespace xlsx row: %v", err)
+	}
 	if err := writer.Close(); err != nil {
 		_ = file.Close()
 		t.Fatalf("close xlsx writer: %v", err)
@@ -272,18 +290,186 @@ func TestIssue1025BlankNullableXLSXCellsBecomeSQLNull(t *testing.T) {
 	if !result.Success {
 		t.Fatalf("blank nullable XLSX cells should import successfully: %#v", result)
 	}
+	if len(database.batchChanges) != 1 || len(database.batchChanges[0].Inserts) != 2 {
+		t.Fatalf("batch changes = %#v, want two inserted rows", database.batchChanges)
+	}
+	blankRow := database.batchChanges[0].Inserts[0]
+	if blankRow["id"] != "1" {
+		t.Fatalf("blank row id = %#v, want string 1", blankRow["id"])
+	}
+	if blankRow["payload"] != nil || blankRow["count"] != nil {
+		t.Fatalf("nullable blank cells = %#v, want NULL values", blankRow)
+	}
+	if blankRow["required_count"] != "" {
+		t.Fatalf("required blank cell = %#v, want empty string for database validation", blankRow["required_count"])
+	}
+	whitespaceRow := database.batchChanges[0].Inserts[1]
+	if whitespaceRow["id"] != "2" {
+		t.Fatalf("whitespace row id = %#v, want string 2", whitespaceRow["id"])
+	}
+	if whitespaceRow["payload"] != nil || whitespaceRow["count"] != nil {
+		t.Fatalf("nullable whitespace-only cells = %#v, want NULL values", whitespaceRow)
+	}
+	if whitespaceRow["required_count"] != " \t" {
+		t.Fatalf("required whitespace cell = %#v, want database validation input", whitespaceRow["required_count"])
+	}
+}
+
+func TestIssue1025ReimportEditedExportOmitsBlankDatabaseGeneratedColumns(t *testing.T) {
+	payloadDefault := "{}"
+	countDefault := "0"
+	database := &issue1025CapturingImportDB{fakeMetadataRetryDB: fakeMetadataRetryDB{
+		columns: []connection.ColumnDefinition{
+			{Name: "id", Type: "bigint", Nullable: "NO"},
+			{Name: "payload", Type: "json", Nullable: "NO", Default: &payloadDefault, HasDefault: true},
+			{Name: "count", Type: "int", Nullable: "NO", Default: &countDefault, HasDefault: true},
+			{Name: "note", Type: "varchar(64)", Nullable: "YES"},
+		},
+	}}
+	installImportTestDatabase(t, database)
+
+	path := filepath.Join(t.TempDir(), "exported-users.xlsx")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create exported xlsx: %v", err)
+	}
+	writer, err := newXLSXExportFileWriter(file, 0)
+	if err != nil {
+		_ = file.Close()
+		t.Fatalf("create xlsx writer: %v", err)
+	}
+	if err := writer.SetColumns([]string{"id", "payload", "count", "note"}); err != nil {
+		_ = file.Close()
+		t.Fatalf("set xlsx columns: %v", err)
+	}
+	if err := writer.ConsumeRowValues([]interface{}{"1", `{"source":"export"}`, "9", "old"}); err != nil {
+		_ = file.Close()
+		t.Fatalf("write exported xlsx row: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		_ = file.Close()
+		t.Fatalf("close xlsx writer: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close exported xlsx: %v", err)
+	}
+
+	workbook, err := excelize.OpenFile(path)
+	if err != nil {
+		t.Fatalf("open exported xlsx for editing: %v", err)
+	}
+	if err := workbook.RemoveRow("Sheet1", 2); err != nil {
+		_ = workbook.Close()
+		t.Fatalf("remove exported data row: %v", err)
+	}
+	if err := workbook.SetCellValue("Sheet1", "A2", "2"); err != nil {
+		_ = workbook.Close()
+		t.Fatalf("write required field: %v", err)
+	}
+	if err := workbook.Save(); err != nil {
+		_ = workbook.Close()
+		t.Fatalf("save edited xlsx: %v", err)
+	}
+	if err := workbook.Close(); err != nil {
+		t.Fatalf("close edited xlsx: %v", err)
+	}
+
+	app := newManagedImportTestApp(t)
+	continueOnError := false
+	result := app.ImportDataWithProgressOptions(
+		connection.ConnectionConfig{Type: "mysql", Host: "127.0.0.1", Port: 3306, Database: "app"},
+		"app",
+		"users",
+		path,
+		ImportFileOptions{
+			ContinueOnError: &continueOnError,
+			ColumnMappings: map[string]string{
+				"id": "id", "payload": "payload", "count": "count", "note": "note",
+			},
+		},
+	)
+	if !result.Success {
+		t.Fatalf("edited export should import using database defaults: %#v", result)
+	}
 	if len(database.batchChanges) != 1 || len(database.batchChanges[0].Inserts) != 1 {
 		t.Fatalf("batch changes = %#v, want one inserted row", database.batchChanges)
 	}
 	row := database.batchChanges[0].Inserts[0]
-	if row["id"] != "1" {
-		t.Fatalf("id = %#v, want string 1", row["id"])
+	if row["id"] != "2" {
+		t.Fatalf("required id = %#v, want 2", row["id"])
 	}
-	if row["payload"] != nil || row["count"] != nil {
-		t.Fatalf("nullable blank cells = %#v, want NULL values", row)
+	if _, exists := row["payload"]; exists {
+		t.Fatalf("blank defaulted JSON column must be omitted: %#v", row)
 	}
-	if row["required_count"] != "" {
-		t.Fatalf("required blank cell = %#v, want empty string for database validation", row["required_count"])
+	if _, exists := row["count"]; exists {
+		t.Fatalf("blank defaulted integer column must be omitted: %#v", row)
+	}
+	if row["note"] != nil {
+		t.Fatalf("blank nullable column = %#v, want NULL", row["note"])
+	}
+}
+
+func TestSQLiteMemoryImportReadsColumnsFromSameContextAwareInstance(t *testing.T) {
+	installFakeOptionalDriverRuntime(t)
+	database := &sameSessionImportMetadataDB{issue1025CapturingImportDB: issue1025CapturingImportDB{
+		fakeMetadataRetryDB: fakeMetadataRetryDB{
+			columns: []connection.ColumnDefinition{{Name: "id", Type: "integer", Nullable: "NO"}},
+		},
+	}}
+	installImportTestDatabase(t, database)
+	path := filepath.Join(t.TempDir(), "users.csv")
+	if err := os.WriteFile(path, []byte("id\n1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	application := newManagedImportTestApp(t)
+	ctx := context.WithValue(context.Background(), importMetadataContextKey{}, "request-1098")
+
+	result := application.importDataWithProgressContext(
+		ctx,
+		connection.ConnectionConfig{Type: "sqlite", Host: ":memory:"},
+		"",
+		"users",
+		path,
+		ImportFileOptions{ColumnMappings: map[string]string{"id": "id"}},
+	)
+	if !result.Success {
+		t.Fatalf("in-memory import failed: %#v", result)
+	}
+	if database.contextCalls != 1 || database.contextValue != "request-1098" {
+		t.Fatalf("same-session metadata context calls=%d value=%v", database.contextCalls, database.contextValue)
+	}
+	if database.connectCalls != 1 {
+		t.Fatalf("database connect calls = %d, want one shared in-memory instance", database.connectCalls)
+	}
+	if len(database.batchChanges) != 1 || len(database.batchChanges[0].Inserts) != 1 {
+		t.Fatalf("applied changes = %#v, want one row", database.batchChanges)
+	}
+}
+
+func TestDuckDBMemoryImportReadsColumnsFromSameContextAwareInstance(t *testing.T) {
+	database := &sameSessionImportMetadataDB{issue1025CapturingImportDB: issue1025CapturingImportDB{
+		fakeMetadataRetryDB: fakeMetadataRetryDB{
+			columns: []connection.ColumnDefinition{{Name: "id", Type: "integer", Nullable: "NO"}},
+		},
+	}}
+	application := NewAppWithSecretStore(newFakeAppSecretStore())
+	ctx := context.WithValue(context.Background(), importMetadataContextKey{}, "request-1098")
+
+	columns, err := application.importTargetColumnsContext(
+		ctx,
+		database,
+		connection.ConnectionConfig{Type: "duckdb", Host: ":memory:"},
+		"main",
+		"users",
+	)
+	if err != nil {
+		t.Fatalf("read in-memory DuckDB columns: %v", err)
+	}
+	if len(columns) != 1 || columns[0].Name != "id" {
+		t.Fatalf("columns = %#v, want id", columns)
+	}
+	if database.contextCalls != 1 || database.contextValue != "request-1098" {
+		t.Fatalf("same-session metadata context calls=%d value=%v", database.contextCalls, database.contextValue)
 	}
 }
 
@@ -614,23 +800,69 @@ func TestBuildImportInsertQueryConvertsEmptyNullableValuesToSQLNull(t *testing.T
 	query, err := buildImportInsertQuery(
 		"mysql",
 		"users",
-		[]string{"optional_json", "optional_count", "required_count"},
+		[]string{"optional_json", "optional_count", "optional_total", "required_count"},
 		map[string]interface{}{
 			"optional_json":  "",
-			"optional_count": "",
+			"optional_count": " \t",
+			"optional_total": "\u00a0",
 			"required_count": "",
 		},
 		newImportColumnTypeLookup([]connection.ColumnDefinition{
 			{Name: "optional_json", Type: "json", Nullable: "YES"},
 			{Name: "optional_count", Type: "int", Nullable: "YES"},
+			{Name: "optional_total", Type: "decimal(10,2)", Nullable: "YES"},
 			{Name: "required_count", Type: "int", Nullable: "NO"},
 		}),
 	)
 	if err != nil {
 		t.Fatalf("buildImportInsertQuery returned error: %v", err)
 	}
-	if !strings.Contains(query, "VALUES (NULL, NULL, '')") {
+	if !strings.Contains(query, "VALUES (NULL, NULL, NULL, '')") {
 		t.Fatalf("nullable empty values produced wrong SQL: %s", query)
+	}
+}
+
+func TestBuildImportInsertQueryOmitsBlankDatabaseGeneratedValues(t *testing.T) {
+	payloadDefault := "{}"
+	statusDefault := "pending"
+	query, err := buildImportInsertQuery(
+		"mysql",
+		"users",
+		[]string{"id", "payload", "sequence", "computed", "note", "required_count", "status"},
+		map[string]interface{}{
+			"id":             "2",
+			"payload":        "",
+			"sequence":       nil,
+			"computed":       " \t",
+			"note":           "",
+			"required_count": "7",
+			"status":         "ready",
+		},
+		newImportColumnTypeLookup([]connection.ColumnDefinition{
+			{Name: "id", Type: "bigint", Nullable: "NO"},
+			{Name: "payload", Type: "json", Nullable: "NO", Default: &payloadDefault, HasDefault: true},
+			{Name: "sequence", Type: "bigint", Nullable: "NO", Extra: "auto_increment"},
+			{Name: "computed", Type: "int", Nullable: "NO", Extra: "STORED GENERATED"},
+			{Name: "note", Type: "varchar(64)", Nullable: "YES"},
+			{Name: "required_count", Type: "int", Nullable: "NO"},
+			{Name: "status", Type: "varchar(16)", Nullable: "NO", Default: &statusDefault, HasDefault: true},
+		}),
+	)
+	if err != nil {
+		t.Fatalf("buildImportInsertQuery returned error: %v", err)
+	}
+	want := "INSERT INTO `users` (`id`, `note`, `required_count`, `status`) VALUES ('2', NULL, '7', 'ready')"
+	if query != want {
+		t.Fatalf("database-generated blank values query = %q, want %q", query, want)
+	}
+}
+
+func TestNormalizeImportValueForColumnPreservesContentAndRequiredWhitespace(t *testing.T) {
+	if got := normalizeImportValueForColumn(" 0 ", true); got != " 0 " {
+		t.Fatalf("nullable non-blank value = %#v, want original text", got)
+	}
+	if got := normalizeImportValueForColumn(" \t", false); got != " \t" {
+		t.Fatalf("required whitespace value = %#v, want database validation input", got)
 	}
 }
 

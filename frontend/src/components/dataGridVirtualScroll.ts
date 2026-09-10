@@ -105,10 +105,12 @@ export const calculateFixedVirtualRange = ({
       : 0;
   const clampedScrollTop = Math.max(0, Math.min(maxScrollTop, requestedScrollTop));
 
-  // rc-virtual-list keeps the item ending exactly at scrollTop in its range.
-  const start = Math.min(count - 1, Math.max(0, Math.ceil(clampedScrollTop / height) - 1));
-  // Keep the same additional cached row rendered by rc-virtual-list.
-  const end = Math.min(count - 1, Math.floor((clampedScrollTop + viewport) / height) + 1);
+  // Native scrolling can advance before React commits the next virtual
+  // window. Keep at least one viewport mounted on each side so a large wheel
+  // delta cannot expose the unmounted filler between two React frames.
+  const overscanRows = Math.max(6, Math.ceil(viewport / height));
+  const start = Math.min(count - 1, Math.max(0, Math.ceil(clampedScrollTop / height) - overscanRows));
+  const end = Math.min(count - 1, Math.floor((clampedScrollTop + viewport) / height) + overscanRows);
 
   return {
     scrollHeight,

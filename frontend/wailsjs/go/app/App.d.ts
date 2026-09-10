@@ -21,6 +21,8 @@ export function ApplySavedQueryDirectory(arg1:string):Promise<connection.QueryRe
 
 export function AuthorizeMCPConnectionSQL(arg1:connection.ConnectionConfig,arg2:string):Promise<void>;
 
+export function BootstrapConnectionSidebarLayout(arg1:connection.ConnectionSidebarLayoutInput):Promise<connection.ConnectionSidebarLayout>;
+
 export function BuildDatabaseDiagnosticPackage():Promise<connection.QueryResult>;
 
 export function BuildReproductionBundle(arg1:string,arg2:string):Promise<connection.QueryResult>;
@@ -36,6 +38,8 @@ export function CancelImportJob(arg1:string):Promise<connection.QueryResult>;
 export function CancelQuery(arg1:string):Promise<connection.QueryResult>;
 
 export function CancelSQLFileExecution(arg1:string):Promise<connection.QueryResult>;
+
+export function CancelSavedConnectionsHealthRun(arg1:string):Promise<connection.ConnectionHealthRun>;
 
 export function CheckDriverNetworkStatus():Promise<connection.QueryResult>;
 
@@ -120,6 +124,8 @@ export function DBGetViews(arg1:connection.ConnectionConfig,arg2:string):Promise
 export function DBGetViewsContext(arg1:context.Context,arg2:connection.ConnectionConfig,arg3:string):Promise<connection.QueryResult>;
 
 export function DBQuery(arg1:connection.ConnectionConfig,arg2:string,arg3:string):Promise<connection.QueryResult>;
+
+export function DBQueryApplicationWithCancel(arg1:connection.ConnectionConfig,arg2:string,arg3:string,arg4:string):Promise<connection.QueryResult>;
 
 export function DBQueryAI(arg1:connection.ConnectionConfig,arg2:string,arg3:string):Promise<connection.QueryResult>;
 
@@ -223,6 +229,10 @@ export function DataSyncSchedulePreview(arg1:syncjob.JobDefinition,arg2:number):
 
 export function DeleteConnection(arg1:string):Promise<void>;
 
+export function DeleteConnectionGroup(arg1:connection.DeleteConnectionGroupInput):Promise<void>;
+
+export function DeleteConnections(arg1:Array<string>):Promise<void>;
+
 export function DeleteImportJob(arg1:string):Promise<connection.QueryResult>;
 
 export function DeleteQuery(arg1:string):Promise<void>;
@@ -305,9 +315,13 @@ export function GenerateQueryID():Promise<string>;
 
 export function GetAppInfo():Promise<connection.QueryResult>;
 
+export function GetBrandIconDataURL(arg1:string):Promise<string>;
+
 export function GetDataRootDirectoryInfo():Promise<connection.QueryResult>;
 
 export function GetDatabaseDiagnosticPackagePreview():Promise<connection.QueryResult>;
+
+export function GetDownloadSourceConfig():Promise<app.DownloadSourceConfig>;
 
 export function GetDriverStatusList(arg1:string,arg2:string):Promise<connection.QueryResult>;
 
@@ -332,6 +346,8 @@ export function GetSQLAuditHealth():Promise<connection.QueryResult>;
 export function GetSQLAuditSettings():Promise<connection.QueryResult>;
 
 export function GetSavedConnections():Promise<Array<connection.SavedConnectionView>>;
+
+export function GetSavedConnectionsHealthRun(arg1:string):Promise<connection.ConnectionHealthRun>;
 
 export function GetSavedQueries():Promise<Array<connection.SavedQuery>>;
 
@@ -418,6 +434,8 @@ export function ListInstalledFontFamilies():Promise<connection.QueryResult>;
 export function ListReproductionBundleSources():Promise<connection.QueryResult>;
 
 export function ListSQLDirectory(arg1:string):Promise<connection.QueryResult>;
+
+export function LoadConnectionSidebarLayout():Promise<connection.ConnectionSidebarLayout>;
 
 export function LogWindowDiagnostic(arg1:string,arg2:string):Promise<void>;
 
@@ -643,6 +661,10 @@ export function SaveCloudBackupConfig(arg1:app.CloudBackupConfigInput):Promise<a
 
 export function SaveConnection(arg1:connection.SavedConnectionInput):Promise<connection.SavedConnectionView>;
 
+export function SaveConnectionSidebarLayout(arg1:connection.SaveConnectionSidebarLayoutInput):Promise<connection.SaveConnectionSidebarLayoutResult>;
+
+export function SaveDownloadSourceConfig(arg1:string):Promise<app.DownloadSourceConfig>;
+
 export function SaveGlobalProxy(arg1:connection.SaveGlobalProxyInput):Promise<connection.GlobalProxyView>;
 
 export function SaveQuery(arg1:connection.SavedQuery):Promise<connection.SavedQuery>;
@@ -681,11 +703,13 @@ export function SetMacNativeWindowControls(arg1:boolean):Promise<void>;
 
 export function SetUpdateChannel(arg1:string):Promise<connection.QueryResult>;
 
-export function SetWindowTranslucency(arg1:number,arg2:number):Promise<void>;
+export function SetWindowTranslucency(arg1:number,arg2:number,arg3:boolean):Promise<void>;
 
 export function Shutdown():Promise<void>;
 
 export function StartDriverPackageDownload(arg1:string,arg2:string,arg3:string,arg4:string):Promise<connection.QueryResult>;
+
+export function StartSavedConnectionsHealthRun(arg1:Array<string>):Promise<connection.ConnectionHealthRun>;
 
 export function StartSecurityUpdate(arg1:app.StartSecurityUpdateRequest):Promise<app.SecurityUpdateStatus>;
 

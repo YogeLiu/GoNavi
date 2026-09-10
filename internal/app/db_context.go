@@ -29,6 +29,9 @@ func normalizeRunConfig(config connection.ConnectionConfig, dbName string) conne
 		} else {
 			runConfig.Database = name
 		}
+	case "oracle":
+		// Oracle 的 Database 是 Service Name；所选 Schema 作为独立运行期上下文传给驱动。
+		runConfig = runConfig.WithRuntimeOracleCurrentSchema(name)
 	case "mysql", "mariadb", "goldendb", "greatdb", "gdb", "diros", "starrocks", "sphinx", "postgres", "kingbase", "highgo", "vastbase", "opengauss", "gaussdb", "sqlserver", "iris", "intersystems", "intersystemsiris", "inter-systems", "inter-systems-iris", "mongodb", "milvus", "milvusdb", "milvus-db", "tdengine", "iotdb", "clickhouse", "trino", "rabbitmq", "rabbit-mq", "rabbit_mq":
 		// 这些类型的 dbName 表示"数据库"，需要写入连接配置以选择目标库。
 		runConfig.Database = name
@@ -45,7 +48,6 @@ func normalizeRunConfig(config connection.ConnectionConfig, dbName string) conne
 			runConfig = runConfig.WithRuntimeDatabaseOverride(name)
 		}
 	default:
-		// oracle: dbName 表示 schema/owner，不能覆盖 config.Database（服务名）或 SID（SID 模式）
 		// sqlite: 无需设置 Database
 		// 其他 custom: 语义不明确，避免污染缓存 key
 	}
@@ -54,6 +56,10 @@ func normalizeRunConfig(config connection.ConnectionConfig, dbName string) conne
 }
 
 func normalizeMetadataRunConfig(config connection.ConnectionConfig, dbName string) connection.ConnectionConfig {
+	if strings.EqualFold(strings.TrimSpace(config.Type), "oracle") {
+		// Oracle 元数据 API 显式接收 owner，不需要为每个 owner 建立独立会话池。
+		return config.WithoutRuntimeOracleCurrentSchema()
+	}
 	if strings.EqualFold(strings.TrimSpace(config.Type), "oceanbase") && isOceanBaseOracleProtocol(config) {
 		return normalizeRunConfig(config, "")
 	}
@@ -142,6 +148,10 @@ func normalizeSchemaAndTable(config connection.ConnectionConfig, dbName string, 
 		return rawDB, rawTable
 	}
 
+	if dbType == "sqlite" {
+		return normalizeSQLiteSchemaAndTable(rawDB, rawTable)
+	}
+
 	if dbType == "kingbase" {
 		schema, table := db.SplitKingbaseQualifiedName(rawTable)
 		if schema != "" && table != "" {
@@ -153,7 +163,7 @@ func normalizeSchemaAndTable(config connection.ConnectionConfig, dbName string, 
 	}
 
 	if dbType == "iris" {
-		schema, table := db.SplitSQLQualifiedName(rawTable)
+		schema, table := db.SplitSQLQualifiedNameForDialect(rawTable, dbType)
 		if schema != "" && table != "" {
 			return schema, table
 		}
@@ -162,11 +172,30 @@ func normalizeSchemaAndTable(config connection.ConnectionConfig, dbName string, 
 		}
 	}
 
-	if parts := strings.SplitN(rawTable, ".", 2); len(parts) == 2 {
-		schema := strings.TrimSpace(parts[0])
-		table := strings.TrimSpace(parts[1])
+	// Keep quoted table delimiters for dialects whose metadata helpers parse
+	// the table argument again. Without this, `order.items` is mistaken for
+	// schema=order/table=items after the first normalization pass.
+	if shouldPreserveQuotedTableSegment(dbType) {
+		schema, table := db.SplitSQLQualifiedNamePreserveTableQuoteForDialect(rawTable, dbType)
 		if schema != "" && table != "" {
 			return schema, table
+		}
+		if table != "" {
+			return rawDB, table
+		}
+	} else if schema, table := db.SplitSQLQualifiedNameForDialect(rawTable, dbType); table != "" {
+		if schema != "" {
+			return schema, table
+		}
+		// The caller still needs the historical public fallback for PostgreSQL
+		// family connections, but the object part must be the logical value.
+		// Returning rawTable here leaks delimiters into later quoters and turns
+		// a name such as "order.items" into a triple-quoted identifier.
+		switch dbType {
+		case "postgres", "highgo", "vastbase", "opengauss", "gaussdb":
+			return "public", table
+		default:
+			return rawDB, table
 		}
 	}
 
@@ -180,6 +209,23 @@ func normalizeSchemaAndTable(config connection.ConnectionConfig, dbName string, 
 	}
 }
 
+func shouldPreserveQuotedTableSegment(dbType string) bool {
+	switch strings.ToLower(strings.TrimSpace(dbType)) {
+	case "mysql", "mariadb", "oceanbase", "diros", "starrocks", "sphinx", "tidb", "sqlite", "clickhouse", "tdengine":
+		return true
+	default:
+		return false
+	}
+}
+
+// normalizeSQLiteSchemaAndTable keeps the ambiguity between an attached
+// database qualifier and a literal dotted SQLite table name deterministic.
+// SQLite's catalog returns the latter without delimiters, so only an explicit
+// selected/known database prefix may be split.
+func normalizeSQLiteSchemaAndTable(dbName, tableName string) (string, string) {
+	return db.NormalizeSQLiteSchemaAndTable(dbName, tableName)
+}
+
 func normalizeMetadataSchemaAndTable(config connection.ConnectionConfig, dbName string, tableName string) (string, string) {
 	schema, table := normalizeSchemaAndTable(config, dbName, tableName)
 	switch resolveDDLDBType(config) {
@@ -190,7 +236,7 @@ func normalizeMetadataSchemaAndTable(config connection.ConnectionConfig, dbName 
 		if rawTable == "" {
 			return schema, table
 		}
-		parsedSchema, parsedTable := db.SplitSQLQualifiedName(rawTable)
+		parsedSchema, parsedTable := db.SplitSQLQualifiedNamePreserveTableQuoteForDialect(rawTable, resolveDDLDBType(config))
 		if parsedTable != "" {
 			if parsedSchema != "" {
 				return parsedSchema, parsedTable

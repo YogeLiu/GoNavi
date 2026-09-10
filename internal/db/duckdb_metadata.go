@@ -9,9 +9,10 @@ import (
 )
 
 type duckDBObjectPath struct {
-	Catalog string
-	Schema  string
-	Object  string
+	Catalog             string
+	Schema              string
+	Object              string
+	ExplicitlyQualified bool
 }
 
 func buildDuckDBConstraintMetadataQuery(path duckDBObjectPath, exact bool) string {
@@ -63,6 +64,38 @@ WHERE table_name = '%s'`
 	return fmt.Sprintf(base, args...)
 }
 
+func buildDuckDBCreateStatementQueryCandidates(path duckDBObjectPath) []string {
+	escapedTable := escapeDuckDBLiteral(path.Object)
+	escapedSchema := escapeDuckDBLiteral(path.Schema)
+	escapedCatalog := escapeDuckDBLiteral(path.Catalog)
+
+	queryCandidates := make([]string, 0, 3)
+	if path.Catalog != "" {
+		queryCandidates = append(queryCandidates,
+			fmt.Sprintf("SHOW CREATE TABLE %s.%s", quoteDuckDBIdentifier(path.Catalog), quoteDuckDBQualifiedTable(path.Schema, path.Object)),
+			fmt.Sprintf("SELECT sql FROM duckdb_tables() WHERE table_name = '%s' AND schema_name = '%s' AND database_name = '%s' LIMIT 1", escapedTable, escapedSchema, escapedCatalog),
+		)
+	} else {
+		queryCandidates = append(queryCandidates,
+			fmt.Sprintf("SELECT sql FROM duckdb_tables() WHERE table_name = '%s' AND schema_name = '%s' LIMIT 1", escapedTable, escapedSchema),
+		)
+	}
+
+	if !path.ExplicitlyQualified {
+		queryCandidates = append(queryCandidates,
+			fmt.Sprintf("SELECT sql FROM duckdb_tables() WHERE table_name = '%s' LIMIT 1", escapedTable),
+		)
+	}
+
+	if path.Catalog == "" {
+		queryCandidates = append(queryCandidates,
+			fmt.Sprintf("SHOW CREATE TABLE %s", quoteDuckDBQualifiedTable(path.Schema, path.Object)),
+		)
+	}
+
+	return queryCandidates
+}
+
 func buildDuckDBColumnDefinitions(rows []map[string]interface{}, constraintRows []map[string]interface{}) []connection.ColumnDefinition {
 	primaryKeyColumns := make(map[string]struct{})
 	uniqueColumns := make(map[string]struct{})
@@ -103,6 +136,12 @@ func buildDuckDBColumnDefinitions(rows []map[string]interface{}, constraintRows 
 		if defaultVal := strings.TrimSpace(duckDBRowString(row, "column_default")); defaultVal != "" && defaultVal != "<nil>" {
 			def := defaultVal
 			column.Default = &def
+			// DuckDB 的 SERIAL 类型实际是整数列 + nextval 序列默认值，
+			// information_schema 不回显 serial 类型名。与 pg_metadata 的
+			// nextval 处理保持一致，否则跨库迁移时自增语义在源侧就丢失。
+			if strings.HasPrefix(strings.ToLower(def), "nextval(") {
+				column.Extra = "auto_increment"
+			}
 		}
 		columns = append(columns, column)
 	}
@@ -156,6 +195,16 @@ func buildDuckDBIndexDefinitions(constraintRows []map[string]interface{}, indexR
 }
 
 func normalizeDuckDBObjectPath(dbName string, tableName string) duckDBObjectPath {
+	path := parseDuckDBObjectPath(dbName, tableName)
+	if strings.TrimSpace(tableName) == "" {
+		return path
+	}
+
+	path.ExplicitlyQualified = len(splitDuckDBQualifiedName(dbName)) > 0 || len(splitDuckDBQualifiedName(tableName)) > 1
+	return path
+}
+
+func parseDuckDBObjectPath(dbName string, tableName string) duckDBObjectPath {
 	rawDB := strings.TrimSpace(dbName)
 	rawTable := strings.TrimSpace(tableName)
 	if rawTable == "" {

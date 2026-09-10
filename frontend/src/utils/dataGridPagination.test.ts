@@ -79,6 +79,17 @@ describe('dataGridPagination', () => {
       supportsApproximateTableCount: false,
       translate: keyEchoTranslate,
     })).toBe('data_grid.pagination.summary.not_counted {"current":1}');
+
+    expect(resolvePaginationSummaryText({
+      pagination: {
+        ...pagination,
+        totalKnown: false,
+        totalCountUnavailableLabel: 'TAG total unavailable',
+      },
+      prefersManualTotalCount: true,
+      supportsApproximateTableCount: false,
+      translate: keyEchoTranslate,
+    })).toBe('data_grid.pagination.summary.total_unavailable {"current":1,"label":"TAG total unavailable"}');
   });
 
   it('resolves pagination page labels through catalog keys', () => {
@@ -99,6 +110,28 @@ describe('dataGridPagination', () => {
       supportsApproximateTotalPages: false,
       translate: keyEchoTranslate,
     })).toBe('data_grid.pagination.page.current {"current":2}');
+  });
+
+  it('treats an unlimited result page as one page containing the full known result', () => {
+    const pagination = {
+      current: 1,
+      pageSize: 0,
+      total: 3,
+      totalKnown: true,
+    };
+
+    expect(resolvePaginationSummaryText({
+      pagination,
+      prefersManualTotalCount: false,
+      supportsApproximateTableCount: false,
+      translate: keyEchoTranslate,
+    })).toBe('data_grid.pagination.summary.known {"current":3,"total":3}');
+
+    expect(resolvePaginationPageText({
+      pagination,
+      supportsApproximateTotalPages: true,
+      translate: keyEchoTranslate,
+    })).toBe('data_grid.pagination.page.known {"current":1,"totalPages":1}');
   });
 
   it('shows Oracle approximate total in summary but not in total-page chip', () => {

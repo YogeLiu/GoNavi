@@ -2,24 +2,24 @@ import Modal from './common/ResizableDraggableModal';
 // cspell:ignore anticon sqls uuidv uuidv4 hscroll
 import React, { useState, useEffect, useRef, useContext, useMemo, useCallback, useDeferredValue } from 'react';
 import { createPortal } from 'react-dom';
-import { Table, message, Input, Button, Dropdown, MenuProps, Form, Pagination, Select, Checkbox, Segmented, Tooltip, Popover, DatePicker, TimePicker } from 'antd';
+import { Table, message, Input, Button, Form, Pagination, Select, Checkbox, Segmented, Tooltip, Popover, DatePicker, TimePicker } from 'antd';
 import dayjs from 'dayjs';
 import type { SortOrder, ColumnType } from 'antd/es/table/interface';
 import type { Reference as TableReference } from 'rc-table';
-import { CloseOutlined, ConsoleSqlOutlined, CopyOutlined, EditOutlined, ExportOutlined, FileTextOutlined, LeftOutlined, RightOutlined, SearchOutlined, VerticalAlignBottomOutlined } from '@ant-design/icons';
-import { 
-    DndContext, 
-    DragEndEvent, 
-    PointerSensor, 
-    useSensor, 
-    useSensors, 
-    closestCenter 
+import { CloseOutlined, EditOutlined, LeftOutlined, RightOutlined, SearchOutlined, VerticalAlignBottomOutlined } from '@ant-design/icons';
+import {
+    DndContext,
+    DragEndEvent,
+    PointerSensor,
+    useSensor,
+    useSensors,
+    closestCenter
 } from '@dnd-kit/core';
-import { 
-    SortableContext, 
-    useSortable, 
-    horizontalListSortingStrategy, 
-    arrayMove 
+import {
+    SortableContext,
+    useSortable,
+    horizontalListSortingStrategy,
+    arrayMove
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import { ImportData, ExportDataWithOptions, ExportQueryWithOptions, ApplyChanges, PreviewChanges, DBGetColumns, DBGetIndexes, DBGetForeignKeys, DBShowCreateTable } from '../../wailsjs/go/app/App';
@@ -84,12 +84,13 @@ import {
 } from './dataGridColumnOrder';
 import {
     TEMPORAL_FORMATS,
-    formatFromDayjs,
     getTemporalPickerFormat,
     getTemporalPickerType,
     isTemporalColumnType,
     parseToDayjs,
     resolveTemporalEditorSaveValue,
+    isTemporalPickerPopupFocused,
+    TEMPORAL_PICKER_INTERACTION_DELAY_MS,
     type TemporalConnectionLike,
     type TemporalPickerType,
 } from './dataGridTemporal';
@@ -145,7 +146,6 @@ import DataGridResultViewSwitcher from './DataGridResultViewSwitcher';
 import DataGridSecondaryActions from './DataGridSecondaryActions';
 import DataGridToolbarFrame from './DataGridToolbarFrame';
 import DataGridModals from './DataGridModals';
-import DataGridLegacyCellContextMenu from './DataGridLegacyCellContextMenu';
 import DataGridPreviewPanel from './DataGridPreviewPanel';
 import {
     DEFAULT_DATA_EXPORT_FORMAT,
@@ -253,6 +253,42 @@ const splitCellKey = (cellKey: string): { rowKey: string; colName: string } | nu
         colName: cellKey.slice(sepIndex + CELL_KEY_SEP.length),
     };
 };
+const buildDataGridCellSelectionRectangle = ({
+    startRowIndex,
+    startColIndex,
+    endRowIndex,
+    endColIndex,
+    rows,
+    columnNames,
+    rowKeyField = GONAVI_ROW_KEY,
+    canSelectColumn = () => true,
+}: {
+    startRowIndex: number;
+    startColIndex: number;
+    endRowIndex: number;
+    endColIndex: number;
+    rows: Array<Record<string, any>>;
+    columnNames: string[];
+    rowKeyField?: string;
+    canSelectColumn?: (columnName: string) => boolean;
+}): Set<string> => {
+    const selectedCells = new Set<string>();
+    const minRowIndex = Math.min(startRowIndex, endRowIndex);
+    const maxRowIndex = Math.max(startRowIndex, endRowIndex);
+    const minColIndex = Math.min(startColIndex, endColIndex);
+    const maxColIndex = Math.max(startColIndex, endColIndex);
+
+    for (let rowIndex = minRowIndex; rowIndex <= maxRowIndex; rowIndex++) {
+        const rowKey = rows[rowIndex]?.[rowKeyField];
+        if (rowKey === undefined || rowKey === null) continue;
+        for (let colIndex = minColIndex; colIndex <= maxColIndex; colIndex++) {
+            const columnName = columnNames[colIndex];
+            if (!columnName || !canSelectColumn(columnName)) continue;
+            selectedCells.add(makeCellKey(String(rowKey), columnName));
+        }
+    }
+    return selectedCells;
+};
 const collectDataGridCellSelectionRowKeys = (cellKeys: Iterable<string>): string[] => {
     const rowKeys = new Set<string>();
     for (const cellKey of cellKeys) {
@@ -261,6 +297,88 @@ const collectDataGridCellSelectionRowKeys = (cellKeys: Iterable<string>): string
         rowKeys.add(parsed.rowKey);
     }
     return Array.from(rowKeys);
+};
+const filterDataGridCellSelectionToVisibleRows = ({
+    cellKeys,
+    rows,
+    rowKeyField = GONAVI_ROW_KEY,
+}: {
+    cellKeys: Iterable<string>;
+    rows: Iterable<Record<string, any>>;
+    rowKeyField?: string;
+}): Set<string> => {
+    const visibleRowKeys = new Set<string>();
+    for (const row of rows) {
+        const rowKey = row?.[rowKeyField];
+        if (rowKey === undefined || rowKey === null) continue;
+        visibleRowKeys.add(String(rowKey));
+    }
+
+    const visibleCells = new Set<string>();
+    for (const cellKey of cellKeys) {
+        const parsed = splitCellKey(cellKey);
+        if (parsed && visibleRowKeys.has(parsed.rowKey)) {
+            visibleCells.add(cellKey);
+        }
+    }
+    return visibleCells;
+};
+type DataGridCellSelectionAnchor = {
+    rowKey: string;
+    colName: string;
+    rowIndex: number;
+    colIndex: number;
+};
+const resolveDataGridCellSelectionAnchor = ({
+    cellKeys,
+    rows,
+    columnNames,
+    preferredAnchor,
+}: {
+    cellKeys: Iterable<string>;
+    rows: Iterable<Record<string, any>>;
+    columnNames: Iterable<string>;
+    preferredAnchor?: { rowKey: string; colName: string } | null;
+}): DataGridCellSelectionAnchor | null => {
+    const selectedCells = new Set(cellKeys);
+    if (selectedCells.size === 0) return null;
+
+    const rowList = Array.from(rows);
+    const columns = Array.from(columnNames, (columnName) => String(columnName));
+    const columnIndexMap = new Map<string, number>();
+    columns.forEach((columnName, index) => columnIndexMap.set(columnName, index));
+
+    const rowIndexMap = new Map<string, number>();
+    rowList.forEach((row, index) => {
+        const rowKey = row?.[GONAVI_ROW_KEY];
+        if (rowKey === undefined || rowKey === null) return;
+        rowIndexMap.set(String(rowKey), index);
+    });
+
+    const resolveCandidate = (rowKey: string, colName: string): DataGridCellSelectionAnchor | null => {
+        const rowIndex = rowIndexMap.get(rowKey);
+        const colIndex = columnIndexMap.get(colName);
+        if (rowIndex === undefined || colIndex === undefined) return null;
+        if (!selectedCells.has(makeCellKey(rowKey, colName))) return null;
+        return { rowKey, colName, rowIndex, colIndex };
+    };
+
+    if (preferredAnchor) {
+        const preferred = resolveCandidate(String(preferredAnchor.rowKey), String(preferredAnchor.colName));
+        if (preferred) return preferred;
+    }
+
+    for (const [rowIndex, row] of rowList.entries()) {
+        const rowKey = row?.[GONAVI_ROW_KEY];
+        if (rowKey === undefined || rowKey === null) continue;
+        const rowKeyText = String(rowKey);
+        for (const [colIndex, colName] of columns.entries()) {
+            if (selectedCells.has(makeCellKey(rowKeyText, colName))) {
+                return { rowKey: rowKeyText, colName, rowIndex, colIndex };
+            }
+        }
+    }
+    return null;
 };
 const collectDataGridFillTemplateTargetRowKeys = ({
     selectedRowKeys,
@@ -932,21 +1050,6 @@ const CellContextMenuContext = React.createContext<{
     showMenu: (e: React.MouseEvent, record: Item, dataIndex: string, title: React.ReactNode) => void;
     handleBatchFillToSelected: (record: Item, dataIndex: string) => void;
 } | null>(null);
-const DataContext = React.createContext<{
-    selectedRowKeysRef: React.MutableRefObject<React.Key[]>;
-    displayDataRef: React.MutableRefObject<any[]>;
-    handleCopyInsert: (r: any) => void;
-    handleCopyUpdate: (r: any) => void;
-    handleCopyDelete: (r: any) => void;
-    handleCopyJson: (r: any) => void;
-    handleCopyCsv: (r: any) => void;
-    handleExportSelected: (options: DataExportFileOptions, r: any) => Promise<void>;
-    copyToClipboard: (t: string | DataGridClipboardPayload) => void;
-    tableName?: string;
-    enableRowContextMenu: boolean;
-    supportsCopyInsert: boolean;
-} | null>(null);
-
 interface Item {
   [key: string]: any;
 }
@@ -1062,11 +1165,19 @@ const EditableCell: React.FC<EditableCellProps> = React.memo(({
   deletedRowKeys,
   ...restProps
 }) => {
-  const [editing, setEditing] = useState(false);
-  const inputRef = useRef<any>(null);
-  const cellRef = useRef<HTMLElement>(null);
-  const pickerOpenRef = useRef(false);
-  const scrollLockRef = useRef<{ el: HTMLElement; handler: (e: WheelEvent) => void } | null>(null);
+    const [editing, setEditing] = useState(false);
+    const editingSessionRef = useRef(0);
+    const editingRef = useRef(editing);
+    editingRef.current = editing;
+    const inputRef = useRef<any>(null);
+    const cellRef = useRef<HTMLElement>(null);
+    const pickerOpenRef = useRef(false);
+    const pickerInteractionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const pickerInteractionTokenRef = useRef(0);
+    const pickerPendingValueRef = useRef<dayjs.Dayjs | null | undefined>(undefined);
+    const pickerCommitSessionRef = useRef<number | null>(null);
+    const pickerSaveSessionRef = useRef<number | null>(null);
+    const scrollLockRef = useRef<{ el: HTMLElement; handler: (e: WheelEvent) => void } | null>(null);
   const form = useContext(EditableContext);
   const cellContextMenuContext = useContext(CellContextMenuContext);
   const i18nLanguage = useDataGridI18nLanguage();
@@ -1075,6 +1186,9 @@ const EditableCell: React.FC<EditableCellProps> = React.memo(({
   /** DatePicker 面板打开时锁定表格滚动，关闭时恢复 */
   const lockTableScroll = useCallback((lock: boolean) => {
       if (lock) {
+          if (scrollLockRef.current) {
+              return;
+          }
           // 查找虚拟滚动容器或常规滚动容器
           const tableWrapper = cellRef.current?.closest?.('.ant-table-wrapper') as HTMLElement | null;
           if (tableWrapper) {
@@ -1089,7 +1203,47 @@ const EditableCell: React.FC<EditableCellProps> = React.memo(({
       }
   }, []);
 
+  const cancelPickerInteraction = useCallback(() => {
+    if (pickerInteractionTimerRef.current !== null) {
+      clearTimeout(pickerInteractionTimerRef.current);
+      pickerInteractionTimerRef.current = null;
+    }
+    pickerInteractionTokenRef.current += 1;
+  }, []);
+
+  const closeEditing = useCallback((expectedSessionId?: number) => {
+    if (
+      expectedSessionId !== undefined
+      && editingSessionRef.current !== expectedSessionId
+    ) {
+      return false;
+    }
+    editingSessionRef.current += 1;
+    editingRef.current = false;
+    cancelPickerInteraction();
+    pickerOpenRef.current = false;
+    pickerPendingValueRef.current = undefined;
+    lockTableScroll(false);
+    setEditing(false);
+    return true;
+  }, [cancelPickerInteraction, lockTableScroll]);
+
+  const toggleEdit = useCallback(() => {
+    editingSessionRef.current += 1;
+    cancelPickerInteraction();
+    pickerOpenRef.current = false;
+    pickerPendingValueRef.current = undefined;
+    setEditing((current) => !current);
+  }, [cancelPickerInteraction]);
+
   useEffect(() => {
+    if (!editing) {
+      pickerOpenRef.current = false;
+      pickerPendingValueRef.current = undefined;
+      lockTableScroll(false);
+      return;
+    }
+    cancelPickerInteraction();
     if (editing) {
       // 每次进入编辑时强制设置表单值（覆盖 form store 中可能残留的旧值）
       const raw = record[dataIndex];
@@ -1103,22 +1257,37 @@ const EditableCell: React.FC<EditableCellProps> = React.memo(({
       }
       inputRef.current?.focus();
     }
-  }, [editing]);
+  }, [cancelPickerInteraction, editing, lockTableScroll]);
 
-  const toggleEdit = () => {
-    setEditing(!editing);
-  };
+  useEffect(() => () => {
+    editingSessionRef.current += 1;
+    cancelPickerInteraction();
+    pickerOpenRef.current = false;
+    pickerPendingValueRef.current = undefined;
+    pickerCommitSessionRef.current = null;
+    pickerSaveSessionRef.current = null;
+    lockTableScroll(false);
+  }, [cancelPickerInteraction, lockTableScroll]);
 
-  const save = async (pickerValue?: dayjs.Dayjs | null) => {
+  const save = async (
+    pickerValue?: dayjs.Dayjs | null,
+    expectedSessionId?: number,
+  ) => {
+    const saveSessionId = expectedSessionId ?? editingSessionRef.current;
     try {
-      if (!form || !editing) return;
+      if (!form || !editingRef.current || editingSessionRef.current !== saveSessionId) return;
+      if (pickerSaveSessionRef.current === saveSessionId) return;
+      pickerSaveSessionRef.current = saveSessionId;
+      cancelPickerInteraction();
+      pickerPendingValueRef.current = undefined;
       const fieldName = getCellFieldName(record, dataIndex);
       await form.validateFields([fieldName]);
+      if (!editingRef.current || editingSessionRef.current !== saveSessionId) return;
       let nextValue = form.getFieldValue(fieldName);
       if (isDateTimeField) {
-        nextValue = resolveTemporalEditorSaveValue(nextValue, pickerValue, pickerType);
+        nextValue = resolveTemporalEditorSaveValue(nextValue, pickerValue, pickerType, record?.[dataIndex]);
       }
-      toggleEdit();
+      closeEditing(saveSessionId);
       // 仅当值发生变化时才标记为修改，避免“双击-失焦”导致整行进入 modified 状态（蓝色高亮不清除）。
       if (!isCellValueEqualForDiff(record?.[dataIndex], nextValue)) {
         handleSave({ ...record, [dataIndex]: nextValue });
@@ -1130,7 +1299,17 @@ const EditableCell: React.FC<EditableCellProps> = React.memo(({
     } catch (errInfo) {
       console.log('Save failed:', errInfo);
       // 日期时间类型保存失败时兜底退出编辑，避免 DatePicker 卡在编辑态
-      if (isDateTimeField && editing) setEditing(false);
+      if (
+        isDateTimeField
+        && editingRef.current
+        && editingSessionRef.current === saveSessionId
+      ) {
+        closeEditing(saveSessionId);
+      }
+    } finally {
+      if (pickerSaveSessionRef.current === saveSessionId) {
+        pickerSaveSessionRef.current = null;
+      }
     }
   };
 
@@ -1146,6 +1325,55 @@ const EditableCell: React.FC<EditableCellProps> = React.memo(({
   const pickerType = getTemporalPickerType(columnType, dbType, connectionConfig);
   const isDateTimeField = !!pickerType && !(/^0{4}-0{2}-0{2}/.test(String(record?.[dataIndex] || '')));
 
+  const schedulePickerInteraction = (
+    action: 'save' | 'close',
+    pickerValue?: dayjs.Dayjs | null,
+    relatedTarget?: EventTarget | null,
+    expectedSessionId?: number,
+  ) => {
+    if (!isDateTimeField || !pickerType) return;
+    const sessionId = expectedSessionId ?? editingSessionRef.current;
+    if (!editingRef.current || editingSessionRef.current !== sessionId) return;
+    if (pickerInteractionTimerRef.current !== null) {
+      clearTimeout(pickerInteractionTimerRef.current);
+    }
+    const token = ++pickerInteractionTokenRef.current;
+    pickerInteractionTimerRef.current = setTimeout(() => {
+      pickerInteractionTimerRef.current = null;
+      if (
+        token !== pickerInteractionTokenRef.current
+        || editingSessionRef.current !== sessionId
+        || !editingRef.current
+        || pickerOpenRef.current
+        || pickerCommitSessionRef.current === sessionId
+        || isTemporalPickerPopupFocused(relatedTarget)
+      ) {
+        return;
+      }
+      if (action === 'save') {
+        const value = pickerValue !== undefined ? pickerValue : pickerPendingValueRef.current;
+        pickerPendingValueRef.current = undefined;
+        void save(value, sessionId);
+        return;
+      }
+      pickerPendingValueRef.current = undefined;
+      closeEditing(sessionId);
+    }, TEMPORAL_PICKER_INTERACTION_DELAY_MS);
+  };
+
+  const commitPickerValue = (value?: dayjs.Dayjs | null, expectedSessionId?: number) => {
+    const sessionId = expectedSessionId ?? editingSessionRef.current;
+    if (!editingRef.current || editingSessionRef.current !== sessionId) return;
+    pickerCommitSessionRef.current = sessionId;
+    cancelPickerInteraction();
+    pickerPendingValueRef.current = undefined;
+    void save(value, sessionId).finally(() => {
+      if (pickerCommitSessionRef.current === sessionId) {
+        pickerCommitSessionRef.current = null;
+      }
+    });
+  };
+
   const isRowDeleted = deletedRowKeys && rowKeyStr && record?.[GONAVI_ROW_KEY] !== undefined
     ? deletedRowKeys.has(rowKeyStr(record[GONAVI_ROW_KEY]))
     : false;
@@ -1153,6 +1381,7 @@ const EditableCell: React.FC<EditableCellProps> = React.memo(({
   const isModified = !editing && !isRowDeleted && modifiedColumns && rowKeyStr && record?.[GONAVI_ROW_KEY] !== undefined
     ? !!modifiedColumns[rowKeyStr(record[GONAVI_ROW_KEY])]?.has(dataIndex)
     : false;
+  const editingSessionId = editingSessionRef.current;
 
   if (editable) {
     childNode = editing ? (
@@ -1163,9 +1392,22 @@ const EditableCell: React.FC<EditableCellProps> = React.memo(({
               ref={inputRef}
               style={{ width: '100%' }}
               format={TEMPORAL_FORMATS[pickerType]}
-              onChange={(value) => setTimeout(() => { void save(value); }, 0)}
-              onOpenChange={lockTableScroll}
-              onBlur={() => setTimeout(() => { void save(); }, 0)}
+              onChange={(value) => {
+                if (editingSessionRef.current !== editingSessionId) return;
+                pickerPendingValueRef.current = value;
+                schedulePickerInteraction('save', value, undefined, editingSessionId);
+              }}
+              onOpenChange={(open) => {
+                if (editingSessionRef.current !== editingSessionId) return;
+                pickerOpenRef.current = open;
+                lockTableScroll(open);
+                if (open) {
+                  cancelPickerInteraction();
+                } else {
+                  schedulePickerInteraction('save', undefined, undefined, editingSessionId);
+                }
+              }}
+              onBlur={(event) => schedulePickerInteraction('save', undefined, event?.relatedTarget, editingSessionId)}
               needConfirm={false}
             />
           ) : pickerType === 'datetime' ? (
@@ -1178,7 +1420,9 @@ const EditableCell: React.FC<EditableCellProps> = React.memo(({
               renderExtraFooter={() => (
                 <a
                   style={{ padding: '0 2px' }}
+                  onMouseDown={(event) => event.preventDefault()}
                   onClick={() => {
+                    if (editingSessionRef.current !== editingSessionId) return;
                     // 自定义"此刻"：仅将当前时间填入表单字段，面板保持打开。
                     // 用户需点击"确定"才真正保存，替代内置 showNow 的自动提交行为。
                     const fieldName = getCellFieldName(record, dataIndex);
@@ -1186,18 +1430,22 @@ const EditableCell: React.FC<EditableCellProps> = React.memo(({
                   }}
                 >{dateTimePickerNowLabel}</a>
               )}
-              onOk={(value) => setTimeout(() => { void save((value as dayjs.Dayjs | null | undefined) ?? undefined); }, 0)}
+              onOk={(value) => commitPickerValue(
+                value as dayjs.Dayjs | null | undefined,
+                editingSessionId,
+              )}
               onOpenChange={(open) => {
+                if (editingSessionRef.current !== editingSessionId) return;
                 pickerOpenRef.current = open;
                 lockTableScroll(open);
-                // 面板关闭（点击外部）时退出编辑，不保存；仅"确定"按钮（onOk）触发保存
-                if (!open) setTimeout(() => { if (editing) toggleEdit(); }, 0);
+                // 面板关闭（点击外部）时延迟退出，给 Portal 面板重新获得焦点的机会。
+                if (open) {
+                  cancelPickerInteraction();
+                } else {
+                  schedulePickerInteraction('close', undefined, undefined, editingSessionId);
+                }
               }}
-              onBlur={() => {
-                // 兜底：面板未打开或已关闭时，点击外部通过 blur 退出编辑。
-                // 延迟检查面板状态，避免点击自定义"此刻"按钮时误退出（此时面板仍打开）。
-                setTimeout(() => { if (editing && !pickerOpenRef.current) setEditing(false); }, 150);
-              }}
+              onBlur={(event) => schedulePickerInteraction('close', undefined, event?.relatedTarget, editingSessionId)}
               needConfirm
             />
           ) : (
@@ -1206,9 +1454,22 @@ const EditableCell: React.FC<EditableCellProps> = React.memo(({
               style={{ width: '100%' }}
               format={TEMPORAL_FORMATS[pickerType]}
               picker={pickerType as any}
-              onChange={(value) => setTimeout(() => { void save(value); }, 0)}
-              onOpenChange={lockTableScroll}
-              onBlur={() => setTimeout(() => { void save(); }, 0)}
+              onChange={(value) => {
+                if (editingSessionRef.current !== editingSessionId) return;
+                pickerPendingValueRef.current = value;
+                schedulePickerInteraction('save', value, undefined, editingSessionId);
+              }}
+              onOpenChange={(open) => {
+                if (editingSessionRef.current !== editingSessionId) return;
+                pickerOpenRef.current = open;
+                lockTableScroll(open);
+                if (open) {
+                  cancelPickerInteraction();
+                } else {
+                  schedulePickerInteraction('save', undefined, undefined, editingSessionId);
+                }
+              }}
+              onBlur={(event) => schedulePickerInteraction('save', undefined, event?.relatedTarget, editingSessionId)}
               needConfirm={false}
             />
           )
@@ -1218,8 +1479,8 @@ const EditableCell: React.FC<EditableCellProps> = React.memo(({
             ref={inputRef}
             className="data-grid-inline-editor-input"
             style={{ width: '100%', ...inputCellPadding }}
-            onPressEnter={() => { void save(); }}
-            onBlur={() => { void save(); }}
+            onPressEnter={() => { void save(undefined, editingSessionId); }}
+            onBlur={() => { void save(undefined, editingSessionId); }}
             onFocus={(e) => {
               try {
                 (e.target as HTMLInputElement)?.select?.();
@@ -1287,96 +1548,6 @@ const EditableCell: React.FC<EditableCellProps> = React.memo(({
   );
 }, areEditableCellPropsEqual);
 
-const ContextMenuRow = React.memo(({ children, record, ...props }: any) => {
-    const context = useContext(DataContext);
-    
-    if (!record || !context) return <tr {...props}>{children}</tr>;
-
-    const {
-        selectedRowKeysRef,
-        displayDataRef,
-        handleCopyInsert,
-        handleCopyUpdate,
-        handleCopyDelete,
-        handleCopyJson,
-        handleCopyCsv,
-        handleExportSelected,
-        copyToClipboard,
-        enableRowContextMenu,
-        supportsCopyInsert,
-    } = context;
-
-    if (!enableRowContextMenu) {
-        return <tr {...props}>{children}</tr>;
-    }
-
-    const getTargets = () => {
-        const keys = selectedRowKeysRef.current;
-        const recordKey = record?.[GONAVI_ROW_KEY];
-        if (recordKey !== undefined && keys.includes(recordKey)) {
-            return displayDataRef.current.filter(d => keys.includes(d?.[GONAVI_ROW_KEY]));
-        }
-        return [record];
-    };
-
-    const menuItems: MenuProps['items'] = [
-        ...(supportsCopyInsert ? [{
-            key: 'insert',
-            label: t('data_grid.context_menu.copy_as_insert'),
-            icon: <ConsoleSqlOutlined />,
-            onClick: () => handleCopyInsert(record),
-        }, {
-            key: 'update',
-            label: t('data_grid.context_menu.copy_as_update'),
-            icon: <ConsoleSqlOutlined />,
-            onClick: () => handleCopyUpdate(record),
-        }, {
-            key: 'delete',
-            label: t('data_grid.context_menu.copy_as_delete'),
-            icon: <ConsoleSqlOutlined />,
-            onClick: () => handleCopyDelete(record),
-        }] : []),
-        { key: 'json', label: t('data_grid.context_menu.copy_as_json'), icon: <FileTextOutlined />, onClick: () => handleCopyJson(record) },
-        { key: 'csv', label: t('data_grid.context_menu.copy_as_csv'), icon: <FileTextOutlined />, onClick: () => handleCopyCsv(record) },
-        { key: 'copy', label: t('data_grid.context_menu.copy_as_markdown'), icon: <CopyOutlined />, onClick: () => {
-            const records = getTargets();
-            const orderedCols = displayDataRef.current.length > 0
-                ? Object.keys(displayDataRef.current[0]).filter(c => c !== GONAVI_ROW_KEY)
-                : [];
-            const header = `| ${orderedCols.join(' | ')} |`;
-            const separator = `| ${orderedCols.map(() => '---').join(' | ')} |`;
-            const rows = records.map((r: any) => {
-                const values = orderedCols.map(c => {
-                    const v = r[c];
-                    if (v === null || v === undefined) return 'NULL';
-                    return String(v).replace(/\|/g, '\\|').replace(/\n/g, ' ');
-                });
-                return `| ${values.join(' | ')} |`;
-            });
-            copyToClipboard([header, separator, ...rows].join('\n'));
-        } },
-        { type: 'divider' },
-        {
-            key: 'export-selected',
-            label: t('data_grid.context_menu.export_selected'),
-            icon: <ExportOutlined />,
-            children: [
-                { key: 'exp-csv', label: 'CSV', onClick: () => handleExportSelected({ format: 'csv' }, record).catch(console.error) },
-                { key: 'exp-xlsx', label: 'Excel', onClick: () => handleExportSelected({ format: 'xlsx' }, record).catch(console.error) },
-                { key: 'exp-json', label: 'JSON', onClick: () => handleExportSelected({ format: 'json' }, record).catch(console.error) },
-                { key: 'exp-md', label: 'Markdown', onClick: () => handleExportSelected({ format: 'md' }, record).catch(console.error) },
-                { key: 'exp-html', label: 'HTML', onClick: () => handleExportSelected({ format: 'html' }, record).catch(console.error) },
-            ]
-        }
-    ];
-
-    return (
-        <Dropdown menu={{ items: menuItems }} trigger={['contextMenu']} getPopupContainer={() => document.body} autoAdjustOverflow>
-            <tr {...props}>{children}</tr>
-        </Dropdown>
-    );
-});
-
 interface DataGridProps {
     data: any[];
     columnNames: string[];
@@ -1405,6 +1576,8 @@ interface DataGridProps {
     onSort?: (field: string, order: string) => void;
     onPageChange?: (page: number, size: number) => void;
     onLastPage?: (pageSize: number) => void;
+    /** SQL query max rows used only as a result-grid page-size suggestion. */
+    queryMaxRows?: number;
     pagination?: {
         current: number,
         pageSize: number,
@@ -1414,6 +1587,8 @@ interface DataGridProps {
         approximateTotal?: number,
         totalCountLoading?: boolean,
         totalCountCancelled?: boolean,
+        totalCountUnavailableLabel?: string,
+        totalCountUnavailableReason?: string,
     };
     onRequestTotalCount?: () => void;
     onCancelTotalCount?: () => void;
@@ -1436,6 +1611,8 @@ interface DataGridProps {
     initialViewModeScope?: 'shared' | 'local';
     onDataViewActivate?: () => void;
     onDataChange?: (rows: any[]) => void;
+    /** Workbench tab that owns editable changes in this grid. */
+    workbenchTabId?: string;
 }
 
 type GridFilterCondition = FilterCondition & {
@@ -1757,7 +1934,10 @@ export {
     useDataGridI18nLanguage,
     makeCellKey,
     splitCellKey,
+    buildDataGridCellSelectionRectangle,
     collectDataGridCellSelectionRowKeys,
+    filterDataGridCellSelectionToVisibleRows,
+    resolveDataGridCellSelectionAnchor,
     collectDataGridFillTemplateTargetRowKeys,
     trimSimpleCache,
     looksLikeDateTimeText,
@@ -1790,14 +1970,12 @@ export {
     SortableHeaderCell,
     EditableContext,
     CellContextMenuContext,
-    DataContext,
     setGlobalDeletedRowKeys,
     resolveEditableCellRowKey,
     isEditableCellDeleted,
     isEditableCellModified,
     areEditableCellPropsEqual,
     EditableCell,
-    ContextMenuRow,
     buildColumnMetaMap,
     hasUsableColumnMeta,
     EXACT_GRID_FILTER_OPERATOR,

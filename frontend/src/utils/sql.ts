@@ -61,11 +61,18 @@ export const quoteIdentPart = (dbType: string, ident: string) => {
 export const quoteQualifiedIdent = (dbType: string, ident: string) => {
   const raw = (ident || '').trim();
   if (!raw) return raw;
-  if (['rocketmq', 'mqtt', 'kafka', 'rabbitmq'].includes((dbType || '').trim().toLowerCase())) {
+  const normalizedType = (dbType || '').trim().toLowerCase();
+  if (['rocketmq', 'mqtt', 'kafka', 'rabbitmq'].includes(normalizedType)) {
     return quoteIdentPart(dbType, raw);
   }
   const parts = splitQualifiedNameSegments(raw).filter(Boolean);
   if (parts.length === 0) return quoteIdentPart(dbType, raw);
+  // IoTDB Tree SQL reserves the root node as a path keyword. Quoting it makes
+  // an otherwise valid device query fail during parsing, while child nodes can
+  // still be quoted to preserve special characters and reserved words.
+  if (normalizedType === 'iotdb' && normalizeIdentPart(parts[0]).toLowerCase() === 'root') {
+    return ['root', ...parts.slice(1).map((part) => quoteIdentPart(dbType, part))].join('.');
+  }
   if (parts.length === 1 && parts[0] === normalizeIdentPart(raw)) return quoteIdentPart(dbType, raw);
   return parts.map((part) => quoteIdentPart(dbType, part)).join('.');
 };
@@ -281,6 +288,19 @@ const addSqlServerTopLimit = (sql: string, limit: number): string => {
   );
 };
 
+export const splitTrailingIsolationClause = (sql: string): { main: string; tail: string } => {
+  const text = String(sql || '').trim();
+  const match = text.match(/^(.*?)(\s+WITH\s+(?:UR|CS|RS|RR))\s*$/is);
+  if (!match) return { main: text, tail: '' };
+  const clauseStart = match[1].length;
+  const currentLine = text.slice(text.lastIndexOf('\n', clauseStart - 1) + 1, clauseStart);
+  if (/(?:--|#)[^\r\n]*$/u.test(currentLine)) return { main: text, tail: '' };
+  return {
+    main: match[1].trimEnd(),
+    tail: match[2],
+  };
+};
+
 const buildSqlServerPaginatedSelectSQL = (
   base: string,
   orderBy: string,
@@ -330,6 +350,15 @@ export const buildPaginatedSelectSQL = (
         return `SELECT * FROM (${orderedSql}) WHERE ROWNUM <= ${upperBound}`;
       }
       return `SELECT * FROM (SELECT "__gonavi_page__".*, ROWNUM "__gonavi_rn__" FROM (${orderedSql}) "__gonavi_page__" WHERE ROWNUM <= ${upperBound}) WHERE "__gonavi_rn__" > ${safeOffset}`;
+    }
+    case 'dameng': {
+      // WITH UR/CS/RS/RR is a terminal isolation clause in Dameng DB2
+      // compatibility mode. Keep it after native LIMIT/OFFSET; appending the
+      // limit after WITH UR is rejected. Native pagination also avoids
+      // wrapping JOIN results whose duplicate column names are ambiguous in a
+      // derived table.
+      const statement = splitTrailingIsolationClause(base);
+      return `${statement.main}${orderBy} LIMIT ${safeLimit} OFFSET ${safeOffset}${statement.tail}`;
     }
     case 'sqlserver':
     case 'mssql': {
