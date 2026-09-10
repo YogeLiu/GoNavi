@@ -43,6 +43,7 @@ import {
   resolveTextInputSafeBackdropFilter,
 } from "../utils/appearance";
 import { buildRpcConnectionConfig } from "../utils/connectionRpcConfig";
+import { invokeAppWithSignal, isWebRPCAbortError } from "../utils/webRpc";
 import {
   isPostgresSchemaDialect,
   supportsIndependentSchemaSelection,
@@ -59,6 +60,7 @@ import {
   buildDataSyncAnalysisFingerprint,
   buildInitialDataSyncTableOptions,
   buildDataSyncRequest,
+  resolveDataSyncTargetTableStrategy,
   type SourceDatasetMode,
   validateDataSyncExecutionReadiness,
   validateDataSyncSelection,
@@ -511,11 +513,22 @@ const DataSyncModal: React.FC<{
   const jobIdRef = useRef<string>("");
   const runSyncGuardRef = useRef(false);
   const analysisRequestSeqRef = useRef(0);
+  const previewRequestSeqRef = useRef(0);
+  const analysisAbortRef = useRef<AbortController | null>(null);
+  const previewAbortRef = useRef<AbortController | null>(null);
   const sourceDatabaseRequestSeqRef = useRef(0);
   const targetDatabaseRequestSeqRef = useRef(0);
   const tableMetadataRequestSeqRef = useRef(0);
+  const targetTableStrategyTouchedRef = useRef(false);
   const logBoxRef = useRef<HTMLDivElement>(null);
   const autoScrollRef = useRef(true);
+  const effectiveTargetTableStrategy = resolveDataSyncTargetTableStrategy(
+    targetTableStrategy,
+    workflowType,
+    sourceDatasetMode,
+    migrationCapability?.supportsAutoCreate === true,
+    targetTableStrategyTouchedRef.current,
+  );
 
   const currentAnalysisFingerprint = useMemo(
     () =>
@@ -531,7 +544,7 @@ const DataSyncModal: React.FC<{
         syncContent,
         syncMode,
         autoAddColumns,
-        targetTableStrategy,
+        targetTableStrategy: effectiveTargetTableStrategy,
         createIndexes,
         mongoCollectionName,
       }),
@@ -547,7 +560,7 @@ const DataSyncModal: React.FC<{
       syncContent,
       syncMode,
       autoAddColumns,
-      targetTableStrategy,
+      effectiveTargetTableStrategy,
       createIndexes,
       mongoCollectionName,
     ],
@@ -642,6 +655,24 @@ const DataSyncModal: React.FC<{
   }, [open]);
 
   useEffect(() => {
+    if (open) return undefined;
+    analysisRequestSeqRef.current += 1;
+    previewRequestSeqRef.current += 1;
+    analysisAbortRef.current?.abort();
+    previewAbortRef.current?.abort();
+    analysisAbortRef.current = null;
+    previewAbortRef.current = null;
+    return undefined;
+  }, [open]);
+
+  useEffect(() => () => {
+    analysisRequestSeqRef.current += 1;
+    previewRequestSeqRef.current += 1;
+    analysisAbortRef.current?.abort();
+    previewAbortRef.current?.abort();
+  }, []);
+
+  useEffect(() => {
     if (!logBoxRef.current) return;
     if (!autoScrollRef.current) return;
     logBoxRef.current.scrollTop = logBoxRef.current.scrollHeight;
@@ -675,6 +706,7 @@ const DataSyncModal: React.FC<{
       setSyncContent(isSchemaCompareEntry ? "schema" : "data");
       setSyncMode("insert_update");
       setAutoAddColumns(true);
+      targetTableStrategyTouchedRef.current = false;
       setTargetTableStrategy("existing_only");
       setCreateIndexes(false);
       setShowSameTables(false);
@@ -767,7 +799,11 @@ const DataSyncModal: React.FC<{
       if (syncContent === "schema") {
         setSyncContent("both");
       }
-      if (supportsAutoCreate && targetTableStrategy === "existing_only") {
+      if (
+        supportsAutoCreate &&
+        targetTableStrategy === "existing_only" &&
+        !targetTableStrategyTouchedRef.current
+      ) {
         setTargetTableStrategy("smart");
       } else if (!supportsAutoCreate && targetTableStrategy !== "existing_only") {
         setTargetTableStrategy("existing_only");
@@ -842,6 +878,7 @@ const DataSyncModal: React.FC<{
   const handleSourceConnChange = async (connId: string) => {
     const requestSeq = ++sourceDatabaseRequestSeqRef.current;
     setSourceConnId(connId);
+    targetTableStrategyTouchedRef.current = false;
     setSourceDb("");
     setSourceDbs([]);
     setDiffTables([]);
@@ -880,6 +917,7 @@ const DataSyncModal: React.FC<{
   const handleTargetConnChange = async (connId: string) => {
     const requestSeq = ++targetDatabaseRequestSeqRef.current;
     setTargetConnId(connId);
+    targetTableStrategyTouchedRef.current = false;
     setTargetDb("");
     setTargetDbs([]);
     setTargetSchema("");
@@ -1047,6 +1085,9 @@ const DataSyncModal: React.FC<{
 
     const requestSeq = ++analysisRequestSeqRef.current;
     const requestFingerprint = currentAnalysisFingerprint;
+    analysisAbortRef.current?.abort();
+    const controller = new AbortController();
+    analysisAbortRef.current = controller;
 
     const sConn = connections.find((c) => c.id === sourceConnId)!;
     const tConn = connections.find((c) => c.id === targetConnId)!;
@@ -1073,14 +1114,19 @@ const DataSyncModal: React.FC<{
       syncContent,
       syncMode,
       autoAddColumns,
-      targetTableStrategy,
+      targetTableStrategy: effectiveTargetTableStrategy,
       createIndexes,
       mongoCollectionName,
       jobId,
     });
 
     try {
-      const res = await DataSyncAnalyze(config as any);
+      const res = await invokeAppWithSignal(
+        "DataSyncAnalyze",
+        [config],
+        controller.signal,
+        () => DataSyncAnalyze(config as any),
+      );
       if (
         requestSeq !== analysisRequestSeqRef.current ||
         requestFingerprint !== currentAnalysisFingerprintRef.current
@@ -1114,6 +1160,7 @@ const DataSyncModal: React.FC<{
       ) {
         return;
       }
+      if (isWebRPCAbortError(e)) return;
       setAnalyzedFingerprint("");
       message.error(
         tr("data_sync.message.analysis_failed_detail", {
@@ -1121,6 +1168,9 @@ const DataSyncModal: React.FC<{
         }),
       );
     } finally {
+      if (analysisAbortRef.current === controller) {
+        analysisAbortRef.current = null;
+      }
       if (requestSeq === analysisRequestSeqRef.current) {
         setLoading(false);
         setAnalyzing(false);
@@ -1138,6 +1188,10 @@ const DataSyncModal: React.FC<{
     setPreviewTable(table);
     setPreviewLoading(true);
     setPreviewData(null);
+    const requestSeq = ++previewRequestSeqRef.current;
+    previewAbortRef.current?.abort();
+    const controller = new AbortController();
+    previewAbortRef.current = controller;
 
     const config = buildDataSyncRequest({
       sourceConfig: normalizeConnConfig(sConn, sourceDb),
@@ -1151,13 +1205,19 @@ const DataSyncModal: React.FC<{
       syncContent,
       syncMode,
       autoAddColumns,
-      targetTableStrategy,
+      targetTableStrategy: effectiveTargetTableStrategy,
       createIndexes,
       mongoCollectionName,
     });
 
     try {
-      const res = await DataSyncPreview(config as any, table, 200);
+      const res = await invokeAppWithSignal(
+        "DataSyncPreview",
+        [config, table, 200],
+        controller.signal,
+        () => DataSyncPreview(config as any, table, 200),
+      );
+      if (requestSeq !== previewRequestSeqRef.current) return;
       if (res.success) {
         setPreviewData(res.data);
       } else {
@@ -1170,6 +1230,7 @@ const DataSyncModal: React.FC<{
         );
       }
     } catch (e: any) {
+      if (requestSeq !== previewRequestSeqRef.current || isWebRPCAbortError(e)) return;
       message.error(
         tr("data_sync.message.preview_load_failed_detail", {
           detail: e?.message || String(e),
@@ -1177,7 +1238,8 @@ const DataSyncModal: React.FC<{
       );
     }
 
-    setPreviewLoading(false);
+    if (previewAbortRef.current === controller) previewAbortRef.current = null;
+    if (requestSeq === previewRequestSeqRef.current) setPreviewLoading(false);
   };
 
   const runSync = async () => {
@@ -1266,7 +1328,7 @@ const DataSyncModal: React.FC<{
         syncContent,
         syncMode,
         autoAddColumns,
-        targetTableStrategy,
+        targetTableStrategy: effectiveTargetTableStrategy,
         createIndexes,
         mongoCollectionName,
         tableOptions,
@@ -1988,7 +2050,13 @@ const DataSyncModal: React.FC<{
               <Form layout="vertical">
                 {!isCompareEntry && (
                   <Form.Item label={tr("data_sync.field.workflow_type")}>
-                    <Select value={workflowType} onChange={setWorkflowType}>
+                    <Select
+                      value={workflowType}
+                      onChange={(value) => {
+                        targetTableStrategyTouchedRef.current = false;
+                        setWorkflowType(value);
+                      }}
+                    >
                       <Option value="sync">
                         {tr("data_sync.option.workflow.sync")}
                       </Option>
@@ -2101,7 +2169,10 @@ const DataSyncModal: React.FC<{
                   >
                     <Select
                       value={targetTableStrategy}
-                      onChange={setTargetTableStrategy}
+                      onChange={(value) => {
+                        targetTableStrategyTouchedRef.current = true;
+                        setTargetTableStrategy(value);
+                      }}
                       disabled={
                         !isMigrationWorkflow ||
                         isSourceQueryMode ||
@@ -2839,6 +2910,9 @@ const DataSyncModal: React.FC<{
         }}
         open={previewOpen}
         onClose={() => {
+          previewRequestSeqRef.current += 1;
+          previewAbortRef.current?.abort();
+          previewAbortRef.current = null;
           setPreviewOpen(false);
           setPreviewTable("");
           setPreviewData(null);

@@ -213,7 +213,7 @@ func (s *SQLiteDB) QueryContext(ctx context.Context, query string) ([]map[string
 	}
 	defer rows.Close()
 
-	return scanRows(rows)
+	return scanRowsContext(ctx, rows)
 }
 
 func (s *SQLiteDB) Query(query string) ([]map[string]interface{}, []string, error) {
@@ -297,8 +297,14 @@ func (s *SQLiteDB) GetTableRowCounts(_ string, tables []string) (map[string]int6
 	return getSQLiteTableRowCounts(s.Query, tables)
 }
 
+func normalizeSQLiteMetadataTableName(dbName, raw string) string {
+	_, table := NormalizeSQLiteSchemaAndTable(dbName, raw)
+	return table
+}
+
 func (s *SQLiteDB) GetCreateStatement(dbName, tableName string) (string, error) {
-	query := fmt.Sprintf("SELECT sql FROM sqlite_master WHERE type='table' AND name='%s'", escapeSQLiteStringLiteral(tableName))
+	normalizedTableName := normalizeSQLiteMetadataTableName(dbName, tableName)
+	query := fmt.Sprintf("SELECT sql FROM sqlite_master WHERE type='table' AND name='%s'", escapeSQLiteStringLiteral(normalizedTableName))
 	data, _, err := s.Query(query)
 	if err != nil {
 		return "", err
@@ -312,13 +318,24 @@ func (s *SQLiteDB) GetCreateStatement(dbName, tableName string) (string, error) 
 }
 
 func (s *SQLiteDB) GetColumns(dbName, tableName string) ([]connection.ColumnDefinition, error) {
-	table := strings.TrimSpace(tableName)
+	return s.getColumnsContext(metadataContextFor(s), dbName, tableName)
+}
+
+func (s *SQLiteDB) GetColumnsContext(ctx context.Context, dbName, tableName string) ([]connection.ColumnDefinition, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return s.getColumnsContext(ctx, dbName, tableName)
+}
+
+func (s *SQLiteDB) getColumnsContext(ctx context.Context, dbName, tableName string) ([]connection.ColumnDefinition, error) {
+	table := normalizeSQLiteMetadataTableName(dbName, tableName)
 	if table == "" {
 		return nil, localizedDatabaseRuntimeError("db.backend.error.table_name_required", nil)
 	}
 
 	// cid, name, type, notnull, dflt_value, pk
-	data, _, err := s.Query(fmt.Sprintf("PRAGMA table_info('%s')", escapeSQLiteStringLiteral(table)))
+	data, _, err := s.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info('%s')", escapeSQLiteStringLiteral(table)))
 	if err != nil {
 		return nil, err
 	}
@@ -397,11 +414,47 @@ func (s *SQLiteDB) GetColumns(dbName, tableName string) ([]connection.ColumnDefi
 
 		columns = append(columns, col)
 	}
-	return columns, nil
+
+	// PRAGMA table_info 不回显 AUTOINCREMENT，只能从建表 SQL 识别；
+	// 拿不到 DDL（虚拟表/异常）时静默跳过，不影响其余元数据。
+	tableDDL := ""
+	ddlRows, _, ddlErr := s.QueryContext(ctx, fmt.Sprintf("SELECT sql FROM sqlite_master WHERE type='table' AND name='%s'", escapeSQLiteStringLiteral(table)))
+	if ddlErr == nil && len(ddlRows) > 0 {
+		if val, ok := ddlRows[0]["sql"]; ok && val != nil {
+			tableDDL = fmt.Sprintf("%v", val)
+		}
+	}
+	return applySQLiteAutoIncrement(columns, tableDDL), nil
+}
+
+// applySQLiteAutoIncrement 给 AUTOINCREMENT 主键列打上 auto_increment 标记，
+// 供跨库迁移识别自增语义。该写法只对单列主键合法，复合主键的 DDL 里不会出现
+// AUTOINCREMENT，按主键列数守卫即可。识别经
+// sqliteDDLPrimaryKeyUsesAutoIncrement 匹配真实的内联约束序列，字符串默认值、
+// 注释与引号标识符里的关键字不会误判，理由见其注释。
+func applySQLiteAutoIncrement(columns []connection.ColumnDefinition, tableDDL string) []connection.ColumnDefinition {
+	if !sqliteDDLPrimaryKeyUsesAutoIncrement(tableDDL) {
+		return columns
+	}
+	pkCount := 0
+	for _, col := range columns {
+		if col.Key == "PRI" {
+			pkCount++
+		}
+	}
+	if pkCount != 1 {
+		return columns
+	}
+	for i := range columns {
+		if columns[i].Key == "PRI" {
+			columns[i].Extra = "auto_increment"
+		}
+	}
+	return columns
 }
 
 func (s *SQLiteDB) GetIndexes(dbName, tableName string) ([]connection.IndexDefinition, error) {
-	table := strings.TrimSpace(tableName)
+	table := normalizeSQLiteMetadataTableName(dbName, tableName)
 	if table == "" {
 		return nil, localizedDatabaseRuntimeError("db.backend.error.table_name_required", nil)
 	}
@@ -491,7 +544,7 @@ func (s *SQLiteDB) GetIndexes(dbName, tableName string) ([]connection.IndexDefin
 }
 
 func (s *SQLiteDB) GetForeignKeys(dbName, tableName string) ([]connection.ForeignKeyDefinition, error) {
-	table := strings.TrimSpace(tableName)
+	table := normalizeSQLiteMetadataTableName(dbName, tableName)
 	if table == "" {
 		return nil, localizedDatabaseRuntimeError("db.backend.error.table_name_required", nil)
 	}
@@ -563,7 +616,7 @@ func (s *SQLiteDB) GetForeignKeys(dbName, tableName string) ([]connection.Foreig
 }
 
 func (s *SQLiteDB) GetTriggers(dbName, tableName string) ([]connection.TriggerDefinition, error) {
-	table := strings.TrimSpace(tableName)
+	table := normalizeSQLiteMetadataTableName(dbName, tableName)
 	if table == "" {
 		return nil, localizedDatabaseRuntimeError("db.backend.error.table_name_required", nil)
 	}

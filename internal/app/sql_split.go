@@ -11,11 +11,30 @@ func splitSQLStatements(sql string) []string {
 	return splitSQLStatementsForDialect("", sql)
 }
 
+// SplitSQLStatementsForDialect exposes the established dialect-aware splitter
+// to narrowly scoped consumers that must align statement indexes with SQL.
+func SplitSQLStatementsForDialect(dbType, sql string) []string {
+	return splitSQLStatementsForDialectMode(dbType, sql, true)
+}
+
+// SplitSQLStatementsForDialectMode lets security-sensitive integrations parse
+// MySQL text using the connection's possible backslash-escape modes. Existing
+// execution paths retain their established behavior through the wrapper above.
+func SplitSQLStatementsForDialectMode(dbType, sql string, backslashEscapes bool) []string {
+	return splitSQLStatementsForDialectMode(dbType, sql, backslashEscapes)
+}
+
 // splitSQLStatementsForDialect keeps the legacy generic splitter available to
 // existing execution paths while allowing security-sensitive callers to apply
 // the actual comment and dollar-quote rules of the target database.
 func splitSQLStatementsForDialect(dbType, sql string) []string {
+	return splitSQLStatementsForDialectMode(dbType, sql, true)
+}
+
+func splitSQLStatementsForDialectMode(dbType, sql string, backslashEscapes bool) []string {
 	text := strings.ReplaceAll(sql, "\r\n", "\n")
+	bracketIdentifiers := supportsSQLBracketIdentifier(dbType)
+	escapedBracketIdentifiers := supportsSQLEscapedBracketIdentifier(dbType)
 	if normalizeSQLClassifierDBType(dbType) == "elasticsearch" {
 		if source := strings.TrimSpace(text); source != "" {
 			return []string{source}
@@ -28,6 +47,7 @@ func splitSQLStatementsForDialect(dbType, sql string) []string {
 	inSingle := false
 	inDouble := false
 	inBacktick := false
+	inBracket := false
 	escaped := false
 	inLineComment := false
 	inBlockComment := false
@@ -73,6 +93,22 @@ func splitSQLStatementsForDialect(dbType, sql string) []string {
 			continue
 		}
 
+		// SQL Server and SQLite delimited identifiers use [name]. SQL Server
+		// escapes a closing bracket as ]], while SQLite closes at the first ].
+		// Semicolons inside the identifier are data, not statement delimiters.
+		if bracketIdentifiers && inBracket {
+			cur.WriteByte(ch)
+			if ch == ']' {
+				if escapedBracketIdentifiers && next == ']' {
+					cur.WriteByte(next)
+					i++
+					continue
+				}
+				inBracket = false
+			}
+			continue
+		}
+
 		// Dollar-quoting
 		if dollarTag != "" {
 			if strings.HasPrefix(text[i:], dollarTag) {
@@ -91,7 +127,7 @@ func splitSQLStatementsForDialect(dbType, sql string) []string {
 			cur.WriteByte(ch)
 			continue
 		}
-		if (inSingle || inDouble) && ch == '\\' {
+		if backslashEscapes && (inSingle || inDouble) && ch == '\\' {
 			escaped = true
 			cur.WriteByte(ch)
 			continue
@@ -117,6 +153,11 @@ func splitSQLStatementsForDialect(dbType, sql string) []string {
 		}
 		if !inSingle && !inDouble && ch == '`' {
 			inBacktick = !inBacktick
+			cur.WriteByte(ch)
+			continue
+		}
+		if bracketIdentifiers && !inSingle && !inDouble && !inBacktick && ch == '[' {
+			inBracket = true
 			cur.WriteByte(ch)
 			continue
 		}
@@ -259,6 +300,19 @@ func splitSQLStatementsForDialect(dbType, sql string) []string {
 
 	push()
 	return statements
+}
+
+func supportsSQLBracketIdentifier(dbType string) bool {
+	switch normalizeSQLClassifierDBType(dbType) {
+	case "sqlserver", "sqlite":
+		return true
+	default:
+		return false
+	}
+}
+
+func supportsSQLEscapedBracketIdentifier(dbType string) bool {
+	return normalizeSQLClassifierDBType(dbType) == "sqlserver"
 }
 
 func hasExecutableSQLStatementContent(dbType, statement string) bool {

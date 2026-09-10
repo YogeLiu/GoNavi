@@ -13,10 +13,17 @@ import { hasIndexFormChanged, normalizeIndexFormFromRow, resolveIndexMetadataRes
 import { buildIndexCreateSqlPreview } from './tableDesignerIndexSql';
 import { buildAlterTablePreviewSql, buildCreateTablePreviewSql, hasAlterTableDraftChanges, type StarRocksCreateTableOptions, type StarRocksDistributionType, type StarRocksKeyModel, type StarRocksTableKind, type TDengineCreateTableOptions, type TDengineTableKind, type TDengineTagDefinition } from './tableDesignerSchemaSql';
 import { summarizeDuckDbPrimaryKeyChange } from './tableDesignerDuckDbPrimaryKey';
-import { normalizeSchemaStatementForExecution, parseTableCommentFromDDL, splitSchemaExecutionStatements } from './tableDesignerExecutionSql';
+import {
+    containsTableDesignerTriggerCreateStatement,
+    executeTableDesignerSchemaStatements,
+    parseTableCommentFromDDL,
+    splitSchemaExecutionStatements,
+    type TableDesignerSchemaExecutionResult,
+} from './tableDesignerExecutionSql';
 import TableDesignerSqlPreview from './TableDesignerSqlPreview';
 import { buildRpcConnectionConfig } from '../utils/connectionRpcConfig';
 import { noAutoCapInputProps } from '../utils/inputAutoCap';
+import { dispatchSidebarDatabaseRefresh } from '../utils/sidebarDatabaseRefresh';
 import { getCurrentLanguage, t } from '../i18n';
 import { useOptionalI18n } from '../i18n/provider';
 import {
@@ -24,6 +31,11 @@ import {
     normalizeColumnDefinition,
 } from '../utils/columnDefinition';
 import { buildEditableTriggerSql } from '../utils/triggerEditSql';
+import {
+    buildTableDesignerTriggerDropSql,
+    buildTableDesignerTriggerRestoreSql,
+    shouldDropTableDesignerTriggerBeforeReplace,
+} from '../utils/tableDesignerTriggerSql';
 import { confirmProductionRisk } from '../utils/productionRiskConfirm';
 import { findPotentiallyMutatingConnectionStatements } from '../utils/connectionReadOnly';
 import {
@@ -97,16 +109,14 @@ interface ForeignKeyFormState {
     refColumnNames: string[];
 }
 
-interface SchemaExecutionResult {
-    ok: boolean;
+interface SchemaExecutionResult extends TableDesignerSchemaExecutionResult {
     cancelled?: boolean;
-    message?: string;
-    failedStatementIndex?: number;
-    statementCount: number;
+    rawMessage?: string;
 }
 
 interface SchemaExecutionOptions {
     skipProductionRiskConfirm?: boolean;
+    splitStatements?: boolean;
 }
 
 // 通用兜底类型列表
@@ -444,14 +454,14 @@ const renderDesignerHeaderTitle = (title: string) => (
 
 const TableDesigner: React.FC<{ tab: TabData; embedded?: boolean }> = ({ tab, embedded = false }) => {
   const isNewTable = !tab.tableName;
-  
+
   const [columns, setColumns] = useState<EditableColumn[]>([]);
   const [originalColumns, setOriginalColumns] = useState<EditableColumn[]>([]);
   const [indexes, setIndexes] = useState<IndexDefinition[]>([]);
   const [fks, setFks] = useState<ForeignKeyDefinition[]>([]);
   const [triggers, setTriggers] = useState<TriggerDefinition[]>([]);
   const [ddl, setDdl] = useState<string>('');
-  
+
   // New Table State
   const [newTableName, setNewTableName] = useState('');
   const [schemaOptions, setSchemaOptions] = useState<{ label: string; value: string }[]>([]);
@@ -486,7 +496,7 @@ const TableDesigner: React.FC<{ tab: TabData; embedded?: boolean }> = ({ tab, em
   const [tdengineChildTagDefs, setTdengineChildTagDefs] = useState<TDengineTagDraft[]>([]);
   const [tdengineChildTagValues, setTdengineChildTagValues] = useState<Record<string, string>>({});
   const [tdengineChildTagDefsLoading, setTdengineChildTagDefsLoading] = useState(false);
-  
+
   const [columnsLoading, setColumnsLoading] = useState(false);
   const [indexesLoading, setIndexesLoading] = useState(false);
   const [foreignKeysLoading, setForeignKeysLoading] = useState(false);
@@ -541,7 +551,7 @@ const TableDesigner: React.FC<{ tab: TabData; embedded?: boolean }> = ({ tab, em
   const [columnCharset, setColumnCharset] = useState<string | undefined>();
   const [columnCollation, setColumnCollation] = useState<string | undefined>();
   const [inlineCommentEditingKey, setInlineCommentEditingKey] = useState('');
-  
+
   const connections = useStore(state => state.connections);
   const addTab = useStore(state => state.addTab);
   const setActiveContext = useStore(state => state.setActiveContext);
@@ -551,7 +561,7 @@ const TableDesigner: React.FC<{ tab: TabData; embedded?: boolean }> = ({ tab, em
   const appearance = useStore(state => state.appearance);
   const i18nLanguage = useTableDesignerI18nLanguage();
   const darkMode = theme === 'dark';
-  const isV2Ui = appearance.uiVersion === 'v2';
+
   const resizeGuideColor = darkMode ? '#f6c453' : '#1890ff';
   const readOnly = !!tab.readOnly;
   const designerTableTitle = isNewTable
@@ -740,10 +750,10 @@ const TableDesigner: React.FC<{ tab: TabData; embedded?: boolean }> = ({ tab, em
   useEffect(() => {
       const columnTypeOptions = resolveColumnTypeOptions(getDbType());
       const initialCols = [
-          { 
+          {
               title: renderDesignerHeaderTitle(t('table_designer.column.name', undefined, i18nLanguage)),
-              dataIndex: 'name', 
-              key: 'name', 
+              dataIndex: 'name',
+              key: 'name',
               width: 180,
               render: (text: string, record: EditableColumn) => readOnly ? text : (
                   renderDesignerCellField(
@@ -751,10 +761,10 @@ const TableDesigner: React.FC<{ tab: TabData; embedded?: boolean }> = ({ tab, em
                   )
               )
           },
-          { 
+          {
               title: renderDesignerHeaderTitle(t('table_designer.column.type', undefined, i18nLanguage)),
-              dataIndex: 'type', 
-              key: 'type', 
+              dataIndex: 'type',
+              key: 'type',
               width: 150,
               render: (text: string, record: EditableColumn) => readOnly ? text : (
                   renderDesignerCellField(
@@ -763,10 +773,10 @@ const TableDesigner: React.FC<{ tab: TabData; embedded?: boolean }> = ({ tab, em
                   )
               )
           },
-          { 
+          {
               title: renderDesignerHeaderTitle(t('table_designer.column.primary_key', undefined, i18nLanguage)),
-              dataIndex: 'key', 
-              key: 'key', 
+              dataIndex: 'key',
+              key: 'key',
               width: 60,
               align: 'center',
               render: (text: string, record: EditableColumn) => (
@@ -789,10 +799,10 @@ const TableDesigner: React.FC<{ tab: TabData; embedded?: boolean }> = ({ tab, em
                   )
               )
           },
-          { 
+          {
               title: renderDesignerHeaderTitle(t('table_designer.column.not_null', undefined, i18nLanguage)),
-              dataIndex: 'nullable', 
-              key: 'nullable', 
+              dataIndex: 'nullable',
+              key: 'nullable',
               width: 80,
               align: 'center',
               render: (text: string, record: EditableColumn) => (
@@ -802,10 +812,10 @@ const TableDesigner: React.FC<{ tab: TabData; embedded?: boolean }> = ({ tab, em
                   )
               )
           },
-          { 
+          {
               title: renderDesignerHeaderTitle(t('table_designer.column.default', undefined, i18nLanguage)),
-              dataIndex: 'default', 
-              key: 'default', 
+              dataIndex: 'default',
+              key: 'default',
               width: 180, // Increased default width
               render: (text: string | undefined, record: EditableColumn) => {
                   const value = record.hasDefault
@@ -827,9 +837,9 @@ const TableDesigner: React.FC<{ tab: TabData; embedded?: boolean }> = ({ tab, em
                   );
               }
           },
-          { 
+          {
               title: renderDesignerHeaderTitle(t('table_designer.column.comment', undefined, i18nLanguage)),
-              dataIndex: 'comment', 
+              dataIndex: 'comment',
               key: 'comment',
               width: 200,
               render: (text: string, record: EditableColumn) => readOnly ? (
@@ -1033,8 +1043,8 @@ const TableDesigner: React.FC<{ tab: TabData; embedded?: boolean }> = ({ tab, em
         return;
     }
 
-    const config = { 
-        ...conn.config, 
+    const config = {
+        ...conn.config,
         port: Number(conn.config.port),
         password: conn.config.password || "",
         database: conn.config.database || "",
@@ -1325,9 +1335,12 @@ const TableDesigner: React.FC<{ tab: TabData; embedded?: boolean }> = ({ tab, em
 
   const generateTriggerTemplate = (): string => {
     const dbType = getDbType();
-    const tblName = supportsRequestedTableDesignerSchemaSelection(dbType)
-        ? resolveTableInfo().qualifiedName
-        : (tab.tableName || 'table_name');
+    const tableInfo = resolveTableInfo();
+    const tblName = tableInfo.tableRef || (
+        supportsRequestedTableDesignerSchemaSelection(dbType)
+          ? tableInfo.qualifiedName
+          : (tab.tableName || 'table_name')
+    );
 
     switch (dbType) {
       case 'mysql':
@@ -1335,12 +1348,15 @@ const TableDesigner: React.FC<{ tab: TabData; embedded?: boolean }> = ({ tab, em
       case 'oceanbase':
       case 'diros':
       case 'starrocks':
-        return `CREATE TRIGGER trigger_name
-BEFORE INSERT ON \`${tblName}\`
+        {
+          const tableRef = quoteIdentifierPathByDialect(tblName, dbType);
+          return `CREATE TRIGGER trigger_name
+BEFORE INSERT ON ${tableRef}
 FOR EACH ROW
 BEGIN
     -- Trigger logic
 END;`;
+        }
       case 'postgres':
       case 'kingbase':
       case 'highgo':
@@ -1362,30 +1378,39 @@ FOR EACH ROW
 EXECUTE FUNCTION trigger_function_name();`;
       }
       case 'sqlserver':
-        return `CREATE TRIGGER trigger_name
-ON [${tblName}]
+        {
+          const tableRef = quoteIdentifierPathByDialect(tblName, dbType);
+          return `CREATE TRIGGER trigger_name
+ON ${tableRef}
 AFTER INSERT
 AS
 BEGIN
     SET NOCOUNT ON;
     -- Trigger logic
 END;`;
+        }
       case 'oracle':
       case 'dameng':
       case 'dm':
-        return `CREATE OR REPLACE TRIGGER trigger_name
-BEFORE INSERT ON "${tblName}"
+        {
+          const tableRef = quoteIdentifierPathByDialect(tblName, dbType);
+          return `CREATE OR REPLACE TRIGGER trigger_name
+BEFORE INSERT ON ${tableRef}
 FOR EACH ROW
 BEGIN
     -- Trigger logic
     NULL;
 END;`;
+        }
       case 'sqlite':
-        return `CREATE TRIGGER trigger_name
-AFTER INSERT ON "${tblName}"
+        {
+          const tableRef = quoteIdentifierPathByDialect(tblName, dbType);
+          return `CREATE TRIGGER trigger_name
+AFTER INSERT ON ${tableRef}
 BEGIN
     -- Trigger logic
 END;`;
+        }
       default:
         return `-- Enter a CREATE TRIGGER statement`;
     }
@@ -1393,35 +1418,14 @@ END;`;
 
   const buildDropTriggerSql = (triggerName: string): string => {
     const dbType = getDbType();
-    const tblName = supportsRequestedTableDesignerSchemaSelection(dbType)
-        ? resolveTableInfo().qualifiedName
-        : (tab.tableName || '');
+    const tableInfo = resolveTableInfo();
+    const tblName = tableInfo.tableRef || (
+        supportsRequestedTableDesignerSchemaSelection(dbType)
+          ? tableInfo.qualifiedName
+          : (tab.tableName || '')
+    );
 
-    switch (dbType) {
-      case 'mysql':
-      case 'mariadb':
-      case 'oceanbase':
-      case 'diros':
-      case 'starrocks':
-        return `DROP TRIGGER IF EXISTS \`${triggerName}\``;
-      case 'postgres':
-      case 'kingbase':
-      case 'highgo':
-      case 'vastbase':
-      case 'opengauss':
-      case 'gaussdb':
-        return `DROP TRIGGER IF EXISTS ${quoteIdentifierPartByDialect(triggerName, dbType)} ON ${quoteIdentifierPathByDialect(tblName, dbType)}`;
-      case 'sqlserver':
-        return `DROP TRIGGER IF EXISTS [${triggerName}]`;
-      case 'oracle':
-      case 'dameng':
-      case 'dm':
-        return `DROP TRIGGER "${triggerName}"`;
-      case 'sqlite':
-        return `DROP TRIGGER IF EXISTS "${triggerName}"`;
-      default:
-        return `DROP TRIGGER ${triggerName}`;
-    }
+    return buildTableDesignerTriggerDropSql(triggerName, tblName, dbType, tableInfo.schema);
   };
 
   const handleCreateTrigger = () => {
@@ -1433,31 +1437,43 @@ END;`;
   const handleEditTrigger = () => {
     if (!selectedTrigger) return;
     const dbType = getDbType();
-    const tblName = supportsRequestedTableDesignerSchemaSelection(dbType)
-        ? resolveTableInfo().qualifiedName
-        : (tab.tableName || '');
+    const tableInfo = resolveTableInfo();
+    const tblName = tableInfo.tableRef || (
+        supportsRequestedTableDesignerSchemaSelection(dbType)
+          ? tableInfo.qualifiedName
+          : (tab.tableName || '')
+    );
     let createSql = '';
 
-    if (dbType === 'mysql') {
-      createSql = `CREATE TRIGGER \`${selectedTrigger.name}\`
-${selectedTrigger.timing} ${selectedTrigger.event} ON \`${tblName}\`
-FOR EACH ROW
-${selectedTrigger.statement}`;
-    } else {
-      createSql = selectedTrigger.statement || '-- Trigger definition unavailable';
-    }
+    const triggerRollbackSql = buildTableDesignerTriggerRestoreSql(selectedTrigger, tblName, dbType, tableInfo.schema);
+    createSql = triggerRollbackSql
+      || selectedTrigger.statement
+      || '-- Trigger definition unavailable';
+    const triggerDropSql = shouldDropTableDesignerTriggerBeforeReplace(triggerRollbackSql, dbType)
+      ? buildDropTriggerSql(selectedTrigger.name)
+      : '';
 
     const dbName = String(tab.dbName || '').trim();
-    setActiveContext({ connectionId: tab.connectionId, dbName });
+    const schemaName = String(selectedSchema || tab.schemaName || '').trim();
+    setActiveContext({
+      connectionId: tab.connectionId,
+      dbName,
+      schemaName: schemaName || undefined,
+    });
     addTab({
       id: `query-edit-trigger-${tab.connectionId}-${dbName}-${tab.tableName || ''}-${selectedTrigger.name}-${Date.now()}`,
       title: t('table_designer.tab.edit_trigger_title', { name: selectedTrigger.name }, i18nLanguage),
       type: 'query',
       connectionId: tab.connectionId,
       dbName,
+      schemaName: schemaName || undefined,
       query: buildEditableTriggerSql(selectedTrigger.name, createSql, {
-        dropSql: buildDropTriggerSql(selectedTrigger.name),
+        dropSql: triggerDropSql,
+        dbType,
       }),
+      triggerName: selectedTrigger.name,
+      triggerTableName: tblName,
+      triggerRollbackSql: triggerRollbackSql || undefined,
       queryMode: 'object-edit',
     });
   };
@@ -1479,15 +1495,6 @@ ${selectedTrigger.statement}`;
           return;
         }
 
-        const config = {
-          ...conn.config,
-          port: Number(conn.config.port),
-          password: conn.config.password || "",
-          database: conn.config.database || "",
-          useSSH: conn.config.useSSH || false,
-          ssh: conn.config.ssh || { host: "", port: 22, user: "", password: "", keyPath: "" }
-        };
-
         const approved = await confirmProductionRisk({
           connection: conn,
           action: t('connection.production_risk.action.execute_sql'),
@@ -1499,13 +1506,18 @@ ${selectedTrigger.statement}`;
         const dropSql = buildDropTriggerSql(selectedTrigger.name);
 
         try {
-          const res = await DBQueryAudited(buildRpcConnectionConfig(config) as any, tab.dbName || '', dropSql, 'table_designer');
-          if (res.success) {
+          const result = await executeSchemaStatements(dropSql, {
+            skipProductionRiskConfirm: true,
+          });
+          if (result.ok) {
             setSelectedTrigger(null);
             await fetchData();
             message.success(t('table_designer.message.trigger_deleted', undefined, i18nLanguage));
           } else {
-            message.error(t('table_designer.message.delete_failed', { detail: res.message }, i18nLanguage));
+            if (result.schemaMayHaveChanged) await fetchData();
+            message.error(t('table_designer.message.delete_failed', {
+              detail: result.rawMessage || result.message,
+            }, i18nLanguage));
           }
         } catch (e: any) {
           message.error(t('table_designer.message.delete_failed', { detail: e?.message || String(e) }, i18nLanguage));
@@ -1521,14 +1533,18 @@ ${selectedTrigger.statement}`;
       return;
     }
 
-    const config = {
-      ...conn.config,
-      port: Number(conn.config.port),
-      password: conn.config.password || "",
-      database: conn.config.database || "",
-      useSSH: conn.config.useSSH || false,
-      ssh: conn.config.ssh || { host: "", port: 22, user: "", password: "", keyPath: "" }
-    };
+    const dbType = getDbType();
+    if (
+      !String(triggerEditSql || '').trim()
+      || splitSchemaExecutionStatements(triggerEditSql, dbType).length === 0
+    ) {
+      message.error(t('table_designer.message.no_sql_statement', undefined, i18nLanguage));
+      return;
+    }
+    if (!containsTableDesignerTriggerCreateStatement(triggerEditSql, dbType)) {
+      message.error(t('trigger_viewer.edit_sql.empty_definition', undefined, i18nLanguage));
+      return;
+    }
 
     const approved = await confirmProductionRisk({
       connection: conn,
@@ -1541,20 +1557,63 @@ ${selectedTrigger.statement}`;
     setTriggerExecuting(true);
 
     try {
+      let triggerSchemaMayHaveChanged = false;
+      const tableInfo = resolveTableInfo();
+      const restoreTableName = tableInfo.tableRef || (
+        supportsRequestedTableDesignerSchemaSelection(dbType)
+          ? tableInfo.qualifiedName
+          : (tab.tableName || '')
+      );
+      const restoreSql = triggerEditMode === 'edit' && selectedTrigger
+        ? buildTableDesignerTriggerRestoreSql(selectedTrigger, restoreTableName, dbType, tableInfo.schema)
+        : '';
+      const shouldDropExistingTrigger = triggerEditMode === 'edit'
+        && Boolean(selectedTrigger)
+        && shouldDropTableDesignerTriggerBeforeReplace(restoreSql, dbType);
       // 如果是编辑模式，先删除旧触发器
-      if (triggerEditMode === 'edit' && selectedTrigger) {
+      if (shouldDropExistingTrigger && selectedTrigger) {
         const dropSql = buildDropTriggerSql(selectedTrigger.name);
-        const dropRes = await DBQueryAudited(buildRpcConnectionConfig(config) as any, tab.dbName || '', dropSql, 'table_designer');
-        if (!dropRes.success) {
-          message.error(t('table_designer.message.drop_old_trigger_failed', { detail: dropRes.message }, i18nLanguage));
-          setTriggerExecuting(false);
+        const dropResult = await executeSchemaStatements(dropSql, {
+          skipProductionRiskConfirm: true,
+        });
+        if (!dropResult.ok) {
+          const failureDetail = dropResult.rawMessage || dropResult.message;
+          if (dropResult.outcomeUnknown) {
+            await fetchData();
+            message.error(t('table_designer.message.trigger_outcome_unknown', {
+              detail: failureDetail,
+            }, i18nLanguage));
+          } else if (dropResult.schemaMayHaveChanged && restoreSql) {
+            const restoreResult = await executeSchemaStatements(restoreSql, {
+              skipProductionRiskConfirm: true,
+              splitStatements: false,
+            });
+            await fetchData();
+            message.error(restoreResult.ok
+              ? t('table_designer.message.trigger_restored_after_failure', {
+                detail: failureDetail,
+              }, i18nLanguage)
+              : t('table_designer.message.trigger_restore_failed', {
+                detail: failureDetail,
+                restoreDetail: restoreResult.rawMessage || restoreResult.message,
+              }, i18nLanguage));
+          } else {
+            if (dropResult.schemaMayHaveChanged) await fetchData();
+            message.error(t('table_designer.message.drop_old_trigger_failed', {
+              detail: failureDetail,
+            }, i18nLanguage));
+          }
           return;
         }
+        triggerSchemaMayHaveChanged = true;
       }
 
       // 执行创建语句
-      const res = await DBQueryAudited(buildRpcConnectionConfig(config) as any, tab.dbName || '', triggerEditSql, 'table_designer');
-      if (res.success) {
+      const result = await executeSchemaStatements(triggerEditSql, {
+        skipProductionRiskConfirm: true,
+        splitStatements: false,
+      });
+      if (result.ok) {
         setIsTriggerEditModalOpen(false);
         setSelectedTrigger(null);
         await fetchData();
@@ -1562,7 +1621,38 @@ ${selectedTrigger.statement}`;
             ? t('table_designer.message.trigger_created', undefined, i18nLanguage)
             : t('table_designer.message.trigger_updated', undefined, i18nLanguage));
       } else {
-        message.error(t('table_designer.message.execution_failed', { detail: res.message }, i18nLanguage));
+        if (triggerSchemaMayHaveChanged || result.schemaMayHaveChanged) await fetchData();
+        const failureDetail = result.rawMessage || result.message;
+        if (result.outcomeUnknown) {
+          message.error(t('table_designer.message.trigger_outcome_unknown', {
+            detail: failureDetail,
+          }, i18nLanguage));
+        } else if (triggerSchemaMayHaveChanged && restoreSql) {
+          const restoreResult = await executeSchemaStatements(restoreSql, {
+            skipProductionRiskConfirm: true,
+            splitStatements: false,
+          });
+          if (restoreResult.ok) {
+            await fetchData();
+            message.error(t('table_designer.message.trigger_restored_after_failure', {
+              detail: failureDetail,
+            }, i18nLanguage));
+          } else {
+            await fetchData();
+            message.error(t('table_designer.message.trigger_restore_failed', {
+              detail: failureDetail,
+              restoreDetail: restoreResult.rawMessage || restoreResult.message,
+            }, i18nLanguage));
+          }
+        } else if (triggerSchemaMayHaveChanged) {
+          message.error(t('table_designer.message.trigger_restore_unavailable', {
+            detail: failureDetail,
+          }, i18nLanguage));
+        } else {
+          message.error(t('table_designer.message.execution_failed', {
+            detail: failureDetail,
+          }, i18nLanguage));
+        }
       }
     } catch (e: any) {
       message.error(t('table_designer.message.execution_failed', { detail: e?.message || String(e) }, i18nLanguage));
@@ -2218,14 +2308,6 @@ ${selectedTrigger.statement}`;
           message.error(t('table_designer.message.connection_not_found', undefined, i18nLanguage));
           return;
       }
-      const config = {
-          ...conn.config,
-          port: Number(conn.config.port),
-          password: conn.config.password || "",
-          database: conn.config.database || "",
-          useSSH: conn.config.useSSH || false,
-          ssh: conn.config.ssh || { host: "", port: 22, user: "", password: "", keyPath: "" }
-      };
       const approved = await confirmProductionRisk({
           connection: conn,
           action: t('connection.production_risk.action.execute_sql'),
@@ -2240,12 +2322,16 @@ ${selectedTrigger.statement}`;
       const sql = buildCreateTableSql(copyTableName.trim(), selectedColumns, copyCharset, copyCollation);
       setCopyExecuting(true);
       try {
-          const res = await DBQueryAudited(buildRpcConnectionConfig(config) as any, tab.dbName || '', sql, 'table_designer');
-          if (res.success) {
+          const result = await executeSchemaStatements(sql, {
+              skipProductionRiskConfirm: true,
+          });
+          if (result.ok) {
               message.success(t('table_designer.message.columns_copied_to_new_table', { count: selectedColumns.length, table: copyTableName.trim() }, i18nLanguage));
               setIsCopyColumnsModalOpen(false);
           } else {
-              message.error(t('table_designer.message.execution_failed', { detail: res.message }, i18nLanguage));
+              message.error(t('table_designer.message.execution_failed', {
+                  detail: result.rawMessage || result.message,
+              }, i18nLanguage));
           }
       } finally {
           setCopyExecuting(false);
@@ -2269,7 +2355,15 @@ ${selectedTrigger.statement}`;
           ssh: conn.config.ssh || { host: "", port: 22, user: "", password: "", keyPath: "" }
       };
       const dbType = resolveTableInfo().dbType;
-      const statements = splitSchemaExecutionStatements(sqlText);
+      const statements = options.splitStatements === false
+          ? (String(sqlText || '').trim() && splitSchemaExecutionStatements(sqlText, dbType).length > 0 ? [sqlText] : [])
+          : splitSchemaExecutionStatements(sqlText, dbType);
+      const refreshSchemaConsumers = () => {
+          dispatchSidebarDatabaseRefresh({
+              connectionId: tab.connectionId,
+              dbName: tab.dbName || '',
+          });
+      };
       if (
           !options.skipProductionRiskConfirm
           && findPotentiallyMutatingConnectionStatements(conn.config, sqlText).length > 0
@@ -2284,22 +2378,33 @@ ${selectedTrigger.statement}`;
               return { ok: false, cancelled: true, statementCount: statements.length };
           }
       }
-      for (let i = 0; i < statements.length; i++) {
-          const stmt = normalizeSchemaStatementForExecution(statements[i], dbType);
-          const res = await DBQueryAudited(buildRpcConnectionConfig(config) as any, tab.dbName || '', stmt, 'table_designer');
-          if (!res.success) {
-              const prefix = statements.length > 1
-                  ? t('table_designer.message.statement_execution_failed_prefix', { current: i + 1, total: statements.length }, i18nLanguage)
-                  : t('table_designer.message.execution_failed_prefix', undefined, i18nLanguage);
-              return {
-                  ok: false,
-                  message: prefix + res.message,
-                  failedStatementIndex: i,
-                  statementCount: statements.length,
-              };
-          }
-      }
-      return { ok: true, statementCount: statements.length };
+      const result = await executeTableDesignerSchemaStatements({
+          sqlText,
+          dbType,
+          execute: (statement) => DBQueryAudited(
+              buildRpcConnectionConfig(config) as any,
+              tab.dbName || '',
+              statement,
+              'table_designer',
+          ),
+          refreshSchemaConsumers,
+          emptySqlMessage: t('table_designer.message.no_sql_statement', undefined, i18nLanguage),
+          splitStatements: options.splitStatements,
+      });
+      if (result.ok) return result;
+
+      const failedStatementIndex = result.failedStatementIndex ?? 0;
+      const prefix = statements.length > 1
+          ? t('table_designer.message.statement_execution_failed_prefix', {
+              current: failedStatementIndex + 1,
+              total: statements.length,
+          }, i18nLanguage)
+          : t('table_designer.message.execution_failed_prefix', undefined, i18nLanguage);
+      return {
+          ...result,
+          rawMessage: result.message,
+          message: prefix + String(result.message || ''),
+      };
   };
 
   const buildIndexFormFromRow = (row: IndexDisplayRow): IndexFormState => {
@@ -2327,6 +2432,7 @@ ${selectedTrigger.statement}`;
 
       if (!shouldRestoreOriginalIndex(result)) {
           message.error(result.message || t('table_designer.message.execution_failed_plain', undefined, i18nLanguage));
+          if (result.schemaMayHaveChanged) await fetchData();
           return false;
       }
 
@@ -2351,7 +2457,7 @@ ${selectedTrigger.statement}`;
           if (!result.ok) {
               if (result.cancelled) return false;
               message.error(result.message || t('table_designer.message.execution_failed_plain', undefined, i18nLanguage));
-              if ((result.failedStatementIndex ?? 0) > 0) await fetchData();
+              if (result.schemaMayHaveChanged) await fetchData();
               return false;
           }
           await fetchData();
@@ -2913,15 +3019,18 @@ END;`;
       });
   };
 
-	  const handleExecuteSave = async () => {
-	      const result = await executeSchemaStatements(previewSql);
-	      if (!result.ok) {
-	          if (result.cancelled) return;
-	          message.error(result.message || t('table_designer.message.execution_failed_plain', undefined, i18nLanguage));
-	          return;
-	      }
-	      setIsPreviewOpen(false);
-	      if (!isNewTable) {
+  const handleExecuteSave = async () => {
+      const result = await executeSchemaStatements(previewSql);
+      if (!result.ok) {
+          if (result.cancelled) return;
+          message.error(result.message || t('table_designer.message.execution_failed_plain', undefined, i18nLanguage));
+          if (result.schemaMayHaveChanged && !isNewTable) {
+              await fetchData();
+          }
+          return;
+      }
+      setIsPreviewOpen(false);
+      if (!isNewTable) {
               await fetchData();
           } else {
               const connectionId = String(tab.connectionId || '').trim();
@@ -2941,10 +3050,10 @@ END;`;
                   }));
               }
           }
-	      message.success(isNewTable
+      message.success(isNewTable
               ? t('table_designer.message.schema_saved_create', undefined, i18nLanguage)
               : t('table_designer.message.schema_saved_alter', undefined, i18nLanguage));
-	  };
+  };
 
   // Merge columns with resize handler
   const resizableColumns = useMemo(() => tableColumns.map((col, index) => ({
@@ -3368,7 +3477,7 @@ END;`;
   const columnsTabContent = (
       <div
           ref={containerRef}
-          className={`table-designer-wrapper${isV2Ui ? ' gn-v2-designer-table-shell' : ''}`}
+          className="table-designer-wrapper gn-v2-designer-table-shell"
           onCopy={handleColumnClipboardCopy}
           onPaste={handleColumnClipboardPaste}
           style={{
@@ -3387,13 +3496,13 @@ END;`;
             }
         `}</style>
         {readOnly ? (
-        <Table 
-            dataSource={columns} 
-            columns={columnsWithSelect} 
-            rowKey="_key" 
+        <Table
+            dataSource={columns}
+            columns={columnsWithSelect}
+            rowKey="_key"
             rowClassName={(record: EditableColumn) => record._key === focusColumnKey ? 'table-designer-focus-row' : ''}
-            size="small" 
-            pagination={false} 
+            size="small"
+            pagination={false}
             loading={columnsLoading}
             scroll={{ y: tableHeight }}
             bordered={false}
@@ -3406,13 +3515,13 @@ END;`;
   ) : (
       <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={onDragEnd}>
         <SortableContext items={columns.map(c => c._key)} strategy={verticalListSortingStrategy}>
-            <Table 
-                dataSource={columns} 
-                columns={columnsWithSelect} 
-                rowKey="_key" 
+            <Table
+                dataSource={columns}
+                columns={columnsWithSelect}
+                rowKey="_key"
                 rowClassName={(record: EditableColumn) => record._key === focusColumnKey ? 'table-designer-focus-row' : ''}
-                size="small" 
-                pagination={false} 
+                size="small"
+                pagination={false}
                 loading={columnsLoading}
                 scroll={{ y: tableHeight }}
                 bordered={false}
@@ -3490,7 +3599,7 @@ END;`;
   return (
     <div
         ref={shellRef}
-        className={`table-designer-shell${isV2Ui ? ' gn-v2-table-designer' : ''}${embedded ? ' is-embedded' : ''}`}
+        className={`table-designer-shell gn-v2-table-designer${embedded ? ' is-embedded' : ''}`}
         style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, padding: embedded ? 0 : '6px 0', position: 'relative' }}
     >
         <style>{`
@@ -3793,8 +3902,7 @@ END;`;
             willChange: 'transform',
           }}
         />
-        {isV2Ui && (
-            <div className="gn-v2-designer-header">
+        <div className="gn-v2-designer-header">
                 <div className="gn-v2-designer-title">
                     <span>{t('table_designer.title.schema_designer', undefined, i18nLanguage)}</span>
                     <strong>{designerTableTitle}</strong>
@@ -3805,10 +3913,9 @@ END;`;
                     <span>{designerColumnSummary}</span>
                     {readOnly && <span>{t('table_designer.status.read_only', undefined, i18nLanguage)}</span>}
                 </div>
-            </div>
-        )}
+        </div>
         <div
-            className={isV2Ui ? 'gn-v2-designer-toolbar' : undefined}
+            className={'gn-v2-designer-toolbar'}
             style={{
                 padding: '10px 12px 8px 12px',
                 borderBottom: `1px solid ${panelToolbarBorder}`,
@@ -3842,7 +3949,7 @@ END;`;
             )}
             {isNewTable && (
                 <>
-                    <Input 
+                    <Input
                         {...noAutoCapInputProps}
                         placeholder={t('table_designer.placeholder.table_name', undefined, i18nLanguage)}
                         value={newTableName}
@@ -3856,7 +3963,7 @@ END;`;
                                 setTableDesignerSchema?.(tab.connectionId, explicitSchema);
                             }
                         }}
-                        style={{ width: 150 }} 
+                        style={{ width: 150 }}
                     />
                     {!isTDengineNewTable && (
                         <>
@@ -3909,8 +4016,8 @@ END;`;
             )}
             <div style={{ flex: 1 }} />
         </div>
-        <Tabs 
-            className={isV2Ui ? 'gn-v2-designer-tabs' : undefined}
+        <Tabs
+            className={'gn-v2-designer-tabs'}
             activeKey={activeKey}
             onChange={(key) => React.startTransition(() => setActiveKey(key))}
             style={{
@@ -3950,9 +4057,9 @@ END;`;
                         key: 'indexes',
                         label: t('table_designer.tab.indexes', undefined, i18nLanguage),
                         children: (
-                            <div className={`index-table-wrap${isV2Ui ? ' gn-v2-designer-tab-content gn-v2-designer-index-table' : ''}`} style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                            <div className="index-table-wrap gn-v2-designer-tab-content gn-v2-designer-index-table" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                                 {!readOnly && (
-                                    <div className={isV2Ui ? 'gn-v2-designer-actionbar' : undefined} style={{ display: 'flex', gap: 8 }}>
+                                    <div className={'gn-v2-designer-actionbar'} style={{ display: 'flex', gap: 8 }}>
                                         <Button size="small" icon={<PlusOutlined />} disabled={!supportsIndexSchemaOps()} onClick={openCreateIndexModal}>{t('table_designer.action.add', undefined, i18nLanguage)}</Button>
                                         <Button size="small" icon={<EditOutlined />} disabled={!supportsIndexSchemaOps() || selectedIndexKeys.length !== 1} onClick={openEditIndexModal}>{t('table_designer.action.edit', undefined, i18nLanguage)}</Button>
                                         <Button size="small" icon={<DeleteOutlined />} danger disabled={!supportsIndexSchemaOps() || selectedIndexKeys.length === 0} onClick={handleDeleteIndex}>{t('table_designer.action.delete', undefined, i18nLanguage)}</Button>
@@ -3968,7 +4075,7 @@ END;`;
                                         )}
                                     </div>
                                 )}
-                                <div className={isV2Ui ? 'gn-v2-designer-section-note' : undefined} style={{ color: '#888', fontSize: 12 }}>
+                                <div className={'gn-v2-designer-section-note'} style={{ color: '#888', fontSize: 12 }}>
                                     {t('table_designer.summary.indexes', { count: groupedIndexes.length, fields: groupedIndexFieldCount }, i18nLanguage)}
                                 </div>
                                 <Table
@@ -4004,9 +4111,9 @@ END;`;
                         key: 'foreignKeys',
                         label: t('table_designer.tab.foreign_keys', undefined, i18nLanguage),
                         children: (
-                            <div className={isV2Ui ? 'gn-v2-designer-tab-content' : undefined} style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                            <div className={'gn-v2-designer-tab-content'} style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                                 {!readOnly && (
-                                    <div className={isV2Ui ? 'gn-v2-designer-actionbar' : undefined} style={{ display: 'flex', gap: 8 }}>
+                                    <div className={'gn-v2-designer-actionbar'} style={{ display: 'flex', gap: 8 }}>
                                         <Button size="small" icon={<PlusOutlined />} disabled={!supportsForeignKeySchemaOps()} onClick={openCreateForeignKeyModal}>{t('table_designer.action.add', undefined, i18nLanguage)}</Button>
                                         <Button size="small" icon={<EditOutlined />} disabled={!supportsForeignKeySchemaOps() || !selectedForeignKey} onClick={openEditForeignKeyModal}>{t('table_designer.action.edit', undefined, i18nLanguage)}</Button>
                                         <Button size="small" icon={<DeleteOutlined />} danger disabled={!supportsForeignKeySchemaOps() || !selectedForeignKey} onClick={handleDeleteForeignKey}>{t('table_designer.action.delete', undefined, i18nLanguage)}</Button>
@@ -4022,8 +4129,8 @@ END;`;
                                         )}
                                     </div>
                                 )}
-                                <Table 
-                                    dataSource={groupedForeignKeys} 
+                                <Table
+                                    dataSource={groupedForeignKeys}
                                     columns={[
                                         { title: t('table_designer.foreign_key.column.constraint_name', undefined, i18nLanguage), dataIndex: 'constraintName', key: 'constraintName', width: 220 },
                                         {
@@ -4040,9 +4147,9 @@ END;`;
                                             render: (vals: string[]) => vals?.length ? vals.join(', ') : '-',
                                         },
                                     ]}
-                                    rowKey="key" 
-                                    size="small" 
-                                    pagination={false} 
+                                    rowKey="key"
+                                    size="small"
+                                    pagination={false}
                                     loading={foreignKeysLoading}
                                     scroll={{ x: 980, y: tableHeight }}
                                     rowSelection={{
@@ -4068,8 +4175,8 @@ END;`;
                         key: 'triggers',
                         label: t('table_designer.tab.triggers', undefined, i18nLanguage),
                         children: (
-                            <div className={isV2Ui ? 'gn-v2-designer-tab-content' : undefined}>
-                                <div className={isV2Ui ? 'gn-v2-designer-actionbar' : undefined} style={{ marginBottom: 8, display: 'flex', gap: 8 }}>
+                            <div className={'gn-v2-designer-tab-content'}>
+                                <div className={'gn-v2-designer-actionbar'} style={{ marginBottom: 8, display: 'flex', gap: 8 }}>
                                     <Button
                                         size="small"
                                         icon={<EyeOutlined />}
@@ -4138,7 +4245,7 @@ END;`;
                         label: 'DDL',
                         icon: <FileTextOutlined />,
                         children: (
-                        <div className={isV2Ui ? 'gn-v2-designer-ddl-shell' : undefined} style={{ height: '100%', minHeight: 320, border: `1px solid ${panelFrameColor}`, borderRadius: panelRadius, background: panelBodyBg }}>
+                        <div className={'gn-v2-designer-ddl-shell'} style={{ height: '100%', minHeight: 320, border: `1px solid ${panelFrameColor}`, borderRadius: panelRadius, background: panelBodyBg }}>
                             <Editor
                                 height="100%"
                                 language="sql"

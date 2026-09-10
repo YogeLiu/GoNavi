@@ -4,7 +4,7 @@ import TitleBarQuickActions, { type TitleBarQuickAction } from './TitleBarQuickA
 import { type DataSyncEntryMode } from './dataSyncEntryMode';
 import type { DatabaseCharsetOption, DatabaseCollationOption } from '../utils/databaseCharset';
 import SidebarSearchPanel, { type SidebarSearchPanelProps } from './sidebar/SidebarSearchPanel';
-import { buildSidebarLegacyNodeMenuItems } from './sidebar/sidebarLegacyNodeMenu';
+import { buildSidebarNodeMenuItems } from './sidebar/sidebarNodeMenu';
 import {
   getMetadataDialect,
   loadSchemas,
@@ -53,9 +53,11 @@ import {
   V2_RAIL_UNGROUPED_CONNECTION_GROUP_ID,
   formatSidebarRowCount,
   hasSidebarLazyChildren,
-  shouldClearSidebarActiveContextOnEmptySelect,
   shouldLoadSidebarNodeOnExpand,
   getV2RailConnectionGroupBadgeText,
+  resolveSidebarTitlebarObjectName,
+  clearSidebarHostConnectionState,
+  shouldDeferSidebarTitlebarSelection,
   type V2ExplorerFilter,
 } from './sidebar/sidebarHelpers';
 // 重新导出，保持外部测试文件的 `from './Sidebar'` 兼容
@@ -63,18 +65,19 @@ export {
   V2_RAIL_UNGROUPED_CONNECTION_GROUP_ID,
   formatSidebarRowCount,
   hasSidebarLazyChildren,
-  shouldClearSidebarActiveContextOnEmptySelect,
   shouldLoadSidebarNodeOnExpand,
   getV2RailConnectionGroupBadgeText,
   isV2SidebarObjectNode,
   resolveV2ObjectGroupTitle,
+  clearSidebarHostConnectionState,
+  shouldDeferSidebarTitlebarSelection,
   resolveSidebarTableNameForCopy,
   resolveSidebarDatabaseNameForCopy,
   parseV2CommandSearchQuery,
 } from './sidebar/sidebarHelpers';
-import React, { useEffect, useState, useMemo, useRef, useCallback, useDeferredValue } from 'react';
+import React, { useEffect, useLayoutEffect, useState, useMemo, useRef, useCallback, useDeferredValue } from 'react';
 import { createPortal } from 'react-dom';
-import { Tree, message, Dropdown, MenuProps, Input, Button, Form, Popover, Radio, Select, Tooltip } from 'antd';
+import { Tree, message, MenuProps, Input, Button, Form, Popover, Radio, Select, Tooltip } from 'antd';
 import { APP_POPUP_Z_INDEX } from '../utils/overlayZIndex';
 import { createSidebarResizeAwareFrameScheduler } from '../utils/sidebarResizeLifecycle';
 	import {
@@ -88,9 +91,7 @@ import { createSidebarResizeAwareFrameScheduler } from '../utils/sidebarResizeLi
 	  DownloadOutlined,
 	  GlobalOutlined,
 	  HistoryOutlined,
-	  InfoCircleOutlined,
 	  TableOutlined,
-	  ToolOutlined,
 	  SwitcherOutlined,
 	  UploadOutlined,
 	  ConsoleSqlOutlined,
@@ -122,10 +123,9 @@ import { createSidebarResizeAwareFrameScheduler } from '../utils/sidebarResizeLi
   AimOutlined,
   MoreOutlined,
   MenuFoldOutlined,
+  MenuUnfoldOutlined,
   VerticalAlignTopOutlined,
-  RobotOutlined,
   SafetyCertificateOutlined,
-  SettingOutlined,
   SkinOutlined,
 	} from '@ant-design/icons';
 import {
@@ -200,10 +200,15 @@ import {
   type BuildDataImportWorkbenchTabInput,
 } from '../utils/dataImportTab';
 import { useExportProgressDialog } from './ExportProgressModal';
-import { getShortcutPlatform, resolveShortcutDisplay } from '../utils/shortcuts';
+import { getShortcutPlatform } from '../utils/shortcuts';
 import { buildExternalSQLRootNode, type ExternalSQLTreeNode } from '../utils/externalSqlTree';
 import { resolveSidebarTableMetadataFields } from '../utils/sidebarTableMetadata';
 import { filterSidebarTreeByHiddenObjectGroups } from '../utils/sidebarObjectVisibility';
+import {
+  mergeTitlebarSidebarSnapshot,
+  type TitlebarSelectionContext,
+  type TitlebarSidebarSnapshot,
+} from '../utils/titlebarContext';
 import { t } from '../i18n';
 import MessagePublishModal from './MessagePublishModal';
 import {
@@ -214,6 +219,10 @@ import {
 } from './sidebarCoreUtils';
 export { resolveSidebarContextMenuPosition } from './sidebarCoreUtils';
 export type { ExternalSQLFileModalMode, SearchScope } from './sidebarCoreUtils';
+
+// Keep the titlebar snapshot synchronous in the browser without emitting an
+// SSR warning when the Sidebar is rendered to HTML in tests or web tooling.
+const useSidebarLayoutEffect = typeof window === 'undefined' ? useEffect : useLayoutEffect;
 import {
   applySidebarDatabasePinning,
   buildSidebarTableChildrenForUi,
@@ -221,6 +230,7 @@ import {
   buildV2RailConnectionGroups,
   buildV2SidebarDatabaseSectionedChildren,
   buildV2SidebarTableSectionedChildren,
+  resolveSidebarTreeRowHeight,
   collectSidebarSubtreeKeys,
   estimateV2TreeHorizontalScrollWidth,
   filterV2CommandSearchTreeItems,
@@ -242,9 +252,9 @@ import {
   resolveSidebarSingleDatabaseExpandedKeys,
   resolveV2ConnectionGroup,
   resolveV2ActiveConnectionId,
-  resolveV2CommandSearchPersistentFilter,
   resolveNacosNamespaceDiscoveryModeFromTreeNode,
   resolveNacosServicesDoubleClickAction,
+  replaceSidebarTreeNodeChildren,
   shouldClearSidebarNodeChildrenOnCollapse,
   shouldSkipSidebarLoadOnExpandWhileDragging,
   shouldSkipSidebarSelectWhileDragging,
@@ -264,6 +274,7 @@ export {
   buildV2RailConnectionGroups,
   buildV2SidebarDatabaseSectionedChildren,
   buildV2SidebarTableSectionedChildren,
+  resolveSidebarTreeRowHeight,
   collectSidebarSubtreeKeys,
   estimateV2TreeHorizontalScrollWidth,
   filterV2CommandSearchTreeItems,
@@ -283,7 +294,6 @@ export {
   resolveSidebarDatabaseTreePruneKeys,
   resolveSidebarNodeConnectionId,
   resolveV2ActiveConnectionId,
-  resolveV2CommandSearchPersistentFilter,
   shouldClearSidebarNodeChildrenOnCollapse,
   shouldSkipSidebarLoadOnExpandWhileDragging,
   shouldSkipSidebarSelectWhileDragging,
@@ -350,6 +360,59 @@ const SIDEBAR_CACHED_DATABASE_TREE_LIMIT = 12;
 const NACOS_SERVICES_CHANGED_EVENT = 'gonavi:nacos-services-changed';
 const SIDEBAR_GROUP_HOVER_EXPAND_DELAY_MS = 500;
 const SIDEBAR_TREE_SCROLL_IDLE_DELAY_MS = 2000;
+
+type SidebarTreeHorizontalWheelInput = {
+  deltaX?: number;
+  deltaY?: number;
+  shiftKey?: boolean;
+};
+
+/**
+ * Normalize wheel input to the horizontal intent used by the virtual tree.
+ * On macOS, Shift+wheel commonly reports the vertical wheel amount in
+ * `deltaY`, so relying on `deltaX` alone makes the gesture work only when the
+ * browser happens to retarget it to a focused tree row.
+ */
+export const resolveSidebarTreeHorizontalWheelDelta = ({
+  deltaX = 0,
+  deltaY = 0,
+  shiftKey = false,
+}: SidebarTreeHorizontalWheelInput): number => {
+  const safeDeltaX = Number.isFinite(deltaX) ? Number(deltaX) : 0;
+  const safeDeltaY = Number.isFinite(deltaY) ? Number(deltaY) : 0;
+
+  if (shiftKey) {
+    return safeDeltaX !== 0 ? safeDeltaX : safeDeltaY;
+  }
+
+  return Math.abs(safeDeltaX) > Math.abs(safeDeltaY) ? safeDeltaX : 0;
+};
+
+export const resolveSidebarTreeHorizontalScrollLeft = ({
+  currentLeft,
+  delta,
+  scrollWidth,
+  viewportWidth,
+}: {
+  currentLeft: number;
+  delta: number;
+  scrollWidth: number;
+  viewportWidth: number;
+}): number | null => {
+  const safeCurrentLeft = Number.isFinite(currentLeft) ? currentLeft : 0;
+  const safeDelta = Number.isFinite(delta) ? delta : 0;
+  const safeScrollWidth = Number.isFinite(scrollWidth) ? scrollWidth : 0;
+  const safeViewportWidth = Number.isFinite(viewportWidth) ? viewportWidth : 0;
+  const maxLeft = Math.max(0, safeScrollWidth - safeViewportWidth);
+  const nextLeft = Math.min(maxLeft, Math.max(0, safeCurrentLeft + safeDelta));
+
+  return Math.abs(nextLeft - safeCurrentLeft) > 0.5 ? nextLeft : null;
+};
+
+const buildOptionalSchemaContext = (value: unknown): { schemaName?: string } => {
+  const schemaName = String(value ?? '').trim();
+  return schemaName ? { schemaName } : {};
+};
 
 type SidebarTreeDragEventLike = {
   dataTransfer?: DataTransfer | null;
@@ -538,7 +601,7 @@ export const buildAllSavedQueriesTreeNode = (
           automaticChildren.push({
               title: conn.name || conn.id,
               key: `all-saved-queries-connection-${conn.id}`,
-              icon: getDbIcon(iconType, iconColor, 22),
+              icon: getDbIcon(iconType, iconColor, 20),
               type: 'saved-query-group',
               selectable: false,
               isLeaf: false,
@@ -631,13 +694,197 @@ export const buildAllSavedQueriesTreeNode = (
   return {
       title: t('sidebar.tree.all_saved_queries'),
       key: 'all-saved-queries',
-      icon: <FolderOpenOutlined />,
+      icon: (
+        <span className="gn-v2-tree-folder-icon" data-sidebar-tree-folder-icon="true">
+          <FolderOpenOutlined />
+        </span>
+      ),
       type: 'all-saved-queries',
       isLeaf: false,
       selectable: false,
       children,
   };
 };
+
+export type V2ExplorerContext = {
+  active: boolean;
+  connectionName: string;
+  databaseName: string;
+  objectName: string;
+  tooltip: string;
+};
+
+export const V2ExplorerContextSummary: React.FC<{ context: V2ExplorerContext }> = ({ context }) => (
+  <Tooltip
+    title={(
+      <div
+        className="gn-v2-explorer-context-tooltip"
+        data-sidebar-active-context-tooltip="true"
+      >
+        <strong
+          className="gn-v2-explorer-context-tooltip-line is-connection"
+          data-sidebar-active-context-tooltip-field="connection"
+        >
+          {context.connectionName}
+        </strong>
+        <span
+          className="gn-v2-explorer-context-tooltip-line is-database"
+          data-sidebar-active-context-tooltip-field="database"
+        >
+          {context.databaseName}
+        </span>
+        <span
+          className="gn-v2-explorer-context-tooltip-line is-object"
+          data-sidebar-active-context-tooltip-field="object"
+        >
+          {context.objectName}
+        </span>
+      </div>
+    )}
+    placement="bottomLeft"
+    mouseEnterDelay={0.35}
+    rootClassName="gn-v2-explorer-context-tooltip-popup"
+  >
+    <div
+      className="gn-v2-explorer-context"
+      data-sidebar-active-context-summary="true"
+      data-sidebar-active-context={context.active ? 'true' : 'false'}
+      data-sidebar-active-context-depth={context.objectName ? 'object' : context.databaseName ? 'database' : 'connection'}
+      aria-label={context.tooltip}
+    >
+      <span className="gn-v2-explorer-context-copy">
+        <strong
+          className="gn-v2-explorer-context-line is-connection"
+          data-sidebar-active-context-field="connection"
+        >
+          {context.connectionName}
+        </strong>
+        <span
+          className="gn-v2-explorer-context-line is-database"
+          data-sidebar-active-context-field="database"
+        >
+          {context.databaseName}
+        </span>
+        <span
+          className="gn-v2-explorer-context-line is-object"
+          data-sidebar-active-context-field="object"
+        >
+          {context.objectName}
+        </span>
+      </span>
+    </div>
+  </Tooltip>
+);
+
+export type V2ExplorerToolbarActionLabels = {
+  objectActions: string;
+  locateCurrentTable: string;
+  locateCurrentTableUnavailable: string;
+  scrollToTop: string;
+  connectionActions: string;
+};
+
+export type V2ExplorerToolbarToggleAction = {
+  label: string;
+  onClick: () => void;
+  buttonRef?: React.Ref<HTMLButtonElement>;
+  placement: 'explorer-toolbar' | 'collapsed-titlebar';
+  expanded: boolean;
+};
+
+export const V2ExplorerToolbarActions: React.FC<{
+  labels: V2ExplorerToolbarActionLabels;
+  canLocateActiveTab: boolean;
+  hasActiveConnection: boolean;
+  onLocateCurrentTable: () => void;
+  onScrollToTop: () => void;
+  onOpenConnectionActions: (event: React.MouseEvent<HTMLElement>) => void;
+  toggleAction?: V2ExplorerToolbarToggleAction;
+}> = ({
+  labels,
+  canLocateActiveTab,
+  hasActiveConnection,
+  onLocateCurrentTable,
+  onScrollToTop,
+  onOpenConnectionActions,
+  toggleAction,
+}) => (
+  <>
+    <div className="gn-v2-explorer-action-group is-navigation" role="group" aria-label={labels.objectActions}>
+      <Tooltip
+        title={canLocateActiveTab ? labels.locateCurrentTable : labels.locateCurrentTableUnavailable}
+        placement="bottom"
+        mouseEnterDelay={0.35}
+      >
+        <span
+          className="gn-v2-explorer-action-wrap"
+          tabIndex={canLocateActiveTab ? undefined : 0}
+          aria-label={canLocateActiveTab ? undefined : labels.locateCurrentTableUnavailable}
+        >
+          <Button
+            size="small"
+            type="text"
+            className="gn-v2-explorer-tool"
+            icon={<AimOutlined />}
+            aria-label={labels.locateCurrentTable}
+            data-sidebar-locate-current-tab-action="true"
+            disabled={!canLocateActiveTab}
+            onClick={onLocateCurrentTable}
+          />
+        </span>
+      </Tooltip>
+      <Tooltip title={labels.scrollToTop} placement="bottom" mouseEnterDelay={0.35}>
+        <Button
+          size="small"
+          type="text"
+          className="gn-v2-explorer-tool"
+          icon={<VerticalAlignTopOutlined />}
+          aria-label={labels.scrollToTop}
+          data-sidebar-scroll-to-top-action="true"
+          onClick={onScrollToTop}
+        />
+      </Tooltip>
+    </div>
+    <div className="gn-v2-explorer-action-group is-connection" role="group" aria-label={labels.connectionActions}>
+      <Tooltip title={labels.connectionActions} placement="bottom" mouseEnterDelay={0.35}>
+        <span
+          className="gn-v2-explorer-action-wrap"
+          tabIndex={hasActiveConnection ? undefined : 0}
+          aria-label={hasActiveConnection ? undefined : labels.connectionActions}
+        >
+          <Button
+            size="small"
+            type="text"
+            className="gn-v2-explorer-tool"
+            icon={<MoreOutlined />}
+            aria-label={labels.connectionActions}
+            aria-haspopup="menu"
+            data-sidebar-active-connection-actions="true"
+            disabled={!hasActiveConnection}
+            onClick={onOpenConnectionActions}
+          />
+        </span>
+      </Tooltip>
+    </div>
+    {toggleAction && (
+      <Tooltip title={toggleAction.label} placement="bottom" mouseEnterDelay={0.35}>
+        <Button
+          ref={toggleAction.buttonRef}
+          size="small"
+          type="text"
+          className="gonavi-sidebar-collapse-trigger gn-v2-explorer-tool"
+          data-sidebar-collapse-trigger="true"
+          data-sidebar-toggle-placement={toggleAction.placement}
+          aria-label={toggleAction.label}
+          aria-controls="gonavi-sidebar-tree-panel"
+          aria-expanded={toggleAction.expanded}
+          icon={toggleAction.expanded ? <MenuFoldOutlined /> : <MenuUnfoldOutlined />}
+          onClick={toggleAction.onClick}
+        />
+      </Tooltip>
+    )}
+  </>
+);
 
 const Sidebar: React.FC<{
   onCreateConnection?: () => void;
@@ -646,22 +893,26 @@ const Sidebar: React.FC<{
   onOpenSettings?: () => void;
   /**
    * Open a settings-center group/pane, tool-center entry, or run a settings action
-   * (import/export connections, data-sync, sql audit). Mirrors 设置 left-nav groups.
+   * (import/export connections, data-sync, driver manager, sql audit). Mirrors 设置 left-nav groups.
    */
   onOpenSettingsNavigation?: (spec: {
     group: 'preferences' | 'services' | 'config' | 'workflow' | 'workspace' | 'about';
     pane?: string;
-    action?: 'import-connections' | 'export-connections' | 'schema-compare' | 'data-compare' | 'sync' | 'sql-audit';
+    action?: 'import-connections' | 'export-connections' | 'schema-compare' | 'data-compare' | 'sync' | 'drivers' | 'sql-audit';
   }) => void;
   /** Whether web-only settings entries (e.g. browser auth) should appear. */
   isWebRuntime?: boolean;
   onOpenDataSyncWorkbench?: (entryMode: DataSyncEntryMode) => void;
   onToggleAI?: () => void;
   onToggleLogPanel?: () => void;
-  uiVersion?: 'legacy' | 'v2';
+  v2ExplorerContext?: V2ExplorerContext;
+  collapsedSidebarActionsTarget?: HTMLElement | null;
+  onTitlebarSnapshotChange?: (snapshot: React.SetStateAction<TitlebarSidebarSnapshot>) => void;
   onFocusCommandSearch?: () => void;
   onCollapseSidebar?: () => void;
   onExpandSidebar?: () => void;
+  /** Expands a collapsed explorer before a locate request changes its selection. */
+  onEnsureSidebarExpanded?: () => void;
   collapseSidebarLabel?: string;
   collapseSidebarButtonRef?: React.Ref<HTMLButtonElement>;
   expandSidebarLabel?: string;
@@ -673,13 +924,15 @@ const Sidebar: React.FC<{
   onOpenSettings,
   onOpenSettingsNavigation,
   isWebRuntime = false,
-  onOpenDataSyncWorkbench,
   onToggleAI,
   onToggleLogPanel,
-  uiVersion,
+  v2ExplorerContext,
+  collapsedSidebarActionsTarget,
+  onTitlebarSnapshotChange,
   onFocusCommandSearch,
   onCollapseSidebar,
   onExpandSidebar,
+  onEnsureSidebarExpanded,
   collapseSidebarLabel,
   collapseSidebarButtonRef,
   expandSidebarLabel,
@@ -711,6 +964,8 @@ const Sidebar: React.FC<{
   const removeConnection = useStore(state => state.removeConnection);
   const connectionTags = useStore(state => state.connectionTags);
   const sidebarRootOrder = useStore(state => state.sidebarRootOrder);
+  const rootSortMode = useStore(state => state.rootSortMode);
+  const rootConnectionSortMode = useStore(state => state.rootConnectionSortMode);
   const addConnectionTag = useStore(state => state.addConnectionTag);
   const updateConnectionTag = useStore(state => state.updateConnectionTag);
   const removeConnectionTag = useStore(state => state.removeConnectionTag);
@@ -755,11 +1010,7 @@ const Sidebar: React.FC<{
   const disableLocalBackdropFilter = isMacLikePlatform();
   const autoFetchVisible = useAutoFetchVisibility();
   const activeShortcutPlatform = getShortcutPlatform(isMacLikePlatform());
-  const focusSidebarSearchShortcut = resolveShortcutDisplay(shortcutOptions, 'focusSidebarSearch', activeShortcutPlatform);
-  const focusSidebarSearchShortcutTokens = focusSidebarSearchShortcut === '-'
-      ? []
-      : focusSidebarSearchShortcut.match(/Ctrl|Alt|Shift|Esc|Space|[⌘⌃⌥⇧↵↑↓←→]|[^+]/g) ?? [];
-  const isV2Ui = (uiVersion ?? appearance.uiVersion) === 'v2';
+
   const [treeData, setTreeData] = useState<TreeNode[]>([]);
   const activeTab = useMemo(() => tabs.find(tab => tab.id === activeTabId) || null, [tabs, activeTabId]);
   const activeTabHasConnection = useMemo(
@@ -770,7 +1021,10 @@ const Sidebar: React.FC<{
     [activeTab?.connectionId, connections],
   );
   const activeTabLocateRequest = useMemo(() => normalizeSidebarLocateObjectRequestFromTab(activeTab), [activeTab]);
-  const canLocateActiveTab = !!activeTabLocateRequest;
+  const isActiveQueryTab = activeTab?.type === 'query' && !String(activeTab.filePath || '').trim();
+  const canLocateActiveTab = isActiveQueryTab
+    ? Boolean(activeTabHasConnection && String(activeTab?.dbName || '').trim())
+    : !!activeTabLocateRequest;
 
   // Background Helper (Duplicate logic for now, ideally shared)
   const getBg = (darkHex: string) => {
@@ -785,9 +1039,8 @@ const Sidebar: React.FC<{
   const overlayTheme = useMemo(
       () => buildOverlayWorkbenchTheme(darkMode, {
           disableBackdropFilter: disableLocalBackdropFilter,
-          uiVersion: isV2Ui ? 'v2' : 'legacy',
       }),
-      [darkMode, disableLocalBackdropFilter, isV2Ui],
+      [darkMode, disableLocalBackdropFilter],
   );
   const modalPanelStyle = useMemo(() => ({
       background: overlayTheme.shellBg,
@@ -826,12 +1079,13 @@ const Sidebar: React.FC<{
       </div>
   );
   const v2SidebarSearchMode = appearance.v2SidebarSearchMode ?? 'command';
-  const v2UseLegacySidebarFilter = isV2Ui && v2SidebarSearchMode === 'filter';
-  const v2CommandSearchPersistentFilterEnabled = appearance.v2CommandSearchPersistentFilterEnabled === true;
+  const usePersistentSidebarFilter = v2SidebarSearchMode === 'filter';
   const v2PersistedSidebarFilter = appearance.v2SidebarPersistedFilter ?? '';
   const tableDoubleClickAction = appearance.tableDoubleClickAction === 'open-design' ? 'open-design' : 'open-data';
   const sidebarSingleDatabaseExpansion = appearance.sidebarSingleDatabaseExpansion === true;
-  const [searchValue, setSearchValue] = useState(v2PersistedSidebarFilter);
+  const [searchValue, setSearchValue] = useState(
+      usePersistentSidebarFilter ? v2PersistedSidebarFilter : '',
+  );
   const deferredSearchValue = useDeferredValue(searchValue);
   const [searchScopes, setSearchScopes] = useState<SearchScope[]>(['smart']);
   const [v2ExplorerFilter, setV2ExplorerFilter] = useState<V2ExplorerFilter>('all');
@@ -840,7 +1094,7 @@ const Sidebar: React.FC<{
   const commandSearchInputRef = useRef<any>(null);
   const [isV2CommandSearchOpen, setIsV2CommandSearchOpen] = useState(false);
   const commandSearchSqlLogs = useStore(
-      state => selectSidebarCommandSearchSqlLogs(state, isV2Ui && isV2CommandSearchOpen),
+      state => selectSidebarCommandSearchSqlLogs(state, isV2CommandSearchOpen),
   );
   const recentSqlLogs = useMemo(
       () => selectRecentSidebarSqlLogs(commandSearchSqlLogs),
@@ -854,10 +1108,26 @@ const Sidebar: React.FC<{
   const [autoExpandParent, setAutoExpandParent] = useState(true);
   const [loadedKeys, setLoadedKeys] = useState<React.Key[]>([]);
   const [selectedKeys, setSelectedKeys] = useState<React.Key[]>([]);
+  const selectedSidebarKeyRef = useRef('');
+  const setSidebarSelectedKeys = useCallback((
+      action: React.SetStateAction<React.Key[]>,
+  ) => {
+      if (typeof action === 'function') {
+          setSelectedKeys((previous) => {
+              const next = action(previous);
+              selectedSidebarKeyRef.current = String(next[0] ?? '').trim();
+              return next;
+          });
+          return;
+      }
+      selectedSidebarKeyRef.current = String(action[0] ?? '').trim();
+      setSelectedKeys(action);
+  }, []);
   const selectedNodesRef = useRef<any[]>([]);
   const loadingNodesRef = useRef<Set<string>>(new Set());
   const databaseTreeTouchedAtRef = useRef<Record<string, number>>({});
   const pruneLoadedDatabaseTreesRef = useRef<() => void>(() => {});
+  const refreshConnectionResourcesRef = useRef<(node: any) => Promise<void>>(async () => {});
   const loadNacosServiceGroupsRef = useRef<(
       node: any,
       options?: { force?: boolean },
@@ -872,13 +1142,14 @@ const Sidebar: React.FC<{
   const treeDragSelectionSnapshotRef = useRef<{
       selectedKeys: React.Key[];
       selectedNodes: any[];
-      activeContext: { connectionId: string; dbName: string } | null;
+      activeContext: { connectionId: string; dbName: string; schemaName?: string; tableName?: string } | null;
   }>({
       selectedKeys: [],
       selectedNodes: [],
       activeContext: null,
   });
   const connectionReloadSignaturesRef = useRef<Record<string, string>>({});
+  const invalidateConnectionLoadsRef = useRef<(connectionId: string) => void>(() => {});
   expandedKeysRef.current = expandedKeys;
   const connectionIds = useMemo(() => connections.map((conn) => conn.id), [connections]);
   const queryCapableConnectionIds = useMemo(
@@ -914,10 +1185,10 @@ const Sidebar: React.FC<{
   const restoreTreeSelectionAfterDrag = useCallback(() => {
       const snapshot = treeDragSelectionSnapshotRef.current;
       treeDragSelectSuppressUntilRef.current = Date.now() + 1000;
-      setSelectedKeys(snapshot.selectedKeys);
+      setSidebarSelectedKeys(snapshot.selectedKeys);
       selectedNodesRef.current = snapshot.selectedNodes;
       setActiveContext(snapshot.activeContext);
-  }, [setActiveContext]);
+  }, [setActiveContext, setSidebarSelectedKeys]);
 
   const openV2CommandSearch = useCallback(() => {
       pruneLoadedDatabaseTreesRef.current();
@@ -925,34 +1196,22 @@ const Sidebar: React.FC<{
       setV2CommandActiveIndex(0);
   }, []);
 
-  const commitV2CommandSearchPersistentFilter = useCallback((value = v2CommandSearchValue) => {
-      if (!v2CommandSearchPersistentFilterEnabled) {
-          return;
-      }
-      const nextFilter = value.trim();
-      setSearchValue(nextFilter);
-      if (nextFilter !== v2PersistedSidebarFilter) {
-          setAppearance({ v2SidebarPersistedFilter: nextFilter });
-      }
-  }, [setAppearance, v2CommandSearchPersistentFilterEnabled, v2CommandSearchValue, v2PersistedSidebarFilter]);
-
   const closeV2CommandSearch = useCallback(() => {
-      commitV2CommandSearchPersistentFilter();
       setIsV2CommandSearchOpen(false);
       setV2CommandSearchValue('');
       setV2CommandActiveIndex(0);
-  }, [commitV2CommandSearchPersistentFilter]);
+  }, []);
 
   useEffect(() => {
-      setSearchValue(v2PersistedSidebarFilter);
-  }, [v2PersistedSidebarFilter]);
+      setSearchValue(usePersistentSidebarFilter ? v2PersistedSidebarFilter : '');
+  }, [usePersistentSidebarFilter, v2PersistedSidebarFilter]);
 
   const persistV2SidebarFilter = useCallback((nextFilter: string) => {
       setAppearance({ v2SidebarPersistedFilter: nextFilter });
   }, [setAppearance]);
 
   useSidebarFilterPersistence({
-      enabled: v2UseLegacySidebarFilter,
+      enabled: usePersistentSidebarFilter,
       searchValue,
       persistedFilter: v2PersistedSidebarFilter,
       onPersist: persistV2SidebarFilter,
@@ -962,56 +1221,24 @@ const Sidebar: React.FC<{
       setV2CommandSearchValue(value);
   }, []);
 
-  useEffect(() => {
-      if (!v2CommandSearchPersistentFilterEnabled) {
-          return;
-      }
-      if (!isV2CommandSearchOpen) {
-          return;
-      }
-      const nextFilter = resolveV2CommandSearchPersistentFilter({
-          commandSearchValue: deferredV2CommandSearchValue,
-          persistedFilter: v2PersistedSidebarFilter,
-          enabled: v2CommandSearchPersistentFilterEnabled,
-          isOpen: isV2CommandSearchOpen,
-      });
-      setSearchValue(nextFilter);
-      const timer = window.setTimeout(() => {
-          setAppearance({ v2SidebarPersistedFilter: nextFilter });
-      }, 160);
-      return () => window.clearTimeout(timer);
-  }, [deferredV2CommandSearchValue, isV2CommandSearchOpen, setAppearance, v2CommandSearchPersistentFilterEnabled, v2PersistedSidebarFilter]);
-
-  const toggleV2CommandSearchPersistentFilter = useCallback((enabled: boolean) => {
-      const nextFilter = enabled ? v2CommandSearchValue.trim() : '';
-      setSearchValue(nextFilter);
-      setAppearance({
-          v2CommandSearchPersistentFilterEnabled: enabled,
-          v2SidebarPersistedFilter: nextFilter,
-      });
-      message.success(
-          enabled
-              ? t('sidebar.message.sidebar_filter_sync_enabled')
-              : t('sidebar.message.sidebar_filter_sync_disabled'),
-      );
-  }, [setAppearance, v2CommandSearchValue]);
-
   const resetV2SidebarFilter = useCallback(() => {
       setSearchValue('');
-      setAppearance({
-          v2CommandSearchPersistentFilterEnabled: false,
-          v2SidebarPersistedFilter: '',
-      });
+      setAppearance({ v2SidebarPersistedFilter: '' });
       message.success(t('sidebar.message.sidebar_filter_reset'));
   }, [setAppearance]);
-  
+
   // Virtual Scroll State
   const [treeHeight, setTreeHeight] = useState(500);
   const [treeViewportWidth, setTreeViewportWidth] = useState(0);
-  const [isTreeScrolling, setIsTreeScrolling] = useState(false);
   const treeContainerRef = useRef<HTMLDivElement>(null);
   const treeScrollIdleTimerRef = useRef<number | null>(null);
   const treeRef = useRef<any>(null);
+  const sidebarTreeScrollRequestIdRef = useRef(0);
+  const [sidebarTreeScrollRequest, setSidebarTreeScrollRequest] = useState<{
+      id: number;
+      key: React.Key;
+      scrollBlock: 'nearest' | 'center';
+  } | null>(null);
   const treeDataRef = useRef<TreeNode[]>([]);
   const externalSQLDirectoryTreesRef = useRef<Record<string, ExternalSQLTreeEntry[]>>({});
   const findTreeNodeByKeyRef = useRef<(nodes: TreeNode[], targetKey: React.Key) => TreeNode | null>(() => null);
@@ -1063,32 +1290,26 @@ const Sidebar: React.FC<{
   }, []);
 
   const markTreeScrollActivity = useCallback(() => {
-      if (!isV2Ui) return;
-      setIsTreeScrolling(true);
+      treeContainerRef.current?.classList.add('is-vertical-scrolling');
       if (treeScrollIdleTimerRef.current !== null) {
           window.clearTimeout(treeScrollIdleTimerRef.current);
       }
       treeScrollIdleTimerRef.current = window.setTimeout(() => {
           treeScrollIdleTimerRef.current = null;
-          setIsTreeScrolling(false);
+          treeContainerRef.current?.classList.remove('is-vertical-scrolling');
       }, SIDEBAR_TREE_SCROLL_IDLE_DELAY_MS);
-  }, [isV2Ui]);
-
-  const handleTreeWheel = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
-      if (Math.abs(event.deltaY) > Math.abs(event.deltaX)) {
-          markTreeScrollActivity();
-      }
-  }, [markTreeScrollActivity]);
+  }, []);
 
   useEffect(() => () => {
       if (treeScrollIdleTimerRef.current !== null) {
           window.clearTimeout(treeScrollIdleTimerRef.current);
       }
+      treeContainerRef.current?.classList.remove('is-vertical-scrolling');
   }, []);
 
   useEffect(() => {
       const handleFocusSidebarSearch = () => {
-          if (isV2Ui && !v2UseLegacySidebarFilter) {
+          if (!usePersistentSidebarFilter) {
               openV2CommandSearch();
               return;
           }
@@ -1103,7 +1324,7 @@ const Sidebar: React.FC<{
       return () => {
           window.removeEventListener('gonavi:focus-sidebar-search', handleFocusSidebarSearch as EventListener);
       };
-  }, [isV2Ui, openV2CommandSearch, v2UseLegacySidebarFilter]);
+  }, [openV2CommandSearch, usePersistentSidebarFilter]);
 
   useEffect(() => {
       if (!isV2CommandSearchOpen) return;
@@ -1128,9 +1349,10 @@ const Sidebar: React.FC<{
       window.addEventListener('keydown', handleV2CommandSearchGlobalKeyDown, true);
       return () => window.removeEventListener('keydown', handleV2CommandSearchGlobalKeyDown, true);
   }, [closeV2CommandSearch, isV2CommandSearchOpen]);
-  
+
   // Connection Status State: key -> 'loading' | 'success' | 'error'
   const [connectionStates, setConnectionStates] = useState<Record<string, SidebarConnectionState>>({});
+
   const [isTreeDragging, setIsTreeDragging] = useState(false);
   const [sidebarTreeDragNodeType, setSidebarTreeDragNodeType] = useState<string | null>(null);
   const [sidebarTreeDropPreview, setSidebarTreeDropPreview] = useState<{
@@ -1186,6 +1408,18 @@ const Sidebar: React.FC<{
   // Connection Tag Modals
   const [isCreateTagModalOpen, setIsCreateTagModalOpen] = useState(false);
   const [createTagForm] = Form.useForm();
+
+  useEffect(() => {
+    const openTagForm = (event: Event) => {
+      const parentTagId = String((event as CustomEvent<{ parentTagId?: string }>).detail?.parentTagId || '').trim();
+      setRenameViewTarget(null);
+      createTagForm.resetFields();
+      if (parentTagId) createTagForm.setFieldsValue({ parentTagId });
+      setIsCreateTagModalOpen(true);
+    };
+    window.addEventListener('gonavi:open-connection-tag-form', openTagForm);
+    return () => window.removeEventListener('gonavi:open-connection-tag-form', openTagForm);
+  }, [createTagForm]);
 
   const {
       handleExportDatabaseSQL,
@@ -1247,6 +1481,7 @@ const Sidebar: React.FC<{
         return next;
       });
       staleIds.forEach((id) => {
+        invalidateConnectionLoadsRef.current(id);
         Array.from(loadingNodesRef.current).forEach((key) => {
           if (key === `dbs-${id}` || key.startsWith(`tables-${id}-`)) {
             loadingNodesRef.current.delete(key);
@@ -1283,7 +1518,7 @@ const Sidebar: React.FC<{
         return {
           title: conn.name,
           key: conn.id,
-          icon: getDbIcon(iconType, iconColor, 22),
+          icon: getDbIcon(iconType, iconColor, 20),
           type: 'connection',
           'data-sidebar-node-key': conn.id,
           'data-sidebar-node-type': 'connection',
@@ -1323,6 +1558,8 @@ const Sidebar: React.FC<{
         connections,
         connectionTags,
         sidebarRootOrder,
+        rootSortMode,
+        rootConnectionSortMode,
       ).map(buildTreeNode);
       if (allSavedQueriesNode) {
         orderedNodes.push(allSavedQueriesNode);
@@ -1330,7 +1567,7 @@ const Sidebar: React.FC<{
       const externalSQLRootNode = prev.find((node) => node.type === 'external-sql-root');
       return externalSQLRootNode ? [...orderedNodes, externalSQLRootNode] : orderedNodes;
     });
-  }, [connections, connectionTags, sidebarRootOrder, allSavedQueriesNode]);
+  }, [connections, connectionTags, sidebarRootOrder, rootSortMode, rootConnectionSortMode, allSavedQueriesNode]);
 
   const handleDuplicateConnection = async (conn: SavedConnection) => {
     if (!conn?.id) return;
@@ -1354,30 +1591,6 @@ const Sidebar: React.FC<{
       message.error(error?.message || t('connection.sidebar.duplicate.failureFallback'));
     }
   };
-  const updateTreeData = (
-    list: TreeNode[],
-    key: React.Key,
-    children: TreeNode[] | undefined,
-    dataRef?: unknown,
-  ): TreeNode[] => {
-    return list.map(node => {
-      if (node.key === key) {
-        return {
-          ...node,
-          children,
-          ...(dataRef === undefined ? {} : { dataRef }),
-        };
-      }
-      if (node.children) {
-        return {
-          ...node,
-          children: updateTreeData(node.children, key, children, dataRef),
-        };
-      }
-      return node;
-    });
-  };
-
   const findTreeNodeByKey = (nodes: TreeNode[], targetKey: React.Key): TreeNode | null => {
     for (const node of nodes) {
       if (node.key === targetKey) {
@@ -1395,12 +1608,153 @@ const Sidebar: React.FC<{
 
   findTreeNodeByKeyRef.current = findTreeNodeByKey;
 
+  const resolveSidebarSelectionContext = useCallback((node: any): TitlebarSelectionContext | null => {
+      if (!node) return null;
+      const type = String(node.type || '');
+      const dataRef = node.dataRef || {};
+      const connectionId = type === 'connection'
+          ? String(node.key || dataRef.id || '').trim()
+          : String(
+              resolveSidebarNodeConnectionId(node, connectionIds)
+              || dataRef.id
+              || dataRef.connectionId
+              || '',
+          ).trim();
+      if (!connectionId) return null;
+
+      // The state map is keyed by the Host connection id. Keep this key
+      // stable when a database/table row is selected so the title bar follows
+      // the same Host marker as the tree instead of a child-row spinner.
+      const sidebarStateKey = connectionId;
+
+      if (type === 'connection') {
+          return { connectionId, dbName: '', sidebarStateKey };
+      }
+
+      let dbName = String(dataRef.dbName || '').trim();
+      if (type === 'redis-db') {
+          dbName = `db${dataRef.redisDB}`;
+      } else if (
+          type === 'nacos-namespace'
+          || type === 'nacos-config-entry'
+          || type === 'nacos-config-group'
+          || type === 'nacos-services-entry'
+          || type === 'nacos-service-group'
+      ) {
+          dbName = String(
+              dataRef.nacosNamespaceName
+              || dataRef.nacosNamespaceId
+              || 'public',
+          ).trim();
+      }
+
+      const tableName = resolveSidebarTitlebarObjectName(node);
+      return tableName
+          ? { connectionId, dbName, tableName, sidebarStateKey }
+          : { connectionId, dbName, sidebarStateKey };
+  }, [connectionIds]);
+
+  const titlebarSnapshotRevisionRef = useRef(0);
+  const publishTitlebarSnapshotUpdate = useCallback((
+      update: (snapshot: TitlebarSidebarSnapshot) => TitlebarSidebarSnapshot,
+      expectedSelectedKey?: unknown,
+  ) => {
+      const revision = ++titlebarSnapshotRevisionRef.current;
+      const expectedKey = expectedSelectedKey === undefined
+          ? undefined
+          : String(expectedSelectedKey ?? '').trim();
+      onTitlebarSnapshotChange?.((current) => {
+          // A queued effect can outlive the selection that produced it. Do
+          // not let that older tree key repaint the title bar after the user
+          // has already selected another row.
+          if (
+              expectedKey !== undefined
+              && selectedSidebarKeyRef.current !== expectedKey
+          ) {
+              return current;
+          }
+          const next = update(current);
+          return mergeTitlebarSidebarSnapshot(current, {
+              ...next,
+              revision,
+          });
+      });
+  }, [onTitlebarSnapshotChange]);
+
+  const publishTitlebarSelection = useCallback((
+      selection: TitlebarSelectionContext | null,
+      expectedSelectedKey?: unknown,
+  ) => {
+      // `sidebarStateKey` identifies the Host marker; the stale-update guard
+      // must use the actual rc-tree row key (which may be a database/table).
+      const expectedKey = expectedSelectedKey === undefined
+          ? selectedSidebarKeyRef.current
+          : expectedSelectedKey;
+      publishTitlebarSnapshotUpdate((snapshot) => ({
+          ...snapshot,
+          selection,
+      }), expectedKey);
+  }, [publishTitlebarSnapshotUpdate]);
+
+  const publishTitlebarSelectionForNode = useCallback((node: any) => {
+      const selection = resolveSidebarSelectionContext(node);
+      const selectedKey = String(node?.key ?? '').trim();
+      if (selectedKey) {
+          selectedSidebarKeyRef.current = selectedKey;
+      }
+      publishTitlebarSnapshotUpdate((snapshot) => ({
+          ...snapshot,
+          selection,
+      }), selectedKey || selection?.sidebarStateKey || '');
+  }, [publishTitlebarSnapshotUpdate, resolveSidebarSelectionContext]);
+
+  // Keep the title bar tied to the row selected in this tree, even when a
+  // different workbench tab is active.
+  const lastPublishedSidebarSnapshotRef = useRef<{
+      selectionSignature: string;
+      connectionStates: Record<string, SidebarConnectionState>;
+  } | null>(null);
+  useSidebarLayoutEffect(() => {
+      const selectedKey = selectedKeys[0];
+      const selectedNode = selectedKey == null
+          ? null
+          : findTreeNodeByKey(treeData, selectedKey)
+              || selectedNodesRef.current.find((node) => String(node?.key) === String(selectedKey));
+      if (shouldDeferSidebarTitlebarSelection({
+          selectedKey,
+          selectedNode,
+          connectionIds,
+      })) {
+          return;
+      }
+      const context = resolveSidebarSelectionContext(selectedNode);
+      const selectionSignature = context
+          ? [context.connectionId, context.dbName, context.tableName || '', context.sidebarStateKey || ''].join('\u0000')
+          : '';
+      const previous = lastPublishedSidebarSnapshotRef.current;
+      if (
+          previous
+          && previous.selectionSignature === selectionSignature
+          && previous.connectionStates === connectionStates
+      ) {
+          return;
+      }
+      lastPublishedSidebarSnapshotRef.current = {
+          selectionSignature,
+          connectionStates,
+      };
+      publishTitlebarSnapshotUpdate(() => ({
+          selection: context,
+          connectionStates,
+      }), selectedKey == null ? '' : selectedKey);
+  }, [connectionIds, connectionStates, publishTitlebarSnapshotUpdate, resolveSidebarSelectionContext, selectedKeys, treeData]);
+
   const replaceTreeNodeChildren = (
     key: React.Key,
     children: TreeNode[] | undefined,
     dataRef?: unknown,
   ): TreeNode[] => {
-      const nextTreeData = updateTreeData(treeDataRef.current, key, children, dataRef);
+      const nextTreeData = replaceSidebarTreeNodeChildren(treeDataRef.current, key, children, dataRef);
       treeDataRef.current = nextTreeData;
       setTreeData(nextTreeData);
       return nextTreeData;
@@ -1431,10 +1785,25 @@ const Sidebar: React.FC<{
           return nextTreeData;
       });
       setLoadedKeys((prev) => prev.filter((key) => !keysToClearSet.has(String(key))));
+      // Clearing a Host subtree also invalidates its transient load result;
+      // otherwise a late metadata response can repaint the unloaded row green.
+      const clearedConnectionIds = connectionIds.filter((connectionId) => keysToClearSet.has(connectionId));
+      clearedConnectionIds.forEach((connectionId) => invalidateConnectionLoadsRef.current(connectionId));
+      setConnectionStates((previous) => {
+          let changed = false;
+          const next = { ...previous };
+          keysToClearSet.forEach((key) => {
+              if (Object.prototype.hasOwnProperty.call(next, key)) {
+                  delete next[key];
+                  changed = true;
+              }
+          });
+          return changed ? next : previous;
+      });
       keysToClearSet.forEach((key) => {
           delete databaseTreeTouchedAtRef.current[key];
       });
-  }, []);
+  }, [connectionIds]);
 
   const pruneLoadedDatabaseTrees = useCallback(() => {
       const activeDatabaseKey = activeContext?.connectionId && activeContext?.dbName
@@ -1455,7 +1824,7 @@ const Sidebar: React.FC<{
   }, [activeContext?.connectionId, activeContext?.dbName, clearTreeNodeChildrenByKeys, expandedKeys, selectedKeys]);
   pruneLoadedDatabaseTreesRef.current = pruneLoadedDatabaseTrees;
 
-  const mergeExpandedTreeKeys = (requiredKeys: React.Key[]) => {
+  const mergeExpandedTreeKeys = useCallback((requiredKeys: React.Key[]) => {
       setExpandedKeys(prev => {
           const merged = [...prev];
           requiredKeys.forEach(key => {
@@ -1464,27 +1833,26 @@ const Sidebar: React.FC<{
           return merged;
       });
       setAutoExpandParent(true);
-  };
+  }, []);
 
-  const scrollSidebarTreeToKey = (key: React.Key) => {
-      const runAfterFrame = typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function'
-          ? window.requestAnimationFrame.bind(window)
-          : (callback: FrameRequestCallback) => window.setTimeout(() => callback(Date.now()), 0);
-
-      runAfterFrame(() => {
-          treeRef.current?.scrollTo?.({ key, align: 'auto' });
-          runAfterFrame(() => {
-              const selectedNode = treeContainerRef.current?.querySelector('.ant-tree-treenode-selected') as HTMLElement | null;
-              selectedNode?.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
-          });
-      });
-  };
+  const scrollSidebarTreeToKey = useCallback((
+      key: React.Key,
+      scrollBlock: 'nearest' | 'center' = 'nearest',
+  ) => {
+      const id = sidebarTreeScrollRequestIdRef.current + 1;
+      sidebarTreeScrollRequestIdRef.current = id;
+      setSidebarTreeScrollRequest({ id, key, scrollBlock });
+  }, []);
 
   const decorateExternalSQLTreeNode = (node: ExternalSQLTreeNode): TreeNode => {
     const icon = (() => {
       switch (node.type) {
         case 'external-sql-root':
-          return <FolderOpenOutlined />;
+          return (
+            <span className="gn-v2-tree-folder-icon" data-sidebar-tree-folder-icon="true">
+              <FolderOpenOutlined />
+            </span>
+          );
         case 'external-sql-directory':
           return node.dataRef.directoryStatus === 'missing' ? <WarningOutlined /> : <HddOutlined />;
         case 'external-sql-folder':
@@ -1579,6 +1947,7 @@ const Sidebar: React.FC<{
       handleAddExternalSQLDirectory,
       handleRemoveExternalSQLDirectory,
       handleRefreshExternalSQLDirectory,
+      browserSQLFileInputProps,
       externalSQLFileModalProps,
       externalSQLBindingModalProps,
   } = useSidebarExternalSqlWorkflow({
@@ -1599,6 +1968,7 @@ const Sidebar: React.FC<{
       setExpandedKeys,
       setAutoExpandParent,
       getActiveContext: () => useStore.getState().activeContext,
+      isWebRuntime,
   });
 
   useEffect(() => {
@@ -1653,6 +2023,8 @@ const Sidebar: React.FC<{
           return;
       }
 
+      onEnsureSidebarExpanded?.();
+
       if (request.objectGroup === 'externalSqlFiles') {
           await refreshGlobalExternalSQLRootNode(false);
           const target = resolveSidebarLocateTarget(request, { groupBySchema: false });
@@ -1664,15 +2036,59 @@ const Sidebar: React.FC<{
           const targetKey = path[path.length - 1];
           const targetNode = findTreeNodeByKey(treeDataRef.current, targetKey);
           setSearchValue('');
+          setV2ExplorerFilter('all');
           mergeExpandedTreeKeys(path.slice(0, -1));
-          setSelectedKeys([targetKey]);
+          setSidebarSelectedKeys([targetKey]);
           selectedNodesRef.current = targetNode ? [targetNode] : [];
           const connectionId = String(request.connectionId || activeContext?.connectionId || activeTab?.connectionId || '').trim();
           const dbName = String(request.dbName || activeContext?.dbName || activeTab?.dbName || '').trim();
           if (connectionId) {
               setActiveContext({ connectionId, dbName });
+              publishTitlebarSelection(
+                  resolveSidebarSelectionContext(targetNode)
+                  || {
+                      connectionId,
+                      dbName,
+                      sidebarStateKey: connectionId,
+                  },
+                  targetKey,
+              );
           }
-          scrollSidebarTreeToKey(targetKey);
+          scrollSidebarTreeToKey(targetKey, 'center');
+          return;
+      }
+
+      if (request.objectGroup === 'savedQueries') {
+          const target = resolveSidebarLocateTarget(request, { groupBySchema: false });
+          const path = findSidebarNodePathForLocate(treeDataRef.current as SidebarLocateTreeNodeLike[], target);
+          if (!path) {
+              message.warning(t('sidebar.message.locate_saved_query_not_found', {
+                  name: request.savedQueryName || request.savedQueryId,
+              }));
+              return;
+          }
+          const targetKey = path[path.length - 1];
+          const targetNode = findTreeNodeByKey(treeDataRef.current, targetKey);
+          setSearchValue('');
+          setV2ExplorerFilter('all');
+          mergeExpandedTreeKeys(path.slice(0, -1));
+          setSidebarSelectedKeys([targetKey]);
+          selectedNodesRef.current = targetNode ? [targetNode] : [];
+          const connectionId = String(request.connectionId || activeContext?.connectionId || activeTab?.connectionId || '').trim();
+          const dbName = String(request.dbName || activeContext?.dbName || activeTab?.dbName || '').trim();
+          if (connectionId) {
+              setActiveContext({ connectionId, dbName });
+              publishTitlebarSelection(
+                  resolveSidebarSelectionContext(targetNode)
+                  || {
+                      connectionId,
+                      dbName,
+                      sidebarStateKey: connectionId,
+                  },
+                  targetKey,
+              );
+          }
+          scrollSidebarTreeToKey(targetKey, 'center');
           return;
       }
 
@@ -1750,14 +2166,34 @@ const Sidebar: React.FC<{
       const targetKey = path[path.length - 1];
       const targetNode = findTreeNodeByKey(treeDataRef.current, targetKey);
       setSearchValue('');
+      setV2ExplorerFilter('all');
       mergeExpandedTreeKeys(path.slice(0, -1));
-      setSelectedKeys([targetKey]);
+      setSidebarSelectedKeys([targetKey]);
       selectedNodesRef.current = targetNode ? [targetNode] : [];
-      setActiveContext({ connectionId: request.connectionId, dbName: request.dbName });
-      scrollSidebarTreeToKey(targetKey);
+      setActiveContext({
+          connectionId: request.connectionId,
+          dbName: request.dbName,
+          tableName: resolveSidebarTitlebarObjectName(targetNode) || request.tableName,
+          ...buildOptionalSchemaContext(targetNode?.dataRef?.schemaName || request.schemaName),
+      });
+      publishTitlebarSelection(
+          resolveSidebarSelectionContext(targetNode)
+          || {
+              connectionId: request.connectionId,
+              dbName: request.dbName,
+              tableName: request.tableName,
+              sidebarStateKey: request.connectionId,
+          },
+          targetKey,
+      );
+      scrollSidebarTreeToKey(targetKey, 'center');
   };
 
   const handleLocateActiveTabInSidebar = () => {
+      if (isActiveQueryTab) {
+          window.dispatchEvent(new CustomEvent('gonavi:locate-active-query-table'));
+          return;
+      }
       if (!activeTabLocateRequest) {
           message.warning(t('sidebar.message.locate_current_table_unavailable'));
           return;
@@ -1817,6 +2253,16 @@ const Sidebar: React.FC<{
       const handleSidebarDatabaseRefresh = (event: Event) => {
           const request = normalizeSidebarDatabaseRefreshRequest((event as CustomEvent).detail);
           if (!request) return;
+          if (!request.dbName) {
+              const connectionNode = findTreeNodeByKeyRef.current(
+                  treeDataRef.current,
+                  request.connectionId,
+              );
+              if (connectionNode) {
+                  void refreshConnectionResourcesRef.current(connectionNode);
+              }
+              return;
+          }
           const dbNode = findTreeNodeByKeyRef.current(
               treeDataRef.current,
               `${request.connectionId}-${request.dbName}`,
@@ -1849,7 +2295,7 @@ const Sidebar: React.FC<{
         await refreshGlobalExternalSQLRootNode(false);
     } else if (type === 'table') {
         // Expand table to show object categories
-        const conn = dataRef; 
+        const conn = dataRef;
 
         const folders: TreeNode[] = [
             {
@@ -1885,7 +2331,7 @@ const Sidebar: React.FC<{
                 dataRef: conn
             }
         ];
-        
+
         replaceTreeNodeChildren(key, folders);
     }
   };
@@ -1974,7 +2420,7 @@ const Sidebar: React.FC<{
           return true;
       }
       if (node.type === 'routine') {
-          const { routineName, routineType, dbName, id } = node.dataRef;
+          const { routineName, routineType, dbName, id, schemaName } = node.dataRef;
           const typeLabel = t(routineType === 'PROCEDURE' ? 'sidebar.object.procedure' : 'sidebar.object.function');
           addTab({
               id: `routine-def-${node.key}`,
@@ -1983,7 +2429,8 @@ const Sidebar: React.FC<{
               connectionId: id,
               dbName,
               routineName,
-              routineType
+              routineType,
+              ...buildOptionalSchemaContext(schemaName),
           });
           return true;
       }
@@ -2004,8 +2451,35 @@ const Sidebar: React.FC<{
       return true;
   };
 
+  const clearStaleHostStateOnSelection = (node: any): void => {
+      if (node?.type !== 'connection') return;
+      const connectionId = String(node.key || node.dataRef?.id || '').trim();
+      if (!connectionId) return;
+
+      // The rail and command-search paths call this before writing the tree
+      // selection. Register the row first so a queued update from the prior
+      // Host cannot repaint the title bar after this selection.
+      selectedSidebarKeyRef.current = String(node.key || connectionId).trim();
+
+      // Selecting a Host is a navigation action, not a connection-health
+      // assertion. Clear only a previous success/error result. If an
+      // explicit expansion/reconnect is already loading, keep that request
+      // and its loading state so the title bar stays in lockstep with the
+      // Host row instead of cancelling the in-flight probe.
+      setConnectionStates((previous) => clearSidebarHostConnectionState(previous, connectionId));
+      const selection = resolveSidebarSelectionContext(node);
+      publishTitlebarSnapshotUpdate((snapshot) => ({
+          ...snapshot,
+          selection,
+          connectionStates: clearSidebarHostConnectionState(
+              snapshot.connectionStates,
+              connectionId,
+          ),
+      }), selectedSidebarKeyRef.current);
+  };
+
   const onSelect = (keys: React.Key[], info: any) => {
-      if (isV2Ui && (info?.node?.type === 'v2-table-section' || info?.node?.type === 'v2-database-section')) {
+      if (info?.node?.type === 'v2-table-section' || info?.node?.type === 'v2-database-section') {
           return;
       }
       if (Date.now() < treeDragSelectSuppressUntilRef.current) {
@@ -2014,31 +2488,53 @@ const Sidebar: React.FC<{
       if (isTreeDragging) {
           return;
       }
-      setSelectedKeys(keys);
+      setSidebarSelectedKeys(keys);
       selectedNodesRef.current = info.selectedNodes || [];
 
       if (keys.length === 0) {
-          if (shouldClearSidebarActiveContextOnEmptySelect(isV2Ui)) {
-              setActiveContext(null);
-          }
+          publishTitlebarSelection(null);
           return;
       }
       if (shouldSkipSidebarSelectWhileDragging(isTreeDragging, info)) return;
 
       const { type, dataRef, key, title } = info.node;
       const nodeConnectionId = resolveSidebarNodeConnectionId(info.node, connectionIds);
+      if (type === 'connection') {
+          clearStaleHostStateOnSelection(info.node);
+      } else {
+          publishTitlebarSelectionForNode(info.node);
+      }
 
       // Update active context
       if (type === 'connection') {
           setActiveContext({ connectionId: key, dbName: '' });
       } else if (type === 'database' || type === 'message-namespace') {
           setActiveContext({ connectionId: nodeConnectionId || dataRef.id, dbName: dataRef.dbName });
-      } else if (type === 'table' || type === 'message-object') {
-          setActiveContext({ connectionId: nodeConnectionId || dataRef.id, dbName: dataRef.dbName });
+      } else if (type === 'object-group' && dataRef?.groupKey === 'schema') {
+          setActiveContext({
+              connectionId: nodeConnectionId || dataRef.id,
+              dbName: dataRef.dbName,
+              ...buildOptionalSchemaContext(dataRef.schemaName),
+          });
+      } else if (
+          type === 'table'
+          || type === 'message-object'
+          || type === 'view'
+          || type === 'materialized-view'
+          || type === 'sequence'
+          || type === 'package'
+          || type === 'db-trigger'
+          || type === 'db-event'
+          || type === 'routine'
+      ) {
+          setActiveContext({
+              connectionId: nodeConnectionId || dataRef.id,
+              dbName: dataRef.dbName,
+              tableName: resolveSidebarTitlebarObjectName(info.node),
+              ...buildOptionalSchemaContext(dataRef.schemaName),
+          });
       } else if (type === 'jvm-mode' || type === 'jvm-resource' || type === 'jvm-diagnostic' || type === 'jvm-monitoring') {
           setActiveContext({ connectionId: nodeConnectionId || dataRef.id, dbName: '' });
-      } else if (type === 'view' || type === 'materialized-view' || type === 'sequence' || type === 'package' || type === 'db-trigger' || type === 'db-event' || type === 'routine') {
-          setActiveContext({ connectionId: nodeConnectionId || dataRef.id, dbName: dataRef.dbName });
       } else if (type === 'saved-query') {
           setActiveContext({ connectionId: dataRef.connectionId, dbName: dataRef.dbName });
       } else if (type === 'redis-db') {
@@ -2089,8 +2585,7 @@ const Sidebar: React.FC<{
     // ignore rc-tree's competing expansion so connection resource rows do not
     // unexpectedly open and move the target under the pointer.
     if (
-        isV2Ui
-        && isTreeDragging
+        isTreeDragging
         && sidebarTreeDragNodeRef.current?.type === 'connection'
     ) {
         return;
@@ -2121,24 +2616,48 @@ const Sidebar: React.FC<{
           clickTimerRef.current = null;
       }
       const { type, dataRef, key: nodeKey } = node;
-      if (isV2Ui && (type === 'v2-table-section' || type === 'v2-database-section')) {
+      if (type === 'v2-table-section' || type === 'v2-database-section') {
           return;
       }
       const nodeConnectionId = resolveSidebarNodeConnectionId(node, connectionIds);
-      if (type === 'connection') {
-          setSelectedKeys([nodeKey]);
+      // Context-menu actions call this handler directly, without rc-tree's
+      // preceding select event. Keep the tree selection in sync so the
+      // titlebar layout effect cannot restore the previously selected row
+      // after opening the requested object.
+      if (nodeKey !== undefined && nodeKey !== null && String(nodeKey).trim() !== '') {
+          setSidebarSelectedKeys([nodeKey]);
           selectedNodesRef.current = [node];
+      }
+      if (type === 'connection') {
+          clearStaleHostStateOnSelection(node);
+      } else {
+          publishTitlebarSelectionForNode(node);
+      }
+      if (type === 'connection') {
           setActiveContext({ connectionId: nodeKey, dbName: '' });
       } else if (type === 'database' || type === 'message-namespace') {
-          setSelectedKeys([nodeKey]);
-          selectedNodesRef.current = [node];
           setActiveContext({ connectionId: nodeConnectionId || dataRef.id, dbName: dataRef.dbName });
+      } else if (type === 'object-group' && dataRef?.groupKey === 'schema') {
+          setActiveContext({
+              connectionId: nodeConnectionId || dataRef.id,
+              dbName: dataRef.dbName,
+              ...buildOptionalSchemaContext(dataRef.schemaName),
+          });
       } else if (type === 'jvm-mode' || type === 'jvm-resource' || type === 'jvm-diagnostic' || type === 'jvm-monitoring') {
           setActiveContext({ connectionId: nodeConnectionId || dataRef.id, dbName: '' });
       } else if (type === 'table' || type === 'message-object' || type === 'view' || type === 'materialized-view' || type === 'sequence' || type === 'package' || type === 'db-trigger' || type === 'db-event' || type === 'routine') {
-          setActiveContext({ connectionId: nodeConnectionId || dataRef.id, dbName: dataRef.dbName });
-      } else if (type === 'saved-query') setActiveContext({ connectionId: dataRef.connectionId, dbName: dataRef.dbName });
-      else if (type === 'redis-db') setActiveContext({ connectionId: dataRef.id, dbName: `db${dataRef.redisDB}` });
+          setActiveContext({
+              connectionId: nodeConnectionId || dataRef.id,
+              dbName: dataRef.dbName,
+              tableName: resolveSidebarTitlebarObjectName(node),
+              ...buildOptionalSchemaContext(dataRef.schemaName),
+          });
+      } else if (type === 'saved-query') {
+          setActiveContext({ connectionId: dataRef.connectionId, dbName: dataRef.dbName });
+      }
+      else if (type === 'redis-db') {
+          setActiveContext({ connectionId: dataRef.id, dbName: `db${dataRef.redisDB}` });
+      }
       else if (
           type === 'nacos-namespace'
           || type === 'nacos-config-entry'
@@ -2163,7 +2682,7 @@ const Sidebar: React.FC<{
       if (openMessageObjectNode(node)) {
           return;
       } else if (node.type === 'table') {
-          const { tableName, dbName, id } = node.dataRef;
+          const { tableName, dbName, id, schemaName } = node.dataRef;
           // 记录表访问
           recordTableAccess(id, dbName, tableName);
           addTab({
@@ -2173,6 +2692,7 @@ const Sidebar: React.FC<{
               connectionId: id,
               dbName,
               tableName,
+              ...buildOptionalSchemaContext(schemaName),
               initialViewMode: tableDoubleClickAction === 'open-design' ? 'fields' : undefined,
               initialViewModeRequestId: tableDoubleClickAction === 'open-design' ? String(Date.now()) : undefined,
               objectType: 'table',
@@ -2268,7 +2788,7 @@ const Sidebar: React.FC<{
           openEventDefinition(node);
           return;
       } else if (node.type === 'routine') {
-          const { routineName, routineType, dbName, id } = node.dataRef;
+          const { routineName, routineType, dbName, id, schemaName } = node.dataRef;
           const typeLabel = t(routineType === 'PROCEDURE' ? 'sidebar.object.procedure' : 'sidebar.object.function');
           addTab({
               id: `routine-def-${node.key}`,
@@ -2277,7 +2797,8 @@ const Sidebar: React.FC<{
               connectionId: id,
               dbName,
               routineName,
-              routineType
+              routineType,
+              ...buildOptionalSchemaContext(schemaName),
           });
           return;
       } else if (node.type === 'sequence') {
@@ -2329,7 +2850,7 @@ const Sidebar: React.FC<{
       const keepCollapsed = shouldKeepSidebarSwitcherCollapsedWhileLoading(node, loadingNodesRef.current);
       return <CaretDownFilled rotate={keepCollapsed ? -90 : undefined} />;
   }, []);
-  
+
 
   const buildRuntimeConfig = (conn: any, overrideDatabase?: string, clearDatabase: boolean = false) => {
       return buildRpcConnectionConfig(conn.config, {
@@ -2494,13 +3015,13 @@ const Sidebar: React.FC<{
       loadTables,
       loadNacosConfigGroups,
       loadNacosServiceGroups,
+      invalidateConnectionLoads,
   } = useSidebarTreeLoaders({
       savedQueries,
       tableSortPreference,
       tableAccessCount,
       pinnedSidebarTables,
       pinnedSidebarDatabases,
-      isV2Ui,
       loadingNodesRef,
       setConnectionStates,
       setLoadedKeys,
@@ -2514,6 +3035,7 @@ const Sidebar: React.FC<{
           pruneLoadedDatabaseTrees();
       },
   });
+  invalidateConnectionLoadsRef.current = invalidateConnectionLoads;
   loadNacosServiceGroupsRef.current = loadNacosServiceGroups;
   replaceTreeNodeChildrenRef.current = replaceTreeNodeChildren;
 
@@ -2528,6 +3050,7 @@ const Sidebar: React.FC<{
           connectionId,
       });
 
+      invalidateConnectionLoads(connectionId);
       setLoadedKeys((previous) => previous.filter((key) => !isConnectionTreeKey(key, connectionId)));
       Array.from(loadingNodesRef.current).forEach((loadingKey) => {
           if (loadingKey === `dbs-${connectionId}` || loadingKey.startsWith(`tables-${connectionId}-`)) {
@@ -2586,6 +3109,7 @@ const Sidebar: React.FC<{
           return Array.from(new Set(next));
       });
   };
+  refreshConnectionResourcesRef.current = refreshConnectionResources;
 
   useEffect(() => {
       const handleSidebarDatabaseListRefresh = (event: Event) => {
@@ -3017,6 +3541,7 @@ const Sidebar: React.FC<{
       loadingNodesRef,
       treeDataRef,
       refreshConnectionResources,
+      invalidateConnectionLoads,
       findTreeNodeByKeyRef,
       refreshV2TableContextMenuStatsRef,
       setConnectionStates,
@@ -3081,6 +3606,17 @@ const Sidebar: React.FC<{
       buildConnectionRootRedisCommandTabTitle,
       buildConnectionRootRedisMonitorTabTitle,
   });
+  useEffect(() => {
+      const handleDeleteConnection = (event: Event) => {
+          const connectionId = String(
+              (event as CustomEvent<{ connectionId?: string }>).detail?.connectionId || '',
+          ).trim();
+          const connection = connections.find((item) => item.id === connectionId);
+          if (connection) deleteConnectionNode(getConnectionNodeForAction(connection));
+      };
+      window.addEventListener('gonavi:delete-connection', handleDeleteConnection);
+      return () => window.removeEventListener('gonavi:delete-connection', handleDeleteConnection);
+  }, [connections, deleteConnectionNode, getConnectionNodeForAction]);
   const {
       onSearch,
       searchScopeSummary,
@@ -3095,13 +3631,10 @@ const Sidebar: React.FC<{
       commandSearchFlatItems,
       flattenConnectionNodes,
       activeConnection,
-      activeConnectionDisplayName,
-      activeDatabaseDisplayName,
       v2VisibleTreeData,
       v2TreeHorizontalScrollWidth,
       effectiveTreeHeight,
       v2TreeMetrics,
-      activeConnectionObjectCount,
   } = useSidebarSearchModel({
       searchScopes,
       setSearchScopes,
@@ -3115,7 +3648,7 @@ const Sidebar: React.FC<{
       treeData: visibleSidebarTreeData,
       treeViewportWidth,
       treeHeight,
-      isV2Ui,
+      expandedKeys,
       isV2CommandSearchOpen,
       connections,
       connectionIds,
@@ -3134,35 +3667,170 @@ const Sidebar: React.FC<{
       setAIPanelVisible,
       extractObjectName,
   });
-  const activeConnectionIsMessageQueue = [
-      'mqtt',
-      'kafka',
-      'rocketmq',
-      'rabbitmq',
-  ].includes(resolveDataSourceType(activeConnection?.config));
-  const legacyToolbarButtonColor = darkMode ? 'rgba(255,255,255,0.65)' : 'rgba(0,0,0,0.65)';
-  const legacyToolbarStyle: React.CSSProperties = {
-      padding: '6px 16px',
-      display: 'grid',
-      gridTemplateColumns: 'repeat(6, minmax(0, 1fr))',
-      gap: 8,
-      alignItems: 'center',
-      justifyItems: 'center',
-      borderTop: `1px solid ${darkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.04)'}`,
-      borderBottom: `1px solid ${darkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.04)'}`,
-      background: darkMode ? 'rgba(0,0,0,0.2)' : 'rgba(0,0,0,0.015)',
-  };
-  const legacyToolbarItemStyle: React.CSSProperties = {
-      display: 'flex',
-      alignItems: 'center',
-      justifyContent: 'center',
-      minWidth: 0,
-  };
-  const legacyToolbarDisabledWrapStyle: React.CSSProperties = {
-      display: 'inline-flex',
-      alignItems: 'center',
-      justifyContent: 'center',
-  };
+
+  const handleTreeWheel = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
+      const horizontalDelta = resolveSidebarTreeHorizontalWheelDelta(event);
+      if (horizontalDelta !== 0 && v2TreeHorizontalScrollWidth) {
+          const shell = event.currentTarget;
+          const holder = shell.querySelector<HTMLElement>('.ant-tree-list-holder');
+          const holderInner = shell.querySelector<HTMLElement>('.ant-tree-list-holder-inner');
+          const viewportWidth = holder?.clientWidth || treeViewportWidth;
+          const currentLeft = holderInner
+              ? Math.max(0, -(Number.parseFloat(holderInner.style.marginLeft || '0') || 0))
+              : 0;
+          const nextLeft = resolveSidebarTreeHorizontalScrollLeft({
+              currentLeft,
+              delta: horizontalDelta,
+              scrollWidth: v2TreeHorizontalScrollWidth,
+              viewportWidth,
+          });
+
+          if (nextLeft !== null && treeRef.current?.scrollTo) {
+              // The rc-virtual-list listener is attached to the holder only.
+              // Stop propagation here so blank tree space and the scrollbar
+              // reserve use the same virtual offset without double-applying
+              // the wheel delta when the event target is inside the holder.
+              event.preventDefault();
+              event.stopPropagation();
+              treeRef.current.scrollTo({ left: nextLeft });
+              return;
+          }
+      }
+
+      if (Math.abs(event.deltaY) > Math.abs(event.deltaX)) {
+          markTreeScrollActivity();
+      }
+  }, [
+      true,
+      markTreeScrollActivity,
+      treeViewportWidth,
+      v2TreeHorizontalScrollWidth,
+  ]);
+
+  useEffect(() => {
+
+      const shell = treeContainerRef.current;
+      const holderInner = shell?.querySelector<HTMLElement>('.ant-tree-list-holder-inner');
+      if (!shell || !holderInner) return;
+
+      const syncHorizontalViewportOffset = () => {
+          const marginLeft = Number.parseFloat(holderInner.style.marginLeft || '0');
+          const horizontalOffset = Number.isFinite(marginLeft)
+              ? Math.max(0, -marginLeft)
+              : 0;
+          shell.style.setProperty('--gn-v2-tree-horizontal-offset', `${horizontalOffset}px`);
+      };
+
+      syncHorizontalViewportOffset();
+      const observer = new MutationObserver(syncHorizontalViewportOffset);
+      observer.observe(holderInner, {
+          attributes: true,
+          attributeFilter: ['style'],
+      });
+
+      return () => {
+          observer.disconnect();
+          shell.style.removeProperty('--gn-v2-tree-horizontal-offset');
+      };
+  }, [
+      true,
+      sidebarObjectVisibilitySignature,
+      v2ExplorerFilter,
+      v2TreeHorizontalScrollWidth,
+  ]);
+
+  // 侧栏改宽时复位虚拟列表横滚（offsetLeft / marginLeft），避免左侧被拉空。
+  // rc-virtual-list 不用 DOM scrollLeft，必须走 Tree.scrollTo({ left })。
+  useEffect(() => {
+
+      const resetHorizontalScroll = () => {
+          treeRef.current?.scrollTo?.({ left: 0 });
+      };
+      resetHorizontalScroll();
+      const raf = window.requestAnimationFrame(resetHorizontalScroll);
+      return () => window.cancelAnimationFrame(raf);
+  }, [treeViewportWidth, v2TreeHorizontalScrollWidth]);
+
+  useSidebarLayoutEffect(() => {
+      if (!sidebarTreeScrollRequest) return;
+
+      const renderedTreeData = v2VisibleTreeData;
+      const visiblePath = findSidebarNodePathByKey(
+          renderedTreeData as SidebarLocateTreeNodeLike[],
+          String(sidebarTreeScrollRequest.key),
+      );
+      if (!visiblePath) return;
+
+      const expandedKeySet = new Set(expandedKeys.map((key) => String(key)));
+      const visibleAncestorsExpanded = visiblePath
+          .slice(0, -1)
+          .every((key) => expandedKeySet.has(String(key)));
+      if (!visibleAncestorsExpanded) return;
+
+      const request = sidebarTreeScrollRequest;
+      let cancelled = false;
+      let attempt = 0;
+      let frameId: number | null = null;
+      const requestFrame = typeof window.requestAnimationFrame === 'function'
+          ? window.requestAnimationFrame.bind(window)
+          : (callback: FrameRequestCallback) => window.setTimeout(() => callback(Date.now()), 0);
+      const cancelFrame = typeof window.cancelAnimationFrame === 'function'
+          ? window.cancelAnimationFrame.bind(window)
+          : window.clearTimeout.bind(window);
+
+      const findExactTreeRow = (): HTMLElement | null => {
+          const nodeTitles = treeContainerRef.current
+              ?.querySelectorAll<HTMLElement>('[data-sidebar-node-key]');
+          const targetTitle = Array.from(nodeTitles || [])
+              .find((element) => element.dataset.sidebarNodeKey === String(request.key));
+          const exactRow = targetTitle?.closest('.ant-tree-treenode') as HTMLElement | null;
+          if (exactRow) return exactRow;
+          return null;
+      };
+
+      const attemptScroll = () => {
+          if (cancelled || sidebarTreeScrollRequestIdRef.current !== request.id) return;
+          treeRef.current?.scrollTo?.({ key: request.key, align: 'auto' });
+          frameId = requestFrame(() => {
+              if (cancelled || sidebarTreeScrollRequestIdRef.current !== request.id) return;
+              const targetRow = findExactTreeRow();
+              if (targetRow) {
+                  targetRow.scrollIntoView?.({
+                      block: request.scrollBlock,
+                      inline: 'nearest',
+                      behavior: 'auto',
+                  });
+                  setSidebarTreeScrollRequest((current) => current?.id === request.id ? null : current);
+                  return;
+              }
+              attempt += 1;
+              if (attempt < 6) {
+                  frameId = requestFrame(attemptScroll);
+              } else {
+                  setSidebarTreeScrollRequest((current) => current?.id === request.id ? null : current);
+              }
+          });
+      };
+
+      frameId = requestFrame(attemptScroll);
+      return () => {
+          cancelled = true;
+          if (frameId !== null) cancelFrame(frameId);
+      };
+  }, [displayTreeData, expandedKeys, true, sidebarTreeScrollRequest, v2VisibleTreeData]);
+
+  const hasRelationalObjectKindFilterConnection = connections.some(
+      (connection) => getDataSourceCapabilities(connection.config).supportsRelationalObjectKindFilter,
+  );
+  const showV2ObjectKindFilters = activeConnection
+          ? getDataSourceCapabilities(activeConnection.config).supportsRelationalObjectKindFilter
+          : hasRelationalObjectKindFilterConnection;
+  useEffect(() => {
+      if (!showV2ObjectKindFilters && v2ExplorerFilter !== 'all') {
+          setV2ExplorerFilter('all');
+      }
+  }, [showV2ObjectKindFilters, v2ExplorerFilter]);
+
 
   const {
       contextMenu,
@@ -3227,6 +3895,20 @@ const Sidebar: React.FC<{
       treeDragSelectSuppressUntilRef,
   ]);
 
+  const revealCommandSearchNode = useCallback((node: TreeNode) => {
+      const targetKey = node.key;
+      const path = findSidebarNodePathByKey(
+          treeDataRef.current as SidebarLocateTreeNodeLike[],
+          String(targetKey),
+      );
+      setSearchValue('');
+      setV2ExplorerFilter('all');
+      if (path) mergeExpandedTreeKeys(path.slice(0, -1));
+      setSidebarSelectedKeys([targetKey]);
+      selectedNodesRef.current = [node];
+      scrollSidebarTreeToKey(targetKey, 'center');
+  }, [mergeExpandedTreeKeys, scrollSidebarTreeToKey, setSidebarSelectedKeys]);
+
   const {
       selectConnectionFromRail,
       runCommandSearchItem,
@@ -3235,6 +3917,7 @@ const Sidebar: React.FC<{
       activeContext,
       activeTab,
       addTab,
+      clearStaleHostStateOnSelection,
       closeV2CommandSearch,
       commandSearchFlatItems,
       connectionIds,
@@ -3244,10 +3927,12 @@ const Sidebar: React.FC<{
       loadDatabases,
       mergeExpandedTreeKeys,
       onDoubleClick,
+      publishTitlebarSelectionForNode,
+      revealCommandSearchNode,
       scrollSidebarTreeToKey,
       selectedNodesRef,
       setActiveContext,
-      setSelectedKeys,
+      setSelectedKeys: setSidebarSelectedKeys,
       setV2CommandActiveIndex,
       treeDataRef,
       v2CommandActiveIndex,
@@ -3266,7 +3951,7 @@ const Sidebar: React.FC<{
       const connection = connections.find((item) => item.id === request.connectionId);
       if (!connection) return;
 
-      onExpandSidebar?.();
+      onEnsureSidebarExpanded?.();
       setSearchValue('');
       await selectConnectionFromRail(connection);
 
@@ -3286,11 +3971,12 @@ const Sidebar: React.FC<{
       }
 
       const dbName = String(databaseNode.dataRef?.dbName || request.dbName).trim();
-      setSelectedKeys([databaseNode.key]);
+      setSidebarSelectedKeys([databaseNode.key]);
       selectedNodesRef.current = [databaseNode];
       setActiveContext({ connectionId: connection.id, dbName });
+      publishTitlebarSelectionForNode(databaseNode);
       scrollSidebarTreeToKey(databaseNode.key);
-  }, [connections, findTreeNodeByKeyRef, onExpandSidebar, scrollSidebarTreeToKey, selectConnectionFromRail, selectedNodesRef, setActiveContext, setSearchValue, setSelectedKeys, treeDataRef]);
+  }, [connections, findTreeNodeByKeyRef, onEnsureSidebarExpanded, publishTitlebarSelectionForNode, scrollSidebarTreeToKey, selectConnectionFromRail, selectedNodesRef, setActiveContext, setSearchValue, setSidebarSelectedKeys, treeDataRef]);
 
   useEffect(() => {
       const handleLocateSidebarConnection = (event: Event) => {
@@ -3302,7 +3988,7 @@ const Sidebar: React.FC<{
       };
   }, [locateConnectionInSidebar]);
 
-  const getNodeMenuItems = (node: any): MenuProps['items'] => buildSidebarLegacyNodeMenuItems(node, {
+  const getNodeMenuItems = (node: any): MenuProps['items'] => buildSidebarNodeMenuItems(node, {
     addTab,
     getMetadataDialect,
     shouldHideSchemaPrefix,
@@ -3410,17 +4096,12 @@ const Sidebar: React.FC<{
 
   const titleRender = useSidebarTitleRender({
       connectionStates,
-      isV2Ui,
       renderV2TreeTitle,
       handleAddExternalSQLDirectory,
-      snapshotTreeSelectionBeforeDrag,
-      restoreTreeSelectionAfterDrag,
-      treeDragSelectSuppressUntilRef,
-      setIsTreeDragging,
   });
   const v2RailConnectionGroups = useMemo(
-      () => buildV2RailConnectionGroups(connections, connectionTags, sidebarRootOrder),
-      [connections, connectionTags, sidebarRootOrder],
+      () => buildV2RailConnectionGroups(connections, connectionTags, sidebarRootOrder, rootSortMode, rootConnectionSortMode),
+      [connections, connectionTags, sidebarRootOrder, rootSortMode, rootConnectionSortMode],
   );
   const getTagParentId = (tagId: unknown): string | null => {
       const tag = connectionTags.find((candidate) => candidate.id === String(tagId || '').trim());
@@ -3505,7 +4186,7 @@ const Sidebar: React.FC<{
       clientY?: number;
       target?: EventTarget | null;
   }) => {
-      if (!isV2Ui) return null;
+
       const dragNode = sidebarTreeDragNodeRef.current;
       if (dragNode?.type !== 'connection') return null;
       const hit = resolveSidebarDropDomHit(event);
@@ -3611,8 +4292,7 @@ const Sidebar: React.FC<{
               : info.node);
       if (!dragNode || !dropNode) return;
 
-      const placement: SidebarTreeDropPlacement = isV2Ui
-          ? resolveSidebarTreeDropPlacement({
+      const placement: SidebarTreeDropPlacement = resolveSidebarTreeDropPlacement({
               dragNodeType: dragNode.type,
               dropNodeType: dropNode.type,
               relativeDropPosition: dropPosition,
@@ -3623,10 +4303,7 @@ const Sidebar: React.FC<{
                   top: dropTargetMetrics.top,
                   height: dropTargetMetrics.height,
               } : null,
-          })
-          : (dropNode.type === 'tag' && info?.dropToGap === false
-              ? 'inside'
-              : (insertBefore ? 'before' : 'after'));
+          });
       const droppingIntoTag = dropNode.type === 'tag' && placement === 'inside';
       const targetParentTagId = droppingIntoTag
           ? String(dropNode?.dataRef?.id || '').trim() || null
@@ -3649,12 +4326,12 @@ const Sidebar: React.FC<{
   };
 
   const onRightClick = ({ event, node }: any) => {
-      if (isV2Ui && (node?.type === 'v2-table-section' || node?.type === 'v2-database-section')) {
+      if (node?.type === 'v2-table-section' || node?.type === 'v2-database-section') {
           event.preventDefault();
           event.stopPropagation();
           return;
       }
-      if (isV2Ui && node?.type === 'tag') {
+      if (node?.type === 'tag') {
           const group = resolveV2ConnectionGroup(node, v2RailConnectionGroups);
           if (group) {
               event.preventDefault();
@@ -3675,11 +4352,11 @@ const Sidebar: React.FC<{
               return;
           }
       }
-      if (isV2Ui && node?.type === 'connection') {
+      if (node?.type === 'connection') {
           openV2ConnectionContextMenu(event, node);
           return;
       }
-      if (isV2Ui && node?.type === 'database') {
+      if (node?.type === 'database') {
           const position = resolveSidebarContextMenuPosition(event.clientX, event.clientY);
           setContextMenu({
               x: position.x,
@@ -3696,8 +4373,7 @@ const Sidebar: React.FC<{
           return;
       }
       if (
-          isV2Ui
-          && node?.type === 'object-group'
+          node?.type === 'object-group'
           && node?.dataRef?.groupKey === 'schema'
           && isPostgresSchemaDialect(getMetadataDialect(node.dataRef as SavedConnection))
           && String(node?.dataRef?.schemaName || '').trim()
@@ -3717,7 +4393,7 @@ const Sidebar: React.FC<{
           });
           return;
       }
-      if (isV2Ui && node?.type === 'object-group' && node?.dataRef?.groupKey === 'tables') {
+      if (node?.type === 'object-group' && node?.dataRef?.groupKey === 'tables') {
           const position = resolveSidebarContextMenuPosition(event.clientX, event.clientY);
           setContextMenu({
               x: position.x,
@@ -3733,7 +4409,7 @@ const Sidebar: React.FC<{
           });
           return;
       }
-      if (isV2Ui && node?.type === 'table') {
+      if (node?.type === 'table') {
           const position = resolveSidebarContextMenuPosition(event.clientX, event.clientY);
           setContextMenu({
               x: position.x,
@@ -3751,10 +4427,18 @@ const Sidebar: React.FC<{
       }
       const items = getNodeMenuItems(node);
       if (items && items.length > 0) {
+          const position = resolveSidebarContextMenuPosition(event.clientX, event.clientY);
           setContextMenu({
-              x: event.clientX,
-              y: event.clientY,
-              items
+              x: position.x,
+              y: position.y,
+              sourceX: event.clientX,
+              sourceY: event.clientY,
+              items,
+              kind: 'v2-node',
+              node,
+              rootClassName: 'gn-v2-table-context-menu-popup',
+              overlayStyle: { width: 264, maxWidth: 'calc(100vw - 24px)' },
+              maxHeight: position.maxHeight,
           });
       }
   };
@@ -3762,37 +4446,43 @@ const Sidebar: React.FC<{
   const v2RailObjectActionsLabel = t('sidebar.rail.object_actions');
   const v2RailSystemActionsLabel = t('sidebar.rail.system_actions');
   const v2NewGroupLabel = t('sidebar.action.new_group');
-  const v2BatchActionsLabel = t('sidebar.action.batch_operations');
+  const v2DataWorkflowLabel = t('app.tools.group.workflow.title');
   const v2BatchTablesLabel = t('sidebar.action.batch_tables');
   const v2BatchDatabasesLabel = t('sidebar.action.batch_databases');
   const v2DataImportLabel = t('sidebar.action.data_import');
-  const v2DataWorkflowLabel = t('app.tools.group.workflow.title');
-  const v2SchemaCompareLabel = t('app.tools.entry.schema_compare.title');
-  const v2DataCompareLabel = t('app.tools.entry.data_compare.title');
-  const v2DataSyncLabel = t('app.tools.entry.sync.title');
   const v2SqlToolsLabel = t('sidebar.action.sql_tools');
   const v2SlowQueryLabel = t('sql_analysis.slow_query.rail.aria_label');
   const v2SqlAuditLabel = t('sql_audit.rail.aria_label');
   const v2OpenExternalSqlFileLabel = t('sidebar.sql_file_exec.title');
   const v2LocateCurrentTableLabel = t('sidebar.action.locate_current_table');
   const v2LocateCurrentTableUnavailableLabel = t('sidebar.message.locate_current_table_unavailable');
-  const v2AiAssistantLabel = t('app.sidebar.ai_assistant');
-  const v2SettingsLabel = t('app.sidebar.settings');
-  const v2ActiveConnectionHeaderLabel = t('sidebar.active_connection.current_host_database');
-  const v2NoDatabaseSelectedLabel = t('sidebar.active_connection.no_database_selected');
   const v2ConnectionActionsLabel = t('sidebar.active_connection.actions');
   const v2ScrollToTopLabel = t('sidebar.action.scroll_to_top');
-  const v2ActiveConnectionTooltipContent = (
-    <div className="gn-v2-active-connection-tooltip">
-      <strong>{activeConnectionDisplayName}</strong>
-      <span>{activeDatabaseDisplayName || v2NoDatabaseSelectedLabel}</span>
-    </div>
-  );
   const v2CommandSearchLabel = t('sidebar.command_search.label');
   const v2CommandSearchPlaceholder = t('sidebar.command_search.placeholder');
-  const v2ExplorerSearchPlaceholder = activeConnectionIsMessageQueue
-      ? t('sidebar.message_queue.search_placeholder')
-      : v2CommandSearchPlaceholder;
+
+  const scrollV2ExplorerToTop = () => {
+    treeRef.current?.scrollTo?.({ index: 0, align: 'top' });
+  };
+
+  const v2ExplorerToolbarActionProps = {
+    labels: {
+      objectActions: v2RailObjectActionsLabel,
+      locateCurrentTable: v2LocateCurrentTableLabel,
+      locateCurrentTableUnavailable: v2LocateCurrentTableUnavailableLabel,
+      scrollToTop: v2ScrollToTopLabel,
+      connectionActions: v2ConnectionActionsLabel,
+    },
+    canLocateActiveTab,
+    hasActiveConnection: Boolean(activeConnection),
+    onLocateCurrentTable: handleLocateActiveTabInSidebar,
+    onScrollToTop: scrollV2ExplorerToTop,
+    onOpenConnectionActions: (event: React.MouseEvent<HTMLElement>) => {
+      if (activeConnection) {
+        openV2ConnectionContextMenu(event, activeConnection);
+      }
+    },
+  };
 
   const handleOpenDataImportWorkbench = useCallback(() => {
     const node = selectedNodesRef.current[0];
@@ -3833,16 +4523,8 @@ const Sidebar: React.FC<{
 
   const v2TitlebarQuickActions: TitleBarQuickAction[] = [
     {
-      key: 'new-group',
-      label: v2NewGroupLabel,
-      icon: <FolderOpenOutlined aria-hidden="true" />,
-      onClick: () => { setRenameViewTarget(null); createTagForm.resetFields(); setIsCreateTagModalOpen(true); },
-      priority: 'secondary',
-    },
-    {
-      key: 'batch-actions',
-      label: v2BatchActionsLabel,
-      icon: <AppstoreOutlined aria-hidden="true" />,
+      key: 'data-workflow',
+      label: v2DataWorkflowLabel,
       menu: [
         {
           key: 'batch-tables',
@@ -3862,176 +4544,6 @@ const Sidebar: React.FC<{
           icon: <ImportOutlined aria-hidden="true" />,
           onClick: handleOpenDataImportWorkbench,
         },
-      ],
-    },
-    {
-      key: 'sql-tools',
-      label: v2SqlToolsLabel,
-      icon: <ToolOutlined aria-hidden="true" />,
-      menu: [
-        {
-          key: 'slow-query',
-          label: v2SlowQueryLabel,
-          icon: <HistoryOutlined aria-hidden="true" />,
-          onClick: handleOpenSlowQueryWorkbench,
-          disabled: !activeTabHasConnection,
-        },
-        {
-          key: 'sql-audit',
-          label: v2SqlAuditLabel,
-          icon: <AuditOutlined aria-hidden="true" />,
-          onClick: handleOpenSqlAuditWorkbench,
-        },
-      ],
-    },
-    {
-      key: 'data-workflow',
-      label: v2DataWorkflowLabel,
-      icon: <SwitcherOutlined aria-hidden="true" />,
-      menu: [
-        {
-          key: 'schema-compare',
-          label: v2SchemaCompareLabel,
-          icon: <AppstoreOutlined aria-hidden="true" />,
-          onClick: () => onOpenDataSyncWorkbench?.('schemaCompare'),
-        },
-        {
-          key: 'data-compare',
-          label: v2DataCompareLabel,
-          icon: <SwitcherOutlined aria-hidden="true" />,
-          onClick: () => onOpenDataSyncWorkbench?.('dataCompare'),
-        },
-        {
-          key: 'data-sync',
-          label: v2DataSyncLabel,
-          icon: <UploadOutlined rotate={90} aria-hidden="true" />,
-          onClick: () => onOpenDataSyncWorkbench?.('sync'),
-        },
-      ],
-    },
-    {
-      key: 'connection-package',
-      label: t('app.tools.group.config.title'),
-      icon: <HddOutlined aria-hidden="true" />,
-      menu: [
-        {
-          key: 'import-connections',
-          label: t('app.tools.entry.import.title'),
-          icon: <UploadOutlined aria-hidden="true" />,
-          onClick: () => onOpenSettingsNavigation?.({ group: 'config', action: 'import-connections' }),
-        },
-        {
-          key: 'export-connections',
-          label: t('app.tools.entry.export.title'),
-          icon: <DownloadOutlined aria-hidden="true" />,
-          onClick: () => onOpenSettingsNavigation?.({ group: 'config', action: 'export-connections' }),
-        },
-      ],
-    },
-    {
-      key: 'open-external-sql-file',
-      label: v2OpenExternalSqlFileLabel,
-      icon: <FileAddOutlined aria-hidden="true" />,
-      onClick: () => { void handleOpenSQLFileFromToolbar(); },
-      priority: 'secondary',
-    },
-    // Settings center groups (same order as 设置 left nav)
-    {
-      key: 'settings-preferences',
-      label: t('app.settings.group.preferences.title'),
-      icon: <SettingOutlined aria-hidden="true" />,
-      priority: 'secondary',
-      menu: [
-        {
-          key: 'language',
-          label: t('settings.language.title'),
-          icon: <GlobalOutlined aria-hidden="true" />,
-          onClick: () => onOpenSettingsNavigation?.({ group: 'preferences', pane: 'language' }),
-        },
-        {
-          key: 'theme',
-          label: t('app.settings.entry.theme.title'),
-          icon: <SkinOutlined aria-hidden="true" />,
-          onClick: () => onOpenSettingsNavigation?.({ group: 'preferences', pane: 'theme' }),
-        },
-        {
-          key: 'brand-icon',
-          label: t('app.settings.entry.brand_icon.title'),
-          icon: <AppstoreOutlined aria-hidden="true" />,
-          onClick: () => onOpenSettingsNavigation?.({ group: 'preferences', pane: 'brand-icon' }),
-        },
-        {
-          key: 'sidebar-metadata',
-          label: t('app.settings.sidebar_metadata.title'),
-          icon: <TableOutlined aria-hidden="true" />,
-          onClick: () => onOpenSettingsNavigation?.({ group: 'preferences', pane: 'sidebar-metadata' }),
-        },
-        {
-          key: 'sidebar-objects',
-          label: t('app.settings.sidebar_objects.title'),
-          icon: <FolderOpenOutlined aria-hidden="true" />,
-          onClick: () => onOpenSettingsNavigation?.({ group: 'preferences', pane: 'sidebar-objects' }),
-        },
-      ],
-    },
-    {
-      key: 'settings-services',
-      label: t('app.settings.group.services.title'),
-      icon: <GlobalOutlined aria-hidden="true" />,
-      priority: 'secondary',
-      menu: [
-        {
-          key: 'proxy',
-          label: t('app.settings.entry.proxy.title'),
-          icon: <GlobalOutlined aria-hidden="true" />,
-          onClick: () => onOpenSettingsNavigation?.({ group: 'services', pane: 'proxy' }),
-        },
-        ...(isWebRuntime ? [{
-          key: 'web-auth',
-          label: t('app.settings.entry.web_auth.title'),
-          icon: <SafetyCertificateOutlined aria-hidden="true" />,
-          onClick: () => onOpenSettingsNavigation?.({ group: 'services', pane: 'web-auth' }),
-        }] : []),
-        {
-          key: 'cloud-backup',
-          label: t('app.settings.entry.cloud_backup.title'),
-          icon: <CloudDownloadOutlined aria-hidden="true" />,
-          onClick: () => onOpenSettingsNavigation?.({ group: 'services', pane: 'cloud-backup' }),
-        },
-        {
-          key: 'ai',
-          label: t('app.settings.entry.ai.title'),
-          icon: <RobotOutlined aria-hidden="true" />,
-          onClick: () => onOpenSettingsNavigation?.({ group: 'services', pane: 'ai' }),
-        },
-      ],
-    },
-    {
-      key: 'settings-config',
-      label: t('app.tools.group.config.title'),
-      icon: <SettingOutlined aria-hidden="true" />,
-      priority: 'secondary',
-      menu: [
-        {
-          key: 'data-root',
-          label: t('app.tools.entry.data_root.title'),
-          icon: <HddOutlined aria-hidden="true" />,
-          onClick: () => onOpenSettingsNavigation?.({ group: 'config', pane: 'data-root' }),
-        },
-        {
-          key: 'security-update',
-          label: t('app.tools.entry.security_update.title'),
-          icon: <SafetyCertificateOutlined aria-hidden="true" />,
-          onClick: () => onOpenSettingsNavigation?.({ group: 'config', pane: 'security-update' }),
-        },
-      ],
-    },
-    {
-      key: 'settings-workflow',
-      label: t('app.tools.group.workflow.title'),
-      icon: <SwitcherOutlined aria-hidden="true" />,
-      priority: 'secondary',
-      menu: [
         {
           key: 'schema-compare',
           label: t('app.tools.entry.schema_compare.title'),
@@ -4053,53 +4565,39 @@ const Sidebar: React.FC<{
       ],
     },
     {
-      key: 'settings-workspace',
-      label: t('app.tools.group.workspace.title'),
-      icon: <CodeOutlined aria-hidden="true" />,
-      priority: 'secondary',
+      key: 'sql-tools',
+      label: v2SqlToolsLabel,
       menu: [
         {
-          key: 'drivers',
-          label: t('app.tools.entry.drivers.title'),
-          icon: <SettingOutlined aria-hidden="true" />,
-          onClick: () => onOpenSettingsNavigation?.({ group: 'workspace', pane: 'drivers' }),
-        },
-        {
-          key: 'snippet-settings',
-          label: t('app.tools.entry.snippets.title'),
-          icon: <CodeOutlined aria-hidden="true" />,
-          onClick: () => onOpenSettingsNavigation?.({ group: 'workspace', pane: 'snippet-settings' }),
-        },
-        {
-          key: 'shortcut-settings',
-          label: t('app.tools.entry.shortcuts.title'),
-          icon: <LinkOutlined aria-hidden="true" />,
-          onClick: () => onOpenSettingsNavigation?.({ group: 'workspace', pane: 'shortcut-settings' }),
+          key: 'slow-query',
+          label: v2SlowQueryLabel,
+          icon: <HistoryOutlined aria-hidden="true" />,
+          onClick: handleOpenSlowQueryWorkbench,
+          disabled: !activeTabHasConnection,
         },
         {
           key: 'sql-audit',
-          label: t('app.tools.entry.sql_audit.title'),
+          label: v2SqlAuditLabel,
           icon: <AuditOutlined aria-hidden="true" />,
-          onClick: () => onOpenSettingsNavigation?.({ group: 'workspace', action: 'sql-audit' }),
+          onClick: handleOpenSqlAuditWorkbench,
         },
       ],
     },
     {
-      key: 'settings-about',
-      label: t('app.settings.group.about.title'),
-      icon: <InfoCircleOutlined aria-hidden="true" />,
-      priority: 'secondary',
-      menu: [
-        {
-          key: 'about-go-navi',
-          label: t('app.settings.entry.about.title'),
-          icon: <InfoCircleOutlined aria-hidden="true" />,
-          onClick: () => onOpenSettingsNavigation?.({ group: 'about', pane: 'about-go-navi' }),
-        },
-      ],
+      key: 'drivers',
+      label: t('app.tools.entry.drivers.title'),
+      onClick: () => onOpenSettingsNavigation?.({ group: 'workspace', action: 'drivers' }),
     },
   ];
-  const v2TitlebarQuickActionsTarget = isV2Ui && typeof document !== 'undefined'
+  // 关于 GoNavi 作为标题栏独立按钮，和数据工作流 / SQL 工具并列。
+  const v2TitlebarAboutActions: TitleBarQuickAction[] = [
+    {
+      key: 'about-go-navi',
+      label: t('app.settings.group.about.title'),
+      onClick: () => onOpenSettingsNavigation?.({ group: 'about', pane: 'about-go-navi' }),
+    },
+  ];
+  const v2TitlebarQuickActionsTarget = typeof document !== 'undefined'
     ? document.getElementById('gonavi-titlebar-quick-actions')
     : null;
 
@@ -4109,8 +4607,6 @@ const Sidebar: React.FC<{
     activeIndex: v2CommandActiveIndex,
     label: v2CommandSearchLabel,
     placeholder: v2CommandSearchPlaceholder,
-    persistedFilter: v2PersistedSidebarFilter,
-    persistentFilterEnabled: v2CommandSearchPersistentFilterEnabled,
     aiMode: v2CommandSearchAiMode,
     objectMode: v2CommandSearchObjectMode,
     flatItems: commandSearchFlatItems,
@@ -4131,8 +4627,6 @@ const Sidebar: React.FC<{
         if (item.kind === 'recent') hideSqlLogFromRecent(item.logId);
       },
       onClearRecentItems: clearRecentSqlLogs,
-      onTogglePersistentFilter: toggleV2CommandSearchPersistentFilter,
-      onResetFilter: resetV2SidebarFilter,
     },
   };
 
@@ -4148,8 +4642,6 @@ const Sidebar: React.FC<{
       openExternalSqlFile: v2OpenExternalSqlFileLabel,
       locateCurrentTable: v2LocateCurrentTableLabel,
       locateCurrentTableUnavailable: v2LocateCurrentTableUnavailableLabel,
-      aiAssistant: v2AiAssistantLabel,
-      settings: v2SettingsLabel,
     },
     handlers: {
       openCreateTagModal: () => { setRenameViewTarget(null); createTagForm.resetFields(); setIsCreateTagModalOpen(true); },
@@ -4158,12 +4650,11 @@ const Sidebar: React.FC<{
       openDataImport: handleOpenDataImportWorkbench,
       openExternalSqlFile: handleOpenSQLFileFromToolbar,
       locateActiveTab: handleLocateActiveTabInSidebar,
-      toggleAI: onToggleAI ?? (() => {}),
-      openSettings: onOpenSettings ?? (() => {}),
     },
     canLocateActiveTab,
     showObjectActions: false,
-    sidebarExpandAction: onExpandSidebar && expandSidebarLabel ? {
+    showLocateAction: false,
+    sidebarExpandAction: !collapsedSidebarActionsTarget && onExpandSidebar && expandSidebarLabel ? {
       label: expandSidebarLabel,
       onClick: onExpandSidebar,
       buttonRef: expandSidebarButtonRef,
@@ -4171,111 +4662,61 @@ const Sidebar: React.FC<{
   };
 
   return (
-    <div className={isV2Ui ? 'gn-v2-sidebar-redesign' : undefined} style={{ display: 'flex', height: '100%', minHeight: 0 }}>
+    <div className="gn-v2-sidebar-redesign" style={{ display: 'flex', height: '100%', minHeight: 0 }}>
         {exportProgressModal}
-        {isV2Ui && <SidebarConnectionRail {...v2ConnectionRailProps} />}
+        <SidebarConnectionRail {...v2ConnectionRailProps} />
         <div
-            id={isV2Ui ? 'gonavi-sidebar-tree-panel' : undefined}
-            className={isV2Ui ? 'gn-v2-object-explorer' : undefined}
-            data-sidebar-tree-panel={isV2Ui ? 'true' : undefined}
+            id="gonavi-sidebar-tree-panel"
+            className="gn-v2-object-explorer"
+            data-sidebar-tree-panel="true"
             style={{ display: 'flex', flexDirection: 'column', height: '100%', minWidth: 0, flex: 1 }}
         >
-        {isV2Ui && (
-            <div className="gn-v2-active-connection-header" data-object-count={activeConnectionObjectCount}>
-                <div className="gn-v2-active-connection-trigger" aria-label={v2ActiveConnectionHeaderLabel}>
-                    <div className="gn-v2-active-connection-copy">
-                        <Tooltip title={v2ActiveConnectionTooltipContent} placement="bottomLeft" mouseEnterDelay={0.35}>
-                            <strong>{activeConnectionDisplayName}</strong>
-                        </Tooltip>
-                        <Tooltip title={v2ActiveConnectionTooltipContent} placement="bottomLeft" mouseEnterDelay={0.35}>
-                            <span className={activeDatabaseDisplayName ? undefined : 'is-placeholder'}>
-                                {activeDatabaseDisplayName || v2NoDatabaseSelectedLabel}
-                            </span>
-                        </Tooltip>
-                    </div>
-                </div>
-                <div className="gn-v2-active-connection-actions">
-                    <Tooltip title={v2ScrollToTopLabel} placement="bottom" mouseEnterDelay={0.35}>
-                        <Button
-                            size="small"
-                            type="text"
-                            icon={<VerticalAlignTopOutlined />}
-                            aria-label={v2ScrollToTopLabel}
-                            onClick={() => {
-                                treeRef.current?.scrollTo?.({ index: 0, align: 'top' });
-                            }}
-                        />
-                    </Tooltip>
-                    <Tooltip title={v2ConnectionActionsLabel}>
-                        <Button
-                            size="small"
-                            type="text"
-                            icon={<MoreOutlined />}
-                            aria-label={v2ConnectionActionsLabel}
-                            disabled={!activeConnection}
-                            onClick={(event) => {
-                                if (activeConnection) {
-                                    openV2ConnectionContextMenu(event, activeConnection);
-                                }
-                            }}
-                        />
-                    </Tooltip>
-                    {onCollapseSidebar && collapseSidebarLabel && (
-                        <Tooltip title={collapseSidebarLabel} placement="bottom" mouseEnterDelay={0.35}>
+        <div
+                className="gn-v2-explorer-actions"
+                role="toolbar"
+                aria-label={v2RailSystemActionsLabel}
+                data-sidebar-explorer-actions="true"
+            >
+                {v2ExplorerContext && <V2ExplorerContextSummary context={v2ExplorerContext} />}
+                {!usePersistentSidebarFilter && (
+                    <div
+                        className="gn-v2-explorer-action-group is-search"
+                        role="group"
+                        aria-label={v2CommandSearchLabel}
+                        data-v2-sidebar-search-mode="command"
+                    >
+                        <Tooltip title={v2CommandSearchLabel} placement="bottom" mouseEnterDelay={0.35}>
                             <Button
-                                ref={collapseSidebarButtonRef}
                                 size="small"
                                 type="text"
-                                className="gonavi-sidebar-collapse-trigger"
-                                data-sidebar-collapse-trigger="true"
-                                data-sidebar-toggle-placement="explorer-header"
-                                aria-label={collapseSidebarLabel}
-                                aria-controls="gonavi-sidebar-tree-panel"
-                                aria-expanded={true}
-                                icon={<MenuFoldOutlined />}
-                                onClick={onCollapseSidebar}
+                                className="gn-v2-explorer-tool"
+                                icon={<SearchOutlined />}
+                                aria-label={v2CommandSearchLabel}
+                                data-sidebar-command-search-action="true"
+                                data-v2-command-search-icon-only="true"
+                                onClick={() => {
+                                    openV2CommandSearch();
+                                    onFocusCommandSearch?.();
+                                }}
                             />
                         </Tooltip>
-                    )}
-                </div>
-            </div>
-        )}
-        <div className={isV2Ui ? 'gn-v2-explorer-search' : undefined} style={{ padding: '8px 14px', borderBottom: `1px solid ${darkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.04)'}` }}>
-            {isV2Ui && !v2UseLegacySidebarFilter ? (
-                <div className="gn-v2-explorer-command-row" data-v2-sidebar-search-mode="command">
-                    <button
-                        type="button"
-                        className="gn-v2-explorer-command-trigger"
-                        onClick={() => {
-                            openV2CommandSearch();
-                            onFocusCommandSearch?.();
-                        }}
-                        aria-label={v2CommandSearchLabel}
-                    >
-                        <SearchOutlined />
-                        <span>{v2PersistedSidebarFilter || v2ExplorerSearchPlaceholder}</span>
-                        {focusSidebarSearchShortcutTokens.length > 0 ? (
-                            <span className="gn-v2-search-shortcut" aria-hidden="true">
-                                {focusSidebarSearchShortcutTokens.map((token, index) => (
-                                    <kbd key={`${token}-${index}`}>{token}</kbd>
-                                ))}
-                            </span>
-                        ) : null}
-                    </button>
-                    <Tooltip title={v2PersistedSidebarFilter ? t('sidebar.command_search.reset_filter') : t('sidebar.command_search.no_synced_filter')}>
-                        <button
-                            type="button"
-                            className="gn-v2-explorer-filter-action"
-                            aria-label={t('sidebar.command_search.reset_filter')}
-                            disabled={!v2PersistedSidebarFilter}
-                            onClick={resetV2SidebarFilter}
-                        >
-                            <ReloadOutlined />
-                        </button>
-                    </Tooltip>
-                </div>
-            ) : isV2Ui ? (
-                <div className="gn-v2-explorer-legacy-filter-row" data-v2-sidebar-search-mode="filter">
+                    </div>
+                )}
+                <V2ExplorerToolbarActions
+                    {...v2ExplorerToolbarActionProps}
+                    toggleAction={onCollapseSidebar && collapseSidebarLabel ? {
+                      label: collapseSidebarLabel,
+                      onClick: onCollapseSidebar,
+                      buttonRef: collapseSidebarButtonRef,
+                      placement: 'explorer-toolbar',
+                      expanded: true,
+                    } : undefined}
+                />
+        </div>
+
+        {usePersistentSidebarFilter && (
+        <div className="gn-v2-explorer-search" style={{ padding: '8px 14px', borderBottom: `1px solid ${darkMode ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.04)'}` }}>
+            <div className="gn-v2-explorer-filter-row" data-v2-sidebar-search-mode="filter">
                     <Input
                         {...noAutoCapInputProps}
                         ref={searchInputRef}
@@ -4296,77 +4737,11 @@ const Sidebar: React.FC<{
                             <ReloadOutlined />
                         </button>
                     </Tooltip>
-                </div>
-            ) : (
-                <Input
-                    {...noAutoCapInputProps}
-                    ref={searchInputRef}
-                    placeholder={t('sidebar.search.placeholder')}
-                    onChange={onSearch}
-                    size="small"
-                    prefix={<SearchOutlined style={{ color: darkMode ? 'rgba(255,255,255,0.35)' : 'rgba(0,0,0,0.35)' }} />}
-                    style={{
-                        borderRadius: 6,
-                        border: 'none',
-                        background: darkMode ? 'rgba(0,0,0,0.25)' : 'rgba(0,0,0,0.03)',
-                        boxShadow: 'none',
-                        padding: '4px 8px',
-                        color: darkMode ? 'rgba(255,255,255,0.85)' : 'rgba(0,0,0,0.85)',
-                    }}
-                    suffix={(
-                        <Popover
-                            content={searchScopePopoverContent}
-                            trigger="click"
-                            placement="bottomRight"
-                            open={isSearchScopePopoverOpen}
-                            onOpenChange={setIsSearchScopePopoverOpen}
-                            styles={{ body: { padding: 0, borderRadius: 16, overflow: 'hidden' } }}
-                        >
-                            <Tooltip title={t('sidebar.command_search.scope.tooltip', { scope: searchScopeSummary })}>
-                                <div
-                                    style={{
-                                        display: 'flex',
-                                        alignItems: 'center',
-                                        gap: 4,
-                                        cursor: 'pointer',
-                                        padding: '2px 6px',
-                                        borderRadius: 4,
-                                        background: isSearchScopePopoverOpen
-                                            ? (darkMode ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.06)')
-                                            : 'transparent',
-                                        transition: 'background 0.2s',
-                                        color: searchScopes.includes('smart')
-                                            ? (darkMode ? '#ffd666' : '#1677ff')
-                                            : (darkMode ? 'rgba(255,255,255,0.45)' : 'rgba(0,0,0,0.45)'),
-                                    }}
-                                    onMouseEnter={(e) => {
-                                        if (!isSearchScopePopoverOpen) {
-                                          e.currentTarget.style.background = darkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.04)';
-                                          e.currentTarget.style.color = darkMode ? 'rgba(255,255,255,0.85)' : 'rgba(0,0,0,0.65)';
-                                        }
-                                    }}
-                                    onMouseLeave={(e) => {
-                                        if (!isSearchScopePopoverOpen) {
-                                          e.currentTarget.style.background = 'transparent';
-                                          e.currentTarget.style.color = searchScopes.includes('smart')
-                                              ? (darkMode ? '#ffd666' : '#1677ff')
-                                              : (darkMode ? 'rgba(255,255,255,0.45)' : 'rgba(0,0,0,0.45)');
-                                        }
-                                    }}
-                                >
-                                    <FilterOutlined style={{ fontSize: 13 }} />
-                                    <span style={{ fontSize: 12, fontWeight: 500 }}>
-                                        {searchScopes.includes('smart') ? t('sidebar.command_search.scope.compact_smart') : searchScopes.length}
-                                    </span>
-                                </div>
-                            </Tooltip>
-                        </Popover>
-                    )}
-                />
-            )}
+            </div>
         </div>
+        )}
 
-        {isV2Ui && !activeConnectionIsMessageQueue && (
+        {showV2ObjectKindFilters && (
             <div className="gn-v2-explorer-filter-tabs" aria-label={t('sidebar.command_search.object_kind.filter_aria')}>
                 {V2_EXPLORER_FILTER_OPTIONS.map((item) => (
                     <button
@@ -4382,96 +4757,9 @@ const Sidebar: React.FC<{
             </div>
         )}
 
-        {/* Toolbar */}
-        {!isV2Ui && (
-        <div data-sidebar-legacy-toolbar="true" style={legacyToolbarStyle}>
-            <div data-sidebar-legacy-toolbar-item="true" style={legacyToolbarItemStyle}>
-                <Tooltip title={t('sidebar.action.new_group')}>
-                    <Button
-                        size="small"
-                        type="text"
-                        icon={<FolderOpenOutlined />}
-                        aria-label={t('sidebar.action.new_group')}
-                        data-sidebar-create-group-action="true"
-                        onClick={() => { setRenameViewTarget(null); createTagForm.resetFields(); setIsCreateTagModalOpen(true); }}
-                        style={{ color: legacyToolbarButtonColor }}
-                    />
-                </Tooltip>
-            </div>
-            <div data-sidebar-legacy-toolbar-item="true" style={legacyToolbarItemStyle}>
-                <Tooltip title={t('sidebar.action.batch_tables')}>
-                    <Button
-                        size="small"
-                        type="text"
-                        icon={<TableOutlined />}
-                        aria-label={t('sidebar.action.batch_tables')}
-                        data-sidebar-batch-table-action="true"
-                        onClick={openBatchTableWorkbench}
-                        style={{ color: legacyToolbarButtonColor }}
-                    />
-                </Tooltip>
-            </div>
-            <div data-sidebar-legacy-toolbar-item="true" style={legacyToolbarItemStyle}>
-                <Tooltip title={t('sidebar.action.batch_databases')}>
-                    <Button
-                        size="small"
-                        type="text"
-                        icon={<DatabaseOutlined />}
-                        aria-label={t('sidebar.action.batch_databases')}
-                        data-sidebar-batch-database-action="true"
-                        onClick={openBatchDatabaseWorkbench}
-                        style={{ color: legacyToolbarButtonColor }}
-                    />
-                </Tooltip>
-            </div>
-            <div data-sidebar-legacy-toolbar-item="true" style={legacyToolbarItemStyle}>
-                <Tooltip title={v2DataImportLabel}>
-                    <Button
-                        size="small"
-                        type="text"
-                        icon={<ImportOutlined />}
-                        aria-label={v2DataImportLabel}
-                        data-sidebar-data-import-action="true"
-                        onClick={handleOpenDataImportWorkbench}
-                        style={{ color: legacyToolbarButtonColor }}
-                    />
-                </Tooltip>
-            </div>
-            <div data-sidebar-legacy-toolbar-item="true" style={legacyToolbarItemStyle}>
-                <Tooltip title={v2OpenExternalSqlFileLabel}>
-                    <Button
-                        size="small"
-                        type="text"
-                        icon={<FileAddOutlined />}
-                        aria-label={v2OpenExternalSqlFileLabel}
-                        data-sidebar-open-external-sql-file-action="true"
-                        onClick={handleOpenSQLFileFromToolbar}
-                        style={{ color: legacyToolbarButtonColor }}
-                    />
-                </Tooltip>
-            </div>
-            <div data-sidebar-legacy-toolbar-item="true" style={legacyToolbarItemStyle}>
-                <Tooltip title={canLocateActiveTab ? t('sidebar.action.locate_current_tab') : t('sidebar.message.locate_current_tab_unavailable')}>
-                    <span style={legacyToolbarDisabledWrapStyle}>
-                        <Button
-                            size="small"
-                            type="text"
-                            icon={<AimOutlined />}
-                            aria-label={t('sidebar.action.locate_current_tab')}
-                            data-sidebar-locate-current-tab-action="true"
-                            disabled={!canLocateActiveTab}
-                            onClick={handleLocateActiveTabInSidebar}
-                            style={{ color: legacyToolbarButtonColor }}
-                        />
-                    </span>
-                </Tooltip>
-            </div>
-        </div>
-        )}
-
         <div
             ref={treeContainerRef}
-            className={`sidebar-tree-scroll-shell${isV2Ui ? ' gn-v2-explorer-tree-shell' : ''}${isTreeScrolling ? ' is-vertical-scrolling' : ''}${sidebarTreeDragNodeType === 'connection' ? ' is-host-tree-dragging' : ''}${sidebarTreeDropPreview ? ' has-host-group-drop-preview' : ''}`}
+            className={`sidebar-tree-scroll-shell gn-v2-explorer-tree-shell${sidebarTreeDragNodeType === 'connection' ? ' is-host-tree-dragging' : ''}${sidebarTreeDropPreview ? ' has-host-group-drop-preview' : ''}`}
             onWheelCapture={handleTreeWheel}
             onTouchMoveCapture={markTreeScrollActivity}
             onDragEnterCapture={handleSidebarTreeDragOverCapture}
@@ -4491,7 +4779,7 @@ const Sidebar: React.FC<{
         >
             <div className="sidebar-tree-scroll-content">
                 <Tree
-                    key={`${isV2Ui ? `v2-tree-${v2ExplorerFilter}` : 'legacy-tree'}-${sidebarObjectVisibilitySignature}`}
+                    key={`v2-tree-${v2ExplorerFilter}-${sidebarObjectVisibilitySignature}`}
                     ref={treeRef}
                     showIcon
                     draggable={{
@@ -4503,12 +4791,10 @@ const Sidebar: React.FC<{
                         snapshotTreeSelectionBeforeDrag();
                         treeDragSelectSuppressUntilRef.current = Date.now() + 600;
                         sidebarTreeDragNodeRef.current = node;
-                        setSidebarTreeDragNodeType(isV2Ui ? String(node?.type || '') || null : null);
-                        if (isV2Ui) updateSidebarTreeDropPreview(null);
+                        setSidebarTreeDragNodeType(String(node?.type || '') || null);
+                        updateSidebarTreeDropPreview(null);
                         sidebarTreeDragPreviewElementRef.current?.remove();
-                        sidebarTreeDragPreviewElementRef.current = isV2Ui
-                            ? createSidebarTreeDragPreview(event, node)
-                            : null;
+                        sidebarTreeDragPreviewElementRef.current = createSidebarTreeDragPreview(event, node);
                         setIsTreeDragging(true);
                     }}
                     onDragEnter={() => {
@@ -4521,7 +4807,7 @@ const Sidebar: React.FC<{
                     }}
                     onDrop={handleDrop}
                     loadData={onLoadData}
-                    treeData={isV2Ui ? v2VisibleTreeData : displayTreeData}
+                    treeData={v2VisibleTreeData}
                     onDoubleClick={onDoubleClick}
                     onSelect={onSelect}
                     titleRender={titleRender}
@@ -4534,7 +4820,9 @@ const Sidebar: React.FC<{
                     selectedKeys={selectedKeys}
                     blockNode
                     height={effectiveTreeHeight}
-                    scrollWidth={isV2Ui ? v2TreeHorizontalScrollWidth : undefined}
+                    itemHeight={30}
+                    itemHeightResolver={resolveSidebarTreeRowHeight}
+                    scrollWidth={v2TreeHorizontalScrollWidth}
                     onRightClick={onRightClick}
                 />
             </div>
@@ -4543,11 +4831,32 @@ const Sidebar: React.FC<{
         </div>
         <SidebarSearchPanel {...v2CommandSearchPanelProps} />
 
+        {collapsedSidebarActionsTarget && createPortal(
+          <V2ExplorerToolbarActions
+            {...v2ExplorerToolbarActionProps}
+            onLocateCurrentTable={() => {
+              handleLocateActiveTabInSidebar();
+            }}
+            onScrollToTop={() => {
+              onExpandSidebar?.();
+              scrollV2ExplorerToTop();
+            }}
+            toggleAction={onExpandSidebar && expandSidebarLabel ? {
+              label: expandSidebarLabel,
+              onClick: onExpandSidebar,
+              buttonRef: expandSidebarButtonRef,
+              placement: 'collapsed-titlebar',
+              expanded: false,
+            } : undefined}
+          />,
+          collapsedSidebarActionsTarget,
+        )}
+
         {v2TitlebarQuickActionsTarget && createPortal(
           <TitleBarQuickActions
             label={v2RailObjectActionsLabel}
-            moreLabel={t('query_editor.action.more')}
             actions={v2TitlebarQuickActions}
+            trailingActions={v2TitlebarAboutActions}
           />,
           v2TitlebarQuickActionsTarget,
         )}
@@ -4574,19 +4883,6 @@ const Sidebar: React.FC<{
                 {renderV2SidebarContextMenuContent(contextMenu)}
             </div>,
             document.body,
-        )}
-
-        {contextMenu && !contextMenu.kind && (
-            <Dropdown
-                menu={{ items: contextMenu.items }}
-                open={true}
-                onOpenChange={(open) => { if (!open) setContextMenu(null); }}
-                trigger={['contextMenu']}
-                rootClassName={contextMenu.rootClassName}
-                overlayStyle={contextMenu.overlayStyle}
-            >
-                <div style={{ position: 'fixed', left: contextMenu.x, top: contextMenu.y, width: 1, height: 1 }} />
-            </Dropdown>
         )}
 
         <SidebarEntityModals
@@ -4709,6 +5005,12 @@ const Sidebar: React.FC<{
             );
         })()}
 
+        {isWebRuntime ? (
+          <input
+            {...browserSQLFileInputProps}
+            data-sidebar-browser-sql-file-input="true"
+          />
+        ) : null}
         <ExternalSQLFileModal {...externalSQLFileModalProps} />
         <ExternalSQLBindingModal {...externalSQLBindingModalProps} />
 

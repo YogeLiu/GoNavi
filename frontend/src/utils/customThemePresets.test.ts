@@ -13,7 +13,7 @@ import {
 } from './customThemePresets';
 
 const readHexProperty = (css: string, property: string): string => {
-  const match = css.match(new RegExp(`${property.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*:\\s*(#[0-9a-f]{6})`, 'i'));
+  const match = css.match(new RegExp(`${property.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*:\\s*[^;]*?(#[0-9a-f]{6})`, 'i'));
   if (!match?.[1]) throw new Error(`Missing hexadecimal custom property: ${property}`);
   return match[1];
 };
@@ -33,8 +33,8 @@ const contrastRatio = (foreground: string, background: string): number => {
 };
 
 describe('built-in custom theme presets', () => {
-  it('ships six unique, safe, size-bounded presets', () => {
-    expect(BUILTIN_CUSTOM_THEME_PRESETS).toHaveLength(6);
+  it('ships sixteen unique, safe, size-bounded presets', () => {
+    expect(BUILTIN_CUSTOM_THEME_PRESETS).toHaveLength(16);
     const ids = new Set<string>();
     const nameKeys = new Set<string>();
     for (const preset of BUILTIN_CUSTOM_THEME_PRESETS) {
@@ -57,9 +57,15 @@ describe('built-in custom theme presets', () => {
       expect(preset.css).toContain(
         'background-color: var(--gn-monaco-bg, var(--gn-bg-panel-2)) !important;',
       );
+      expect(preset.css).not.toMatch(
+        /^\s*--gn-(?:query|result)-toolbar-(?:button|primary)(?:-(?:hover|active|disabled))?-(?:fg|bg|border)\s*:/m,
+      );
+      expect(preset.css).not.toMatch(
+        /^\s*--gn-client-(?:query|result)-toolbar-(?:button|primary)(?:-(?:hover|active|disabled))?-(?:fg|bg|border)\s*:/m,
+      );
     }
-    expect(BUILTIN_CUSTOM_THEME_PRESETS.filter((preset) => preset.baseMode === 'dark')).toHaveLength(4);
-    expect(BUILTIN_CUSTOM_THEME_PRESETS.filter((preset) => preset.baseMode === 'light')).toHaveLength(2);
+    expect(BUILTIN_CUSTOM_THEME_PRESETS.filter((preset) => preset.baseMode === 'dark')).toHaveLength(8);
+    expect(BUILTIN_CUSTOM_THEME_PRESETS.filter((preset) => preset.baseMode === 'light')).toHaveLength(8);
   });
 
   it('keeps Comfort Dark first and covers low-glare surfaces plus hard-coded hotspots', () => {
@@ -67,19 +73,53 @@ describe('built-in custom theme presets', () => {
     expect(comfortDark.id).toBe('builtin-comfort-dark');
     expect(comfortDark.baseMode).toBe('dark');
     expect(comfortDark.badgeKey).toBe('app.theme.custom.preset.badge.recommended');
-    expect(comfortDark.css).toContain('--gn-bg-app: #1b1d21');
-    expect(comfortDark.css).toContain('--gn-bg-panel: #24272d');
-    expect(comfortDark.css).toContain('--gn-fg-5: #878e98');
+    expect(comfortDark.css).toContain('--gn-bg-app: color-mix(in srgb, #1b1d21');
+    expect(comfortDark.css).toContain('--gn-bg-panel: color-mix(in srgb, #24272d');
+    expect(comfortDark.css).toContain('--gn-fg-5: #cccccc');
     expect(comfortDark.css).toContain('--gn-on-accent: #142019');
     expect(comfortDark.css).toContain('.gn-v2-query-toolbar-save-action');
-    // 保存：default 同族 + fg-1 图标，禁止软绿底/透明底踩 primary 前景
-    expect(comfortDark.css).toContain('color: var(--gn-fg-1) !important');
+    // 保存与其他工具栏 default 按钮共用可覆盖的语义变量。
+    expect(comfortDark.css).toContain(
+      'background: var(--gn-toolbar-action-bg, var(--gn-bg-panel)) !important',
+    );
+    expect(comfortDark.css).toContain(
+      'color: var(--gn-toolbar-action-fg, var(--gn-fg-2)) !important',
+    );
+    expect(comfortDark.css).toContain(
+      'background: var(--gn-toolbar-action-active-bg, var(--gn-bg-active)) !important',
+    );
     expect(comfortDark.css).not.toMatch(
       /\.gn-v2-query-toolbar-save-action[\s\S]{0,200}background:\s*transparent\s*!important/,
     );
     expect(comfortDark.css).toContain('.gn-v2-ai-panel .ai-logo');
     expect(comfortDark.css).toContain('.monaco-editor-background');
     expect(comfortDark.css).not.toContain('background-color: var(--gn-bg-input) !important;');
+  });
+
+  it('keeps semantic query actions scoped-first while preserving preset danger and warn colors', () => {
+    const css = BUILTIN_CUSTOM_THEME_PRESETS[0].css;
+
+    expect(css).toContain(
+      '.ant-btn-primary:not(.ant-btn-dangerous):not(.gn-v2-query-transaction-commit-button):not(:disabled):not(.ant-btn-disabled)',
+    );
+    expect(css).toContain(
+      'color: var(--gn-client-query-toolbar-primary-fg, var(--gn-query-toolbar-primary-fg, var(--gn-on-danger, #fff))) !important;',
+    );
+    expect(css).toContain(
+      'background: var(--gn-client-query-toolbar-primary-bg, var(--gn-query-toolbar-primary-bg, var(--gn-danger-strong))) !important;',
+    );
+    expect(css).toContain(
+      'background: var(--gn-client-query-toolbar-primary-hover-bg, var(--gn-query-toolbar-primary-hover-bg, var(--gn-danger-strong-hover, var(--gn-danger-strong)))) !important;',
+    );
+    expect(css).toContain(
+      'background: var(--gn-client-query-toolbar-primary-active-bg, var(--gn-query-toolbar-primary-active-bg, var(--gn-danger-strong-hover, var(--gn-danger-strong)))) !important;',
+    );
+    expect(css).toContain(
+      'background: var(--gn-client-query-toolbar-primary-hover-bg, var(--gn-query-toolbar-primary-hover-bg, var(--gn-warn-hover, var(--gn-warn)))) !important;',
+    );
+    expect(css).toContain(
+      'background: var(--gn-client-query-toolbar-primary-active-bg, var(--gn-query-toolbar-primary-active-bg, var(--gn-warn-active, var(--gn-warn)))) !important;',
+    );
   });
 
   it('keeps preset text and solid-button colors at WCAG AA contrast', () => {
@@ -131,6 +171,23 @@ describe('built-in custom theme presets', () => {
         ).toBeGreaterThanOrEqual(4.5);
       }
     }
+  });
+
+  it('keeps Amber Ember danger-button default and hover contrast at WCAG AA', () => {
+    const preset = resolveBuiltinCustomThemePreset('builtin-amber-ember');
+    expect(preset).not.toBeNull();
+    const onDanger = readHexProperty(preset!.css, '--gn-on-danger');
+    const dangerStrong = readHexProperty(preset!.css, '--gn-danger-strong');
+    const dangerHover = readHexProperty(preset!.css, '--gn-danger-strong-hover');
+
+    expect(
+      contrastRatio(onDanger, dangerStrong),
+      'builtin-amber-ember default danger-button contrast',
+    ).toBeGreaterThanOrEqual(4.5);
+    expect(
+      contrastRatio(onDanger, dangerHover),
+      'builtin-amber-ember hover danger-button contrast',
+    ).toBeGreaterThanOrEqual(4.5);
   });
 
   it('resolves built-in and user themes through one active-theme boundary', () => {

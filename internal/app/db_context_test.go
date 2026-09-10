@@ -50,6 +50,30 @@ func TestNormalizeSchemaAndTable_PostgresStillSplitsQualifiedName(t *testing.T) 
 	}
 }
 
+func TestNormalizeSchemaAndTable_PostgresReturnsLogicalQuotedDottedParts(t *testing.T) {
+	t.Parallel()
+
+	schema, table := normalizeSchemaAndTable(connection.ConnectionConfig{
+		Type: "postgres",
+	}, "demo_db", `"sales.schema"."order.items"`)
+
+	if schema != "sales.schema" || table != "order.items" {
+		t.Fatalf("expected logical PostgreSQL identifier parts, got %q.%q", schema, table)
+	}
+}
+
+func TestNormalizeSchemaAndTable_PostgresReturnsLogicalQuotedTableOnly(t *testing.T) {
+	t.Parallel()
+
+	schema, table := normalizeSchemaAndTable(connection.ConnectionConfig{
+		Type: "postgres",
+	}, "demo_db", `"order.items"`)
+
+	if schema != "public" || table != "order.items" {
+		t.Fatalf("expected logical PostgreSQL table-only identifier, got %q.%q", schema, table)
+	}
+}
+
 func TestNormalizeSchemaAndTable_TrinoPreservesDottedTableName(t *testing.T) {
 	t.Parallel()
 
@@ -129,7 +153,7 @@ func TestNormalizeMetadataSchemaAndTable_PGLikeQualifiedTableKeepsSchema(t *test
 		Type: "postgres",
 	}, "demo_db", `"audit.schema"."order.items"`)
 
-	if schema != "audit.schema" || table != "order.items" {
+	if schema != "audit.schema" || table != `"order.items"` {
 		t.Fatalf("expected metadata qualified table to keep schema/table, got %q.%q", schema, table)
 	}
 }
@@ -153,7 +177,7 @@ func TestNormalizeMetadataSchemaAndTable_PGLikeQuotedDottedTableUsesSearchPath(t
 		Type: "postgres",
 	}, "demo_db", `"order.items"`)
 
-	if schema != "" || table != "order.items" {
+	if schema != "" || table != `"order.items"` {
 		t.Fatalf("expected quoted dotted metadata table to use search_path, got %q.%q", schema, table)
 	}
 }
@@ -167,6 +191,41 @@ func TestNormalizeMetadataSchemaAndTable_NonPGLikeKeepsNormalBehavior(t *testing
 
 	if schema != "demo_db" || table != "users" {
 		t.Fatalf("expected mysql metadata to keep db/table behavior, got %q.%q", schema, table)
+	}
+}
+
+func TestNormalizeSchemaAndTable_MySQLPreservesQuotedDottedTable(t *testing.T) {
+	t.Parallel()
+
+	schema, table := normalizeSchemaAndTable(connection.ConnectionConfig{
+		Type: "mysql",
+	}, "demo_db", "demo_db.`order.items`")
+	if schema != "demo_db" || table != "`order.items`" {
+		t.Fatalf("expected quoted dotted MySQL table to remain one identifier, got %q.%q", schema, table)
+	}
+}
+
+func TestNormalizeSchemaAndTable_SQLitePreservesPlainDottedTable(t *testing.T) {
+	t.Parallel()
+
+	schema, table := normalizeSchemaAndTable(connection.ConnectionConfig{Type: "sqlite"}, "main", "order.items")
+	if schema != "main" || table != "order.items" {
+		t.Fatalf("expected plain dotted SQLite table to stay intact, got %q.%q", schema, table)
+	}
+
+	schema, table = normalizeSchemaAndTable(connection.ConnectionConfig{Type: "sqlite"}, "main", "main.`order.items`")
+	if schema != "main" || table != "order.items" {
+		t.Fatalf("expected explicit SQLite database prefix to normalize, got %q.%q", schema, table)
+	}
+
+	schema, table = normalizeSchemaAndTable(connection.ConnectionConfig{Type: "sqlite"}, "main", "[order.items]")
+	if schema != "main" || table != "order.items" {
+		t.Fatalf("expected SQLite bracketed dotted table to normalize, got %q.%q", schema, table)
+	}
+
+	schema, table = normalizeSchemaAndTable(connection.ConnectionConfig{Type: "sqlite"}, "main", "order.[order.items]")
+	if schema != "main" || table != "order.items" {
+		t.Fatalf("expected SQLite schema-prefixed bracketed dotted table to normalize, got %q.%q", schema, table)
 	}
 }
 
@@ -224,6 +283,59 @@ func TestNormalizeRunConfig_OceanBaseOracleKeepsServiceName(t *testing.T) {
 
 	if runConfig.Database != "OBORCL" {
 		t.Fatalf("expected OceanBase Oracle service name to stay OBORCL, got %q", runConfig.Database)
+	}
+}
+
+func TestNormalizeRunConfig_OracleCarriesSelectedSchemaWithoutReplacingServiceName(t *testing.T) {
+	t.Parallel()
+
+	config := connection.ConnectionConfig{
+		Type:     "oracle",
+		Database: "ORCLPDB1",
+		User:     "TEST",
+	}
+	runConfig := normalizeRunConfig(config, "PRO")
+
+	if runConfig.Database != "ORCLPDB1" {
+		t.Fatalf("expected Oracle service name to stay ORCLPDB1, got %q", runConfig.Database)
+	}
+	if runConfig.RuntimeOracleCurrentSchema() != "PRO" {
+		t.Fatalf("expected selected Oracle schema PRO, got %q", runConfig.RuntimeOracleCurrentSchema())
+	}
+}
+
+func TestNormalizeRunConfig_OracleCarriesSelectedSchemaWithoutReplacingSID(t *testing.T) {
+	t.Parallel()
+
+	config := connection.ConnectionConfig{
+		Type:             "oracle",
+		ConnectionParams: "SID=ORCL",
+		User:             "TEST",
+	}
+	runConfig := normalizeRunConfig(config, "PRO")
+
+	if runConfig.Database != "" || runConfig.ConnectionParams != "SID=ORCL" {
+		t.Fatalf("expected Oracle SID config to stay unchanged, got database=%q params=%q", runConfig.Database, runConfig.ConnectionParams)
+	}
+	if runConfig.RuntimeOracleCurrentSchema() != "PRO" {
+		t.Fatalf("expected selected Oracle schema PRO, got %q", runConfig.RuntimeOracleCurrentSchema())
+	}
+}
+
+func TestNormalizeMetadataRunConfig_OracleDoesNotCreateSchemaSpecificSession(t *testing.T) {
+	t.Parallel()
+
+	config := connection.ConnectionConfig{
+		Type:     "oracle",
+		Database: "ORCLPDB1",
+	}.WithRuntimeOracleCurrentSchema("TEST")
+	runConfig := normalizeMetadataRunConfig(config, "PRO")
+
+	if runConfig.Database != "ORCLPDB1" {
+		t.Fatalf("expected Oracle metadata service name to stay ORCLPDB1, got %q", runConfig.Database)
+	}
+	if runConfig.RuntimeOracleCurrentSchema() != "" {
+		t.Fatalf("expected Oracle metadata connection to omit session schema, got %q", runConfig.RuntimeOracleCurrentSchema())
 	}
 }
 

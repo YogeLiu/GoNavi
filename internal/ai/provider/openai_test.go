@@ -1,16 +1,54 @@
 package provider
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"GoNavi-Wails/internal/ai"
 )
+
+type openAIRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn openAIRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
+
+func TestOpenAIHTTPClientSeparatesStreamBodyAndResponseHeaderTimeouts(t *testing.T) {
+	client := newOpenAIHTTPClient()
+	if client.Timeout != openAIHTTPTimeout {
+		t.Fatalf("non-stream client timeout = %s, want %s", client.Timeout, openAIHTTPTimeout)
+	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", client.Transport)
+	}
+	if transport.ResponseHeaderTimeout != openAIHTTPTimeout {
+		t.Fatalf("response header timeout = %s, want %s", transport.ResponseHeaderTimeout, openAIHTTPTimeout)
+	}
+
+	streamClient := openAIHTTPClientForRequest(client, true)
+	if streamClient == client {
+		t.Fatal("stream client must be a shallow copy so its timeout cannot mutate non-stream requests")
+	}
+	if streamClient.Timeout != 0 {
+		t.Fatalf("stream client timeout = %s, want 0 to avoid bounding SSE body reads", streamClient.Timeout)
+	}
+	if streamClient.Transport != client.Transport {
+		t.Fatal("stream client must preserve the transport and its response-header/connect limits")
+	}
+
+	if got := openAIHTTPClientForRequest(client, false); got != client {
+		t.Fatal("non-stream request must retain the original client timeout")
+	}
+}
 
 func TestNormalizeOpenAICompatibleBaseURL(t *testing.T) {
 	tests := []struct {
@@ -224,6 +262,33 @@ func TestOpenAIProviderChatUsesRequestMaxTokens(t *testing.T) {
 	}
 }
 
+func TestOpenAIProviderGLM53UsesResponsesCompatibleReasoningEffort(t *testing.T) {
+	var received openAIChatRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Fatalf("decode request body failed: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"pong"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	providerInstance, err := NewOpenAIProvider(ai.ProviderConfig{
+		Type: "openai", APIKey: "sk-test", BaseURL: server.URL,
+		Model: "z-ai/glm-5.3-free", ThinkingIntensity: "medium",
+	})
+	if err != nil {
+		t.Fatalf("create provider failed: %v", err)
+	}
+	if _, err := providerInstance.Chat(context.Background(), ai.ChatRequest{Messages: []ai.Message{{Role: "user", Content: "ping"}}}); err != nil {
+		t.Fatalf("chat failed: %v", err)
+	}
+	if received.ReasoningEffort != "medium" {
+		t.Fatalf("GLM-5.3 medium reasoning_effort = %q, want medium", received.ReasoningEffort)
+	}
+}
+
 func TestOpenAIProviderChatMovesSystemMessagesToRequestPrefix(t *testing.T) {
 	var received openAIChatRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -287,6 +352,111 @@ func TestOpenAIProviderChatMovesSystemMessagesToRequestPrefix(t *testing.T) {
 	}
 }
 
+func TestOpenAIProviderChatDropsCompleteToolCallTurnWithMalformedArguments(t *testing.T) {
+	var received openAIChatRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Fatalf("decode request body failed: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"pong"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer server.Close()
+
+	providerInstance, err := NewOpenAIProvider(ai.ProviderConfig{
+		Type:    "openai",
+		APIKey:  "sk-test",
+		BaseURL: server.URL,
+		Model:   "gpt-chat",
+	})
+	if err != nil {
+		t.Fatalf("create provider failed: %v", err)
+	}
+
+	_, err = providerInstance.Chat(context.Background(), ai.ChatRequest{
+		Messages: []ai.Message{
+			{Role: "user", Content: "Inspect the connection."},
+			{
+				Role: "assistant",
+				ToolCalls: []ai.ToolCall{{
+					ID:   "call_execute_sql",
+					Type: "function",
+					Function: ai.ToolCallFunction{
+						Name:      "execute_sql",
+						Arguments: `{"connectionId":"1787533241017"`,
+					},
+				}},
+			},
+			{Role: "tool", ToolCallID: "call_execute_sql", Content: `{"error":"arguments parse failed"}`},
+			{Role: "user", Content: "Continue."},
+		},
+	})
+	if err != nil {
+		t.Fatalf("chat failed: %v", err)
+	}
+
+	if len(received.Messages) != 2 {
+		t.Fatalf("expected malformed tool-call turn to be removed, got %#v", received.Messages)
+	}
+	if received.Messages[0].Role != "user" || received.Messages[0].Content != "Inspect the connection." ||
+		received.Messages[1].Role != "user" || received.Messages[1].Content != "Continue." {
+		t.Fatalf("expected surrounding user messages to remain, got %#v", received.Messages)
+	}
+}
+
+func TestOpenAIProviderChatNormalizesBlankToolArgumentsToEmptyObject(t *testing.T) {
+	var received openAIChatRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Fatalf("decode request body failed: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"pong"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer server.Close()
+
+	providerInstance, err := NewOpenAIProvider(ai.ProviderConfig{
+		Type:    "openai",
+		APIKey:  "sk-test",
+		BaseURL: server.URL,
+		Model:   "gpt-chat",
+	})
+	if err != nil {
+		t.Fatalf("create provider failed: %v", err)
+	}
+
+	messages := []ai.Message{
+		{
+			Role: "assistant",
+			ToolCalls: []ai.ToolCall{{
+				ID:   "call_no_args",
+				Type: "function",
+				Function: ai.ToolCallFunction{
+					Name:      "list_connections",
+					Arguments: " \t\n ",
+				},
+			}},
+		},
+		{Role: "tool", ToolCallID: "call_no_args", Content: `{"connections":[]}`},
+	}
+	_, err = providerInstance.Chat(context.Background(), ai.ChatRequest{Messages: messages})
+	if err != nil {
+		t.Fatalf("chat failed: %v", err)
+	}
+
+	if len(received.Messages) != 2 || len(received.Messages[0].ToolCalls) != 1 {
+		t.Fatalf("expected blank-argument tool-call turn to remain, got %#v", received.Messages)
+	}
+	if got := received.Messages[0].ToolCalls[0].Function.Arguments; got != `{}` {
+		t.Fatalf("expected blank tool arguments to be normalized to {}, got %q", got)
+	}
+	if got := messages[0].ToolCalls[0].Function.Arguments; got != " \t\n " {
+		t.Fatalf("expected request history to remain unmodified, got arguments %q", got)
+	}
+}
+
 func TestOpenAIProviderChatStreamMovesSystemMessagesToRequestPrefix(t *testing.T) {
 	var received openAIChatRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -339,6 +509,146 @@ func TestOpenAIProviderChatStreamMovesSystemMessagesToRequestPrefix(t *testing.T
 	}
 	if len(received.Messages) != 2 || received.Messages[0].Role != "system" || received.Messages[1].Role != "user" {
 		t.Fatalf("expected system message before user message, got %#v", received.Messages)
+	}
+}
+
+func TestOpenAIProviderChatStreamOutlivesHTTPClientTimeout(t *testing.T) {
+	const clientTimeout = 50 * time.Millisecond
+	attempts := 0
+	transport := openAIRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		attempts++
+		reader, writer := io.Pipe()
+		go func() {
+			defer writer.Close()
+			_, _ = io.WriteString(writer, "data: {\"choices\":[{\"delta\":{\"content\":\"slow \"}}]}\n\n")
+
+			timer := time.NewTimer(3 * clientTimeout)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				_, _ = io.WriteString(writer, "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n")
+			case <-req.Context().Done():
+				_ = writer.CloseWithError(req.Context().Err())
+			}
+		}()
+
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       reader,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Request:    req,
+		}, nil
+	})
+
+	providerInstance, err := NewOpenAIProvider(ai.ProviderConfig{
+		Type: "custom", APIKey: "sk-test", BaseURL: "https://provider.test/v1", Model: "glm-test",
+	})
+	if err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+	provider := providerInstance.(*OpenAIProvider)
+	provider.client = &http.Client{Transport: transport, Timeout: clientTimeout}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var content strings.Builder
+	done := false
+	err = provider.ChatStream(ctx, ai.ChatRequest{
+		Messages: []ai.Message{{Role: "user", Content: "ping"}},
+	}, func(chunk ai.StreamChunk) {
+		content.WriteString(chunk.Content)
+		done = done || chunk.Done
+	})
+	if err != nil {
+		t.Fatalf("slow stream: %v", err)
+	}
+	if content.String() != "slow done" || !done {
+		t.Fatalf("chunks content=%q done=%t", content.String(), done)
+	}
+	if attempts != 1 {
+		t.Fatalf("requests=%d, want 1 (no retry)", attempts)
+	}
+}
+
+func TestOpenAIProviderChatStreamRespectsContextCancellation(t *testing.T) {
+	transport := openAIRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		reader, writer := io.Pipe()
+		go func() {
+			_, _ = io.WriteString(writer, "data: {\"choices\":[{\"delta\":{\"content\":\"started\"}}]}\n\n")
+			<-req.Context().Done()
+			_ = writer.CloseWithError(req.Context().Err())
+		}()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       reader,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Request:    req,
+		}, nil
+	})
+
+	providerInstance, err := NewOpenAIProvider(ai.ProviderConfig{
+		Type: "custom", APIKey: "sk-test", BaseURL: "https://provider.test/v1", Model: "glm-test",
+	})
+	if err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+	provider := providerInstance.(*OpenAIProvider)
+	provider.client = &http.Client{Transport: transport, Timeout: 50 * time.Millisecond}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err = provider.ChatStream(ctx, ai.ChatRequest{
+		Messages: []ai.Message{{Role: "user", Content: "ping"}},
+	}, func(chunk ai.StreamChunk) {
+		if chunk.Content == "started" {
+			cancel()
+		}
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("stream error=%v, want context canceled", err)
+	}
+}
+
+func TestOpenAIProviderChatStreamBoundsErrorBodyRead(t *testing.T) {
+	const clientTimeout = 40 * time.Millisecond
+	transport := openAIRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		reader, writer := io.Pipe()
+		go func() {
+			<-req.Context().Done()
+			_ = writer.CloseWithError(req.Context().Err())
+		}()
+		return &http.Response{
+			StatusCode:    http.StatusBadRequest,
+			Body:          reader,
+			ContentLength: -1,
+			Header:        http.Header{"Content-Type": []string{"application/json"}},
+			Request:       req,
+		}, nil
+	})
+
+	providerInstance, err := NewOpenAIProvider(ai.ProviderConfig{
+		Type: "custom", APIKey: "sk-test", BaseURL: "https://provider.test/v1", Model: "glm-test",
+	})
+	if err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+	provider := providerInstance.(*OpenAIProvider)
+	provider.client = &http.Client{Transport: transport, Timeout: clientTimeout}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*clientTimeout)
+	defer cancel()
+	started := time.Now()
+	err = provider.ChatStream(ctx, ai.ChatRequest{
+		Messages: []ai.Message{{Role: "user", Content: "ping"}},
+	}, func(ai.StreamChunk) {})
+	if err == nil || !strings.Contains(err.Error(), "error response body read timed out") {
+		t.Fatalf("stream error=%v, want bounded error-body timeout", err)
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("outer context ended unexpectedly: %v", ctx.Err())
+	}
+	if elapsed := time.Since(started); elapsed > 5*clientTimeout {
+		t.Fatalf("error body read returned after %s, want timeout near %s", elapsed, clientTimeout)
 	}
 }
 
@@ -529,8 +839,8 @@ func TestOpenAIProviderChatStreamRetriesWithoutToolsThenImagesOnHTTP400(t *testi
 	if err != nil {
 		t.Fatalf("expected stream fallback to succeed, got %v", err)
 	}
-	if requestCount != 3 {
-		t.Fatalf("expected 3 requests (with tools, without tools, without images), got %d", requestCount)
+	if requestCount != 4 {
+		t.Fatalf("expected 4 requests (without usage option, tools, then images), got %d", requestCount)
 	}
 	if len(chunks) < 2 {
 		t.Fatalf("expected content and done chunks, got %#v", chunks)
@@ -540,6 +850,84 @@ func TestOpenAIProviderChatStreamRetriesWithoutToolsThenImagesOnHTTP400(t *testi
 	}
 	if !chunks[len(chunks)-1].Done {
 		t.Fatalf("expected final done chunk, got %#v", chunks[len(chunks)-1])
+	}
+}
+
+func TestOpenAIProviderChatStreamIncludesAndPreservesUsageAfterFinishReason(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		streamOptions, _ := body["stream_options"].(map[string]any)
+		if streamOptions["include_usage"] != true {
+			t.Fatalf("expected stream usage request, got %#v", body)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(strings.Join([]string{
+			`data: {"choices":[{"delta":{"content":"pong"},"finish_reason":"stop"}]}`,
+			``,
+			`data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"prompt_tokens_details":{"cached_tokens":4}}}`,
+			``,
+			`data: [DONE]`,
+			``,
+		}, "\n")))
+	}))
+	defer server.Close()
+
+	providerInstance, err := NewOpenAIProvider(ai.ProviderConfig{
+		Type: "custom", APIKey: "sk-test", BaseURL: server.URL, Model: "qwen-compatible",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chunks []ai.StreamChunk
+	err = providerInstance.ChatStream(context.Background(), ai.ChatRequest{
+		Messages: []ai.Message{{Role: "user", Content: "ping"}},
+	}, func(chunk ai.StreamChunk) { chunks = append(chunks, chunk) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	final := chunks[len(chunks)-1]
+	if !final.Done || final.Usage == nil {
+		t.Fatalf("final chunk = %#v", final)
+	}
+	if final.Usage.PromptTokens != 10 || final.Usage.CompletionTokens != 2 || final.Usage.TotalTokens != 12 {
+		t.Fatalf("usage = %#v", final.Usage)
+	}
+	if final.Usage.CachedTokens == nil || *final.Usage.CachedTokens != 4 {
+		t.Fatalf("cached usage = %#v", final.Usage.CachedTokens)
+	}
+}
+
+func TestOpenAIProviderChatStreamFallsBackWhenStreamOptionsAreRejected(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		body, _ := io.ReadAll(r.Body)
+		if bytes.Contains(body, []byte(`"stream_options"`)) {
+			http.Error(w, `{"error":{"message":"unknown parameter stream_options"}}`, http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"pong\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer server.Close()
+
+	providerInstance, err := NewOpenAIProvider(ai.ProviderConfig{
+		Type: "custom", APIKey: "sk-test", BaseURL: server.URL, Model: "legacy-compatible",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = providerInstance.ChatStream(context.Background(), ai.ChatRequest{
+		Messages: []ai.Message{{Role: "user", Content: "ping"}},
+	}, func(ai.StreamChunk) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests != 2 {
+		t.Fatalf("requests = %d, want stream_options retry", requests)
 	}
 }
 
@@ -668,6 +1056,31 @@ func TestBuildOpenAIMessagesDropsIncompleteToolCallHistory(t *testing.T) {
 	}
 	if got[0].Role != "user" || got[1].Role != "user" {
 		t.Fatalf("expected user messages to remain after removing incomplete turn, got %#v", got)
+	}
+}
+
+func TestBuildOpenAIMessagesDropsCompleteToolCallTurnWithNonObjectArguments(t *testing.T) {
+	for name, arguments := range map[string]string{
+		"array":   `[]`,
+		"boolean": `true`,
+		"null":    `null`,
+		"number":  `1`,
+		"string":  `"connection-1"`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			toolCall := testOpenAIToolCall()
+			toolCall.Function.Arguments = arguments
+			got := buildOpenAIMessages([]ai.Message{
+				{Role: "user", Content: "Inspect."},
+				{Role: "assistant", ToolCalls: []ai.ToolCall{toolCall}},
+				{Role: "tool", ToolCallID: toolCall.ID, Content: `{"ok":true}`},
+				{Role: "user", Content: "Continue."},
+			}, "gpt-4o", "https://api.openai.com/v1")
+
+			if len(got) != 2 || got[0].Role != "user" || got[1].Role != "user" {
+				t.Fatalf("expected non-object tool-call turn to be removed, got %#v", got)
+			}
+		})
 	}
 }
 

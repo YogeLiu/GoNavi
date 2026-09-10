@@ -487,7 +487,7 @@ const ConnectionModalNetworkSecuritySection: React.FC<ConnectionModalNetworkSecu
           t("connection.modal.network.httpTunnel.host"),
         )}
         <div className="gn-conn-f-ctrl gn-conn-f-inline">
-          <div className="gn-conn-w gn-conn-w-host">
+          <div className="gn-conn-w gn-conn-w-grow">
             <Form.Item
               name="httpTunnelHost"
               rules={[
@@ -502,32 +502,9 @@ const ConnectionModalNetworkSecuritySection: React.FC<ConnectionModalNetworkSecu
             >
               <Input
                 {...noAutoCapInputProps}
-                placeholder={t("connection.modal.example.or", {
-                  first: "tunnel.company.com",
-                  second: "127.0.0.1",
-                })}
-              />
-            </Form.Item>
-          </div>
-          <div className="gn-conn-w gn-conn-w-port">
-            <Form.Item
-              name="httpTunnelPort"
-              rules={[
-                {
-                  required: useHttpTunnel,
-                  message: t(
-                    "connection.modal.network.httpTunnel.portRequired",
-                  ),
-                },
-              ]}
-              style={{ marginBottom: 0 }}
-            >
-              <InputNumber
-                style={{ width: "100%" }}
-                controls={false}
-                min={1}
-                max={65535}
-                aria-label={t("connection.modal.field.port.label")}
+                placeholder={t(
+                  "connection.modal.network.httpTunnel.urlPlaceholder",
+                )}
               />
             </Form.Item>
           </div>
@@ -567,6 +544,20 @@ const ConnectionModalNetworkSecuritySection: React.FC<ConnectionModalNetworkSecu
         clearLabel: t("connection.modal.network.httpTunnel.clearPassword"),
         description: t("connection.modal.network.httpTunnel.savedDescription"),
       })}
+      <div className="gn-conn-check-line" style={{ paddingLeft: 0 }}>
+        <Form.Item
+          name="httpTunnelEncodeBase64"
+          valuePropName="checked"
+          style={{ marginBottom: 0 }}
+        >
+          <Checkbox className="gn-check">
+            {t("connection.modal.network.httpTunnel.encodeBase64")}
+          </Checkbox>
+        </Form.Item>
+      </div>
+      <div className="gn-conn-field-hint">
+        {t("connection.modal.network.httpTunnel.encodeBase64Hint")}
+      </div>
       <div className="gn-conn-field-hint">
         {t("connection.modal.network.httpTunnel.exclusiveHint")}
       </div>
@@ -787,61 +778,55 @@ const ConnectionModalNetworkSecuritySection: React.FC<ConnectionModalNetworkSecu
         </div>
         {keepAliveSQLSupported ? (
           <>
-            <div
-              style={{
-                fontSize: 12,
-                fontWeight: 650,
-                color: "var(--gn-fg-3)",
-                marginBottom: 4,
-              }}
-            >
-              {t("connection.modal.network.keepAliveSQL.label")}
-            </div>
-            <Form.Item
-              name="keepAliveSQL"
-              rules={[
-                {
-                  max: MAX_CONNECTION_KEEPALIVE_SQL_LENGTH,
-                  message: t("connection.modal.network.keepAliveSQL.maxLength"),
-                },
-                {
-                  validator: (_, value) => {
-                    const sql = String(value || "").trim();
-                    if (
-                      !sql ||
-                      !keepAliveEnabled ||
-                      isSingleReadOnlyConnectionQuery(
-                        {
-                          type: dbType,
-                          driver: connectionDriver,
-                          oceanBaseProtocol: oceanBaseProtocol,
-                        },
-                        sql,
-                      )
-                    ) {
-                      return Promise.resolve();
-                    }
-                    return Promise.reject(
-                      new Error(
-                        t("connection.modal.network.keepAliveSQL.readOnly"),
-                      ),
-                    );
+            <div className="gn-conn-multiline-field">
+              <div className="gn-conn-el">
+                {t("connection.modal.network.keepAliveSQL.label")}
+              </div>
+              <Form.Item
+                name="keepAliveSQL"
+                noStyle
+                rules={[
+                  {
+                    max: MAX_CONNECTION_KEEPALIVE_SQL_LENGTH,
+                    message: t("connection.modal.network.keepAliveSQL.maxLength"),
                   },
-                },
-              ]}
-              style={{ marginBottom: 22 }}
-            >
-              <Input.TextArea
-                {...noAutoCapInputProps}
-                autoSize={{ minRows: 2, maxRows: 4 }}
-                disabled={!keepAliveEnabled}
-                maxLength={MAX_CONNECTION_KEEPALIVE_SQL_LENGTH}
-                placeholder="SELECT 1"
-                showCount
-              />
-            </Form.Item>
-            <div className="gn-conn-field-hint">
-              {t("connection.modal.network.keepAliveSQL.help")}
+                  {
+                    validator: (_, value) => {
+                      const sql = String(value || "").trim();
+                      if (
+                        !sql ||
+                        !keepAliveEnabled ||
+                        isSingleReadOnlyConnectionQuery(
+                          {
+                            type: dbType,
+                            driver: connectionDriver,
+                            oceanBaseProtocol: oceanBaseProtocol,
+                          },
+                          sql,
+                        )
+                      ) {
+                        return Promise.resolve();
+                      }
+                      return Promise.reject(
+                        new Error(
+                          t("connection.modal.network.keepAliveSQL.readOnly"),
+                        ),
+                      );
+                    },
+                  },
+                ]}
+              >
+                <Input.TextArea
+                  {...noAutoCapInputProps}
+                  autoSize={{ minRows: 2, maxRows: 4 }}
+                  disabled={!keepAliveEnabled}
+                  maxLength={MAX_CONNECTION_KEEPALIVE_SQL_LENGTH}
+                  placeholder="SELECT 1"
+                />
+              </Form.Item>
+              <div className="gn-conn-field-hint">
+                {t("connection.modal.network.keepAliveSQL.help")}
+              </div>
             </div>
           </>
         ) : null}

@@ -70,6 +70,7 @@ const importMain = async () => {
       go?: {
         app?: {
           App?: {
+            GetBrandIconDataURL: (id: string) => Promise<string>;
             ImportConfigFile: () => Promise<{ success: boolean; message?: string }>;
             ImportConnectionsPayload: (raw: string, password?: string) => Promise<unknown>;
             ExportConnectionsPackage: (options?: { includeSecrets?: boolean; filePassword?: string }) => Promise<{ success: boolean; message?: string }>;
@@ -160,6 +161,36 @@ describe('main browser mock', () => {
         releasePublishedAt: '2026-07-08T11:15:00Z',
         releaseNotesUrl: 'https://github.com/Syngnat/GoNavi/releases/tag/dev-latest',
       },
+    });
+  });
+
+  it('normalizes result masking with Unicode case-fold and full-mask precedence', async () => {
+    await importMain();
+    const service = (globalThis as any).window.go.aiservice.Service;
+
+    await service.AISaveResultMaskingSettings({
+      enabled: true,
+      fullMaskFields: [' Σ ', 'ς'],
+      partialMaskFields: ['σ', 'email', 'EMAIL'],
+    });
+
+    await expect(service.AIGetResultMaskingSettings()).resolves.toEqual({
+      enabled: true,
+      fullMaskFields: ['Σ'],
+      partialMaskFields: ['email'],
+    });
+  });
+
+  it('uses the real distinct immutable brand assets in browser and Playwright harnesses', async () => {
+    const app = await importMain();
+
+    const sources = await Promise.all(['01', '02', '03', '04', '05', '06'].map((id) => app!.GetBrandIconDataURL(id)));
+    expect(new Set(sources).size).toBe(6);
+    expect(sources.every((source) => source.startsWith('https://origin-download.syngnat.top:8443/gonavi/brand-assets/v1/'))).toBe(true);
+    await expect(app!.GetBrandIconDataURL('unknown')).resolves.toBe('');
+    await expect((globalThis as any).window.runtime.Environment()).resolves.toMatchObject({
+      platform: 'browser',
+      buildType: 'web',
     });
   });
 
@@ -393,7 +424,7 @@ describe('main browser mock', () => {
     }));
   });
 
-  it('localizes browser mock provider test messages', async () => {
+  it('reports provider test previews as unavailable in browser mock mode', async () => {
     vi.stubGlobal('navigator', {
       languages: ['en-US'],
       language: 'en-US',
@@ -404,12 +435,10 @@ describe('main browser mock', () => {
     const service = (globalThis as any).window.go.aiservice.Service;
 
     await expect(service.AITestProvider({ apiKey: 'sk-demo' })).resolves.toEqual(expect.objectContaining({
-      success: true,
-      message: t('app.browser_mock.provider.test_success'),
-    }));
-    await expect(service.AITestProvider({ apiKey: '   ' })).resolves.toEqual(expect.objectContaining({
       success: false,
-      message: t('app.browser_mock.provider.test_failed_detail', { detail: 'missing api key' }),
+      checkKind: 'none',
+      modelVerified: false,
+      message: t('ai_settings.message.preview_check_unavailable'),
     }));
   });
 

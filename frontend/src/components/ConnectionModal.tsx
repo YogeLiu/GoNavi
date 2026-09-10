@@ -208,6 +208,26 @@ const CONNECTION_MODAL_WIDTH_STEP2 = 760;
 // 头部高度约 60px，主体固定为 700px，使弹窗整体（760×760）接近正方形。
 const CONNECTION_MODAL_BODY_HEIGHT = 700;
 const REDIS_DEFAULT_DATABASE_COUNT = 16;
+const CONNECTION_MODAL_FOCUSABLE_SELECTOR = [
+  'a[href]',
+  'button:not([disabled])',
+  'input:not([disabled]):not([type="hidden"])',
+  'select:not([disabled])',
+  'textarea:not([disabled])',
+  '[contenteditable="true"]',
+  '[tabindex]:not([tabindex="-1"])',
+].join(',');
+
+const getConnectionModalFocusableElements = (panel: HTMLElement): HTMLElement[] => (
+  Array.from(panel.querySelectorAll<HTMLElement>(CONNECTION_MODAL_FOCUSABLE_SELECTOR))
+    .filter((element) => (
+      element.parentElement !== panel
+      && !element.hidden
+      && !(element as HTMLButtonElement | HTMLInputElement).disabled
+      && element.getAttribute('aria-hidden') !== 'true'
+      && element.getClientRects().length > 0
+    ))
+);
 const CLICKHOUSE_PROTOCOL_OPTIONS: Array<{
   value: ClickHouseProtocolChoice;
   label?: string;
@@ -364,10 +384,11 @@ const ConnectionModal: React.FC<{
   open: boolean;
   onClose: () => void;
   initialValues?: SavedConnection | null;
+  modalZIndex?: number;
   onOpenDriverManager?: () => void;
   onSaved?: (savedConnection: SavedConnection) => void | Promise<void>;
   onOpenConnectionHealth?: (savedConnection: SavedConnection) => void;
-}> = ({ open, onClose, initialValues, onOpenDriverManager, onSaved, onOpenConnectionHealth }) => {
+}> = ({ open, onClose, initialValues, modalZIndex = APP_FOREGROUND_MODAL_Z_INDEX, onOpenDriverManager, onSaved, onOpenConnectionHealth }) => {
   const [form] = Form.useForm();
   const [saving, setSaving] = useState(false);
   const [testingConnection, setTestingConnection] = useState(false);
@@ -431,6 +452,7 @@ const ConnectionModal: React.FC<{
   const revealedPrimaryPasswordRef = useRef("");
   const clearSecretsRef = useRef(clearSecrets);
   const oracleModeTouchedRef = useRef(false);
+  const connectionModalPanelRef = useRef<HTMLDivElement | null>(null);
   const addConnection = useStore((state) => state.addConnection);
   const updateConnection = useStore((state) => state.updateConnection);
   const savedConnections = useStore((state) => state.connections) ?? [];
@@ -542,9 +564,8 @@ const ConnectionModal: React.FC<{
     () =>
       buildOverlayWorkbenchTheme(darkMode, {
         disableBackdropFilter: disableLocalBackdropFilter,
-        uiVersion: appearance.uiVersion,
       }),
-    [appearance.uiVersion, darkMode, disableLocalBackdropFilter],
+    [darkMode, disableLocalBackdropFilter],
   );
 
   const tunnelSectionStyle: React.CSSProperties = {
@@ -610,12 +631,12 @@ const ConnectionModal: React.FC<{
     [overlayTheme],
   );
 
-  const resetPrimaryPasswordRevealState = () => {
+  const resetPrimaryPasswordRevealState = useCallback(() => {
     primaryPasswordRevealRequestRef.current += 1;
     revealedPrimaryPasswordRef.current = "";
     form.setFieldValue("password", "");
     setPrimaryPasswordVisible(false);
-  };
+  }, [form]);
 
   const cancelActiveConnectionTest = useCallback(() => {
     const nacosTestRunId = activeNacosTestRunIdRef.current;
@@ -644,13 +665,71 @@ const ConnectionModal: React.FC<{
     }
   }, []);
 
-  const handleModalClose = () => {
+  const handleModalClose = useCallback(() => {
     cancelActiveConnectionTest();
     resetPrimaryPasswordRevealState();
     setSSHHostKeyTrust(null);
     setTrustingSSHHostKey(false);
     onClose();
-  };
+  }, [cancelActiveConnectionTest, onClose, resetPrimaryPasswordRevealState]);
+
+  const nestedConnectionModalOpen = Boolean(
+    sshHostKeyTrust
+    || (sshProgressPanelOpen && sshConnectionProgress)
+    || testErrorLogOpen,
+  );
+
+  useLayoutEffect(() => {
+    if (!open || step === 1 || typeof document === "undefined") return;
+    const panel = connectionModalPanelRef.current;
+    if (!panel || panel.contains(document.activeElement)) return;
+    const initialFocus = panel.querySelector<HTMLElement>(
+      '.gn-conn-form-nav-item[aria-selected="true"]',
+    ) || getConnectionModalFocusableElements(panel)[0];
+    initialFocus?.focus({ preventScroll: true });
+  }, [open, step]);
+
+  useEffect(() => {
+    if (
+      !open
+      || nestedConnectionModalOpen
+      || typeof window === "undefined"
+      || typeof document === "undefined"
+    ) {
+      return undefined;
+    }
+
+    const keepFocusInConnectionModal = (event: KeyboardEvent) => {
+      if (event.key !== "Tab" && event.key !== "Escape") return;
+      const panel = connectionModalPanelRef.current;
+      if (!panel) return;
+      const activeElement = document.activeElement as HTMLElement | null;
+      if (activeElement && panel.contains(activeElement)) return;
+      const appRoot = document.getElementById("root");
+      if (activeElement !== document.body && !appRoot?.contains(activeElement)) return;
+
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        handleModalClose();
+        return;
+      }
+
+      const focusableElements = getConnectionModalFocusableElements(panel);
+      const target = event.shiftKey
+        ? focusableElements[focusableElements.length - 1]
+        : focusableElements[0];
+      if (!target) return;
+      event.preventDefault();
+      event.stopPropagation();
+      target.focus({ preventScroll: true });
+    };
+
+    window.addEventListener("keydown", keepFocusInConnectionModal, true);
+    return () => {
+      window.removeEventListener("keydown", keepFocusInConnectionModal, true);
+    };
+  }, [handleModalClose, nestedConnectionModalOpen, open]);
 
   useLayoutEffect(() => {
     resetPrimaryPasswordRevealState();
@@ -659,7 +738,7 @@ const ConnectionModal: React.FC<{
       revealedPrimaryPasswordRef.current = "";
       form.setFieldValue("password", "");
     };
-  }, [open, initialValues?.id]);
+  }, [initialValues?.id, open, resetPrimaryPasswordRevealState]);
 
   const renderStoredSecretControls = ({
     fieldName,
@@ -1784,6 +1863,8 @@ const ConnectionModal: React.FC<{
           httpTunnelPort: config.httpTunnel?.port || 8080,
           httpTunnelUser: config.httpTunnel?.user,
           httpTunnelPassword: config.httpTunnel?.password,
+          httpTunnelEncodeBase64:
+            config.httpTunnel?.encodeBase64 !== false,
           driver: config.driver,
           dsn: config.dsn,
           timeout: resolvedJvmTimeout,
@@ -2640,6 +2721,7 @@ const ConnectionModal: React.FC<{
         httpTunnelPort: 8080,
         httpTunnelUser: "",
         httpTunnelPassword: "",
+        httpTunnelEncodeBase64: true,
         timeout: 30,
         keepAliveEnabled: false,
         keepAliveIntervalMinutes: DEFAULT_KEEPALIVE_INTERVAL_MINUTES,
@@ -2720,6 +2802,7 @@ const ConnectionModal: React.FC<{
         httpTunnelPort: 8080,
         httpTunnelUser: "",
         httpTunnelPassword: "",
+        httpTunnelEncodeBase64: true,
         keepAliveEnabled: false,
         keepAliveIntervalMinutes: DEFAULT_KEEPALIVE_INTERVAL_MINUTES,
         keepAliveSQL: "",
@@ -2776,6 +2859,7 @@ const ConnectionModal: React.FC<{
         httpTunnelPort: 8080,
         httpTunnelUser: "",
         httpTunnelPassword: "",
+        httpTunnelEncodeBase64: true,
         keepAliveEnabled: false,
         keepAliveIntervalMinutes: DEFAULT_KEEPALIVE_INTERVAL_MINUTES,
         keepAliveSQL: "",
@@ -3493,6 +3577,7 @@ const ConnectionModal: React.FC<{
       <Modal
         title={getStudioTitle()}
         open={open}
+        panelRef={connectionModalPanelRef}
         onCancel={handleModalClose}
         footer={getFooter()}
         closable={false}
@@ -3503,7 +3588,7 @@ const ConnectionModal: React.FC<{
             : "connection-modal-wrap"
         }
         width={isFormStep ? CONNECTION_MODAL_WIDTH_STEP2 : CONNECTION_MODAL_WIDTH_STEP1}
-        zIndex={APP_FOREGROUND_MODAL_Z_INDEX}
+        zIndex={modalZIndex}
         destroyOnHidden
         maskClosable={false}
         styles={{

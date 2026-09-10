@@ -358,10 +358,18 @@ describe('nativeDetachedWindowClient', () => {
   });
 
   it('keeps main-window AI context sync separate from child-owned conversation state', () => {
+    const appearance = {
+      toolbarButtonColorOverrides: {
+        query: {
+          'button-bg': '#13579b',
+          'primary-hover-border': 'rgba(18, 52, 86, 0.5)',
+        },
+      },
+    };
     const state = {
       theme: 'light',
       themePreference: 'light',
-      appearance: { uiVersion: 'v2' },
+      appearance,
       fontSize: 16,
       uiScale: 1.15,
       activeContext: { connectionId: 'connection-2', dbName: 'analytics' },
@@ -376,7 +384,7 @@ describe('nativeDetachedWindowClient', () => {
     expect(snapshot).toEqual({
       theme: 'light',
       themePreference: 'light',
-      appearance: { uiVersion: 'v2' },
+      appearance,
       fontSize: 16,
       uiScale: 1.15,
       activeContext: state.activeContext,
@@ -390,7 +398,7 @@ describe('nativeDetachedWindowClient', () => {
       ...state,
       theme: 'dark',
       themePreference: 'dark',
-      appearance: { uiVersion: 'legacy' },
+      appearance: {  },
       fontSize: 12,
       uiScale: 0.9,
       activeTabId: queryTab.id,
@@ -405,7 +413,7 @@ describe('nativeDetachedWindowClient', () => {
     expect(next.closeTab).toBe(current.closeTab);
     expect(next.theme).toBe('light');
     expect(next.themePreference).toBe('light');
-    expect(next.appearance).toEqual({ uiVersion: 'v2' });
+    expect(next.appearance).toEqual(appearance);
     expect(next.fontSize).toBe(16);
     expect(next.uiScale).toBe(1.15);
 
@@ -423,6 +431,7 @@ describe('nativeDetachedWindowClient', () => {
     });
     expect(revision).toBe(5);
     expect(childState.activeTabId).toBe('query-2');
+    expect(childState.appearance).toEqual(appearance);
     expect(getQueryTabDraft('query-2')).toBe('select 1');
     expect(applyNativeDetachedHostStateCommand(childStore, 'ai-chat', revision, {
       id: 'ai-chat',
@@ -772,6 +781,25 @@ describe('nativeDetachedWindowClient', () => {
     try {
       await hideCurrentNativeDetachedWindowForAISettings(13);
       expect(hideForAISettings).toHaveBeenCalledWith(13);
+    } finally {
+      if (previousWindowDescriptor) {
+        Object.defineProperty(globalThis, 'window', previousWindowDescriptor);
+      } else {
+        Reflect.deleteProperty(globalThis, 'window');
+      }
+    }
+  });
+
+  it('passes the selected provider through the atomic native settings control', async () => {
+    const hideForAISettingsProvider = vi.fn(async () => ({ success: true }));
+    const previousWindowDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'window');
+    Object.defineProperty(globalThis, 'window', {
+      configurable: true,
+      value: { go: { nativewindow: { Control: { HideForAISettingsProvider: hideForAISettingsProvider } } } },
+    });
+    try {
+      await hideCurrentNativeDetachedWindowForAISettings(13, 'provider-grok');
+      expect(hideForAISettingsProvider).toHaveBeenCalledWith(13, 'provider-grok');
     } finally {
       if (previousWindowDescriptor) {
         Object.defineProperty(globalThis, 'window', previousWindowDescriptor);

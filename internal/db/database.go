@@ -328,6 +328,13 @@ type QueryContexter interface {
 	QueryContext(ctx context.Context, query string) ([]map[string]interface{}, []string, error)
 }
 
+// ColumnDefinitionContexter is an optional same-session metadata extension.
+// It is used when opening a second database instance would change connection-
+// scoped semantics, such as an in-memory SQLite or DuckDB database.
+type ColumnDefinitionContexter interface {
+	GetColumnsContext(ctx context.Context, dbName, tableName string) ([]connection.ColumnDefinition, error)
+}
+
 // ExecContexter is the optional cancellation-capable write contract.
 // Callers must not assume Database.Exec can be interrupted without it.
 type ExecContexter interface {
@@ -337,6 +344,16 @@ type ExecContexter interface {
 // MultiResultQuerierContext 是带 context 的多结果集查询接口。
 type MultiResultQuerierContext interface {
 	QueryMultiContext(ctx context.Context, query string) ([]connection.ResultSetData, error)
+}
+
+// StatementBatchMultiResultQuerierContext is an optional protocol-native
+// contract for transports that accept an ordered SQL array in one request.
+// Navicat's ntunnel_mysql.php uses repeated q[] form fields and keeps one
+// database connection for that request, so callers must not degrade it into
+// independent HTTP requests when session-scoped SQL is present.
+type StatementBatchMultiResultQuerierContext interface {
+	SupportsStatementBatchMultiResult() bool
+	QueryStatementsMultiContext(ctx context.Context, statements []string) ([]connection.ResultSetData, error)
 }
 
 // BatchWriteExecer 是可选接口，支持将多条写语句一次性批量发送执行。
@@ -351,6 +368,13 @@ type BatchWriteExecer interface {
 // connection had to fall back to multiStatements=false.
 type BatchWriteCapability interface {
 	SupportsBatchWrites() bool
+}
+
+// BatchApplyCapability lets a driver whose BatchApplier implementation is
+// conditionally unavailable opt out at runtime. This is distinct from plain
+// Exec support: a data grid change set promises an atomic batch.
+type BatchApplyCapability interface {
+	SupportsBatchApply() bool
 }
 
 // StatementExecer is a single-session SQL execution handle.
@@ -464,6 +488,14 @@ type SessionExecerProvider interface {
 	OpenSessionExecer(ctx context.Context) (StatementExecer, error)
 }
 
+// SessionExecerCapability lets a database/sql implementation report that its
+// current transport cannot preserve a physical session. HTTP script tunnels
+// create a database connection per request even though the concrete Go type
+// also supports pinned sessions for normal TCP connections.
+type SessionExecerCapability interface {
+	SupportsSessionExecer() bool
+}
+
 // TransactionExecer is a single transaction handle backed by the database
 // driver. It is required for dialects where textual BEGIN/COMMIT is not a
 // valid transaction-control statement, such as Oracle.
@@ -534,7 +566,7 @@ func (e *sqlConnStatementExecer) QueryContext(ctx context.Context, query string)
 		return nil, nil, err
 	}
 	defer rows.Close()
-	return scanRowsForDialect(rows, e.scanDialect)
+	return scanRowsForDialectContext(ctx, rows, e.scanDialect)
 }
 
 func (e *sqlConnStatementExecer) Query(query string) ([]map[string]interface{}, []string, error) {
@@ -566,7 +598,7 @@ func (e *sqlConnStatementExecer) QueryMultiContext(ctx context.Context, query st
 		return nil, err
 	}
 	defer rows.Close()
-	return scanMultiRowsForDialect(rows, e.scanDialect)
+	return scanMultiRowsForDialectContext(ctx, rows, e.scanDialect)
 }
 
 func (e *sqlConnStatementExecer) QueryMulti(query string) ([]connection.ResultSetData, error) {
@@ -681,7 +713,7 @@ func (e *sqlConnTransactionExecer) QueryContext(ctx context.Context, query strin
 		return nil, nil, err
 	}
 	defer rows.Close()
-	return scanRowsForDialect(rows, e.scanDialect)
+	return scanRowsForDialectContext(ctx, rows, e.scanDialect)
 }
 
 func (e *sqlConnTransactionExecer) Query(query string) ([]map[string]interface{}, []string, error) {
@@ -715,7 +747,7 @@ func (e *sqlConnTransactionExecer) QueryMultiContext(ctx context.Context, query 
 		return nil, err
 	}
 	defer rows.Close()
-	return scanMultiRowsForDialect(rows, e.scanDialect)
+	return scanMultiRowsForDialectContext(ctx, rows, e.scanDialect)
 }
 
 func (e *sqlConnTransactionExecer) QueryMulti(query string) ([]connection.ResultSetData, error) {
@@ -884,7 +916,7 @@ func (e *sqlTxStatementExecer) QueryContext(ctx context.Context, query string) (
 		return nil, nil, err
 	}
 	defer rows.Close()
-	return scanRows(rows)
+	return scanRowsContext(ctx, rows)
 }
 
 func (e *sqlTxStatementExecer) Query(query string) ([]map[string]interface{}, []string, error) {
@@ -918,7 +950,7 @@ func (e *sqlTxStatementExecer) QueryMultiContext(ctx context.Context, query stri
 		return nil, err
 	}
 	defer rows.Close()
-	return scanMultiRows(rows)
+	return scanMultiRowsContext(ctx, rows)
 }
 
 func (e *sqlTxStatementExecer) QueryMulti(query string) ([]connection.ResultSetData, error) {

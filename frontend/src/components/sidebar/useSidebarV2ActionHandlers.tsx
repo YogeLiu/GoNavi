@@ -44,6 +44,7 @@ type UseSidebarV2ActionHandlersArgs = {
   loadingNodesRef: MutableRefObject<Set<string>>;
   treeDataRef: MutableRefObject<TreeNode[]>;
   refreshConnectionResources: (node: any) => Promise<void>;
+  invalidateConnectionLoads: (connectionId: string) => void;
   findTreeNodeByKeyRef: MutableRefObject<(nodes: TreeNode[], targetKey: React.Key) => TreeNode | null>;
   refreshV2TableContextMenuStatsRef: MutableRefObject<(node: any) => void>;
   setConnectionStates: Dispatch<SetStateAction<Record<string, SidebarConnectionState>>>;
@@ -117,6 +118,7 @@ export const useSidebarV2ActionHandlers = ({
   loadingNodesRef,
   treeDataRef,
   refreshConnectionResources,
+  invalidateConnectionLoads,
   findTreeNodeByKeyRef,
   refreshV2TableContextMenuStatsRef,
   setConnectionStates,
@@ -211,6 +213,7 @@ export const useSidebarV2ActionHandlers = ({
             type: 'query',
             connectionId: node.dataRef.id,
             dbName: node.dataRef.dbName,
+            schemaName: String(node.dataRef?.schemaName || '').trim() || undefined,
             query: queryTemplate,
           });
         })();
@@ -391,13 +394,15 @@ export const useSidebarV2ActionHandlers = ({
 
   const openDatabaseQuery = (node: any) => {
     const dbName = String(node.dataRef?.dbName || node.title || '').trim();
+    const schemaName = String(node.dataRef?.schemaName || '').trim();
     const dbType = getMetadataDialect(node.dataRef as SavedConnection);
     addTab({
       id: `query-${Date.now()}`,
-      title: t('sidebar.tab.new_query_database', { database: node.title }),
+      title: t('sidebar.tab.new_query_database', { database: dbName }),
       type: 'query',
       connectionId: node.dataRef.id,
       dbName,
+      schemaName: schemaName || undefined,
       query: isElasticsearchDbType(dbType)
         ? buildTableSelectQuery(dbType, dbName)
         : '',
@@ -474,6 +479,7 @@ export const useSidebarV2ActionHandlers = ({
     const connKey = String(node?.key || node?.dataRef?.id || '');
     if (!connKey) return;
     const conn = (connections.find((item) => item.id === connKey) || node?.dataRef) as SavedConnection | undefined;
+    invalidateConnectionLoads(connKey);
     Array.from(loadingNodesRef.current).forEach((loadingKey) => {
       if (loadingKey === `dbs-${connKey}` || loadingKey.startsWith(`tables-${connKey}-`)) {
         loadingNodesRef.current.delete(loadingKey);
@@ -513,6 +519,7 @@ export const useSidebarV2ActionHandlers = ({
         }
         try {
           await backendApp.DeleteConnection(connId);
+          invalidateConnectionLoads(connId);
           closeTabsByConnection(connId);
           removeConnection(connId);
           message.success(t('connection.sidebar.delete.success'));
@@ -527,7 +534,7 @@ export const useSidebarV2ActionHandlers = ({
   const createConnectionTreeNode = (conn: SavedConnection): TreeNode => ({
     title: conn.name,
     key: conn.id,
-    icon: getDbIcon(resolveConnectionIconType(conn), resolveConnectionAccentColor(conn), 22),
+    icon: getDbIcon(resolveConnectionIconType(conn), resolveConnectionAccentColor(conn), 20),
     type: 'connection',
     dataRef: conn,
     isLeaf: false,

@@ -26,7 +26,6 @@ import { useStore } from '../store';
 import {
   isMacLikePlatform,
   normalizeBlurForPlatform,
-  normalizeOpacityForPlatform,
   resolveAppearanceValues,
 } from '../utils/appearance';
 import { buildRpcConnectionConfig } from '../utils/connectionRpcConfig';
@@ -97,6 +96,7 @@ type ServiceViewContext = {
   page: number;
   pageSize: number;
   group: string;
+  serviceName: string;
 };
 
 type NacosLoadOptions = {
@@ -107,6 +107,7 @@ type LoadServices = (
   page?: number,
   requestedGroup?: string,
   requestedPageSize?: number,
+  requestedServiceName?: string,
   options?: NacosLoadOptions,
 ) => Promise<void>;
 
@@ -148,37 +149,26 @@ const NacosServiceViewer: React.FC<NacosServiceViewerProps> = ({
   );
 
   const darkMode = appTheme === 'dark';
-  const isV2Ui = appearance.uiVersion === 'v2';
+
   const resolvedAppearance = resolveAppearanceValues(appearance);
-  const opacity = normalizeOpacityForPlatform(resolvedAppearance.opacity);
   const blur = normalizeBlurForPlatform(resolvedAppearance.blur);
   const workbenchTheme = useMemo(
     () => buildRedisWorkbenchTheme({
       darkMode,
-      opacity,
       blur,
       disableBackdropFilter: isMacLikePlatform(),
     }),
-    [blur, darkMode, opacity, appearance.uiVersion],
+    [blur, darkMode],
   );
   // v1 keeps raised cards; v2 is flat (same as Redis gn-v2-redis-workbench CSS).
   const workbenchCardStyle = useMemo(() => (
-    isV2Ui
-      ? {
+    {
           background: 'transparent',
           border: 'none',
           boxShadow: 'none',
           borderRadius: 0,
         }
-      : {
-          background: workbenchTheme.panelBg,
-          border: workbenchTheme.panelBorder,
-          boxShadow: `${workbenchTheme.panelInset}, ${workbenchTheme.shadow}`,
-          borderRadius: 12,
-          backdropFilter: workbenchTheme.backdropFilter,
-          WebkitBackdropFilter: workbenchTheme.backdropFilter,
-        }
-  ), [isV2Ui, workbenchTheme]);
+  ), [workbenchTheme]);
 
   const connection = connections.find((item) => item.id === connectionId);
   const connectionProtection = connection?.config?.protection;
@@ -199,6 +189,7 @@ const NacosServiceViewer: React.FC<NacosServiceViewerProps> = ({
   const [pageNo, setPageNo] = useState(1);
   const [pageSize, setPageSize] = useState(50);
   const [groupFilter, setGroupFilter] = useState(() => String(initialGroup || '').trim());
+  const [serviceFilter, setServiceFilter] = useState('');
   const [selectedServiceRaw, setSelectedServiceRaw] = useState<string | null>(null);
   const [selectedServiceDetail, setSelectedServiceDetail] = useState<NacosServiceDetail | null>(null);
   const [instances, setInstances] = useState<NacosInstance[]>([]);
@@ -238,6 +229,7 @@ const NacosServiceViewer: React.FC<NacosServiceViewerProps> = ({
     page: 1,
     pageSize: 50,
     group: String(initialGroup || '').trim(),
+    serviceName: '',
   });
   activeContextRef.current = { connectionId, namespaceId, rpcConfig };
 
@@ -308,6 +300,7 @@ const NacosServiceViewer: React.FC<NacosServiceViewerProps> = ({
       page = 1,
       requestedGroup = groupFilter.trim(),
       requestedPageSize = pageSize,
+      requestedServiceName = serviceFilter.trim(),
       options?: NacosLoadOptions,
     ) => {
       if (!rpcConfig) return;
@@ -317,11 +310,13 @@ const NacosServiceViewer: React.FC<NacosServiceViewerProps> = ({
         page,
         pageSize: requestedPageSize,
         group: requestedGroup,
+        serviceName: requestedServiceName,
       };
       setLoadingServices(true);
       try {
         const res = await (window as any).go.app.App.NacosListServices(rpcConfig, {
           namespaceId: namespaceId || '',
+          serviceName: requestedServiceName,
           groupName: requestedGroup,
           pageNo: page,
           pageSize: requestedPageSize,
@@ -336,7 +331,7 @@ const NacosServiceViewer: React.FC<NacosServiceViewerProps> = ({
         const total = Number(pageData.count) || names.length;
         const lastPage = Math.max(1, Math.ceil(total / requestedPageSize));
         if (names.length === 0 && page > lastPage) {
-          await loadServices(lastPage, requestedGroup, requestedPageSize, options);
+          await loadServices(lastPage, requestedGroup, requestedPageSize, requestedServiceName, options);
           return;
         }
         setServiceNames(names);
@@ -362,7 +357,7 @@ const NacosServiceViewer: React.FC<NacosServiceViewerProps> = ({
         }
       }
     },
-    [rpcConfig, namespaceId, groupFilter, pageSize, closeInstanceModal],
+    [rpcConfig, namespaceId, groupFilter, pageSize, serviceFilter, closeInstanceModal],
   );
 
   const loadInstances = useCallback(
@@ -454,6 +449,7 @@ const NacosServiceViewer: React.FC<NacosServiceViewerProps> = ({
     instanceRequestIdRef.current += 1;
     selectedServiceRawRef.current = null;
     setGroupFilter(requestedGroup);
+    setServiceFilter('');
     setServiceNames([]);
     setServiceTotal(0);
     setPageNo(1);
@@ -464,7 +460,7 @@ const NacosServiceViewer: React.FC<NacosServiceViewerProps> = ({
     closeInstanceModal();
     setLoadingServices(false);
     setLoadingInstances(false);
-    void loadServices(1, requestedGroup);
+    void loadServices(1, requestedGroup, undefined, '');
     return () => {
       serviceRequestIdRef.current += 1;
       instanceRequestIdRef.current += 1;
@@ -496,7 +492,7 @@ const NacosServiceViewer: React.FC<NacosServiceViewerProps> = ({
     const refresh = async () => {
       if (cancelled || autoRefreshGenerationRef.current !== generation) return;
       const view = serviceViewRef.current;
-      await loadServicesRef.current(view.page, view.group, view.pageSize, { silent: true });
+      await loadServicesRef.current(view.page, view.group, view.pageSize, view.serviceName, { silent: true });
       if (cancelled || autoRefreshGenerationRef.current !== generation) return;
       const selected = selectedServiceRawRef.current;
       if (selected) {
@@ -558,6 +554,7 @@ const NacosServiceViewer: React.FC<NacosServiceViewerProps> = ({
           currentView.requestId === sourceView.requestId ? 1 : currentView.page,
           currentView.group,
           currentView.pageSize,
+          currentView.serviceName,
         );
       }
       message.success(tr('nacos_service.message.service_create_success'));
@@ -611,7 +608,7 @@ const NacosServiceViewer: React.FC<NacosServiceViewerProps> = ({
           const lastRemainingPage = Math.max(1, Math.ceil(remainingTotal / currentView.pageSize));
           refreshPage = Math.min(sourceView.page, lastRemainingPage);
         }
-        await loadServices(refreshPage, currentView.group, currentView.pageSize);
+        await loadServices(refreshPage, currentView.group, currentView.pageSize, currentView.serviceName);
       }
       message.success(tr('nacos_service.message.service_delete_success'));
     } catch (error: any) {
@@ -896,55 +893,42 @@ const NacosServiceViewer: React.FC<NacosServiceViewerProps> = ({
 
   return (
     <div
-      className={isV2Ui ? 'gn-v2-nacos-workbench' : undefined}
+      className={'gn-v2-nacos-workbench'}
       style={{
         display: 'flex',
         flexDirection: 'column',
         height: '100%',
         minHeight: 0,
-        padding: isV2Ui ? 0 : 12,
-        gap: isV2Ui ? 0 : 12,
+        padding: 0,
+        gap: 0,
         boxSizing: 'border-box',
-        background: isV2Ui ? undefined : workbenchTheme.appBg,
+        background: undefined,
         color: workbenchTheme.textPrimary,
       }}
     >
       <div
-        className={isV2Ui ? 'gn-v2-nacos-split' : undefined}
+        className={'gn-v2-nacos-split'}
         style={{
-          display: isV2Ui ? undefined : 'flex',
+          display: undefined,
           minHeight: 0,
           flex: 1,
           overflow: 'hidden',
-          ...(isV2Ui
-            ? {
+          ...({
                 ['--gn-nacos-sidebar-width' as string]:
                   typeof leftPanelWidth === 'number' ? `${leftPanelWidth}px` : leftPanelWidth,
-              }
-            : {}),
+              }),
         }}
       >
         <div
           ref={leftPanelRef}
-          className={isV2Ui ? 'gn-v2-nacos-list-pane' : undefined}
+          className={'gn-v2-nacos-list-pane'}
           style={
-            isV2Ui
-              ? { minHeight: 0, overflow: 'hidden' }
-              : {
-                  ...workbenchCardStyle,
-                  width: leftPanelWidth,
-                  minWidth: 260,
-                  minHeight: 0,
-                  display: 'flex',
-                  flexDirection: 'column',
-                  flexShrink: 0,
-                  overflow: 'hidden',
-                }
+            { minHeight: 0, overflow: 'hidden' }
           }
         >
           <div
-            className={isV2Ui ? 'gn-v2-nacos-pane-header' : undefined}
-            style={isV2Ui ? undefined : { padding: 8, marginBottom: 8 }}
+            className={'gn-v2-nacos-pane-header'}
+            style={undefined}
           >
             <Space wrap size={[8, 8]}>
               <Tag color="cyan">{namespaceLabel}</Tag>
@@ -956,6 +940,15 @@ const NacosServiceViewer: React.FC<NacosServiceViewerProps> = ({
                 value={groupFilter}
                 onChange={(event) => setGroupFilter(event.target.value)}
                 onPressEnter={() => void loadServices(1)}
+              />
+              <Input
+                allowClear
+                {...noAutoCapInputProps}
+                style={{ width: 180 }}
+                placeholder={tr('nacos_service.field.service')}
+                value={serviceFilter}
+                onChange={(event) => setServiceFilter(event.target.value)}
+                onPressEnter={() => void loadServices(1, groupFilter.trim(), pageSize, serviceFilter.trim())}
               />
               <Button icon={<ReloadOutlined />} loading={loadingServices} onClick={() => void loadServices(1)}>
                 {tr('nacos_viewer.action.refresh')}
@@ -971,9 +964,7 @@ const NacosServiceViewer: React.FC<NacosServiceViewerProps> = ({
           </div>
           <div
             className={
-              isV2Ui
-                ? 'gn-v2-nacos-pane-body gn-nacos-service-list-body'
-                : 'gn-nacos-service-list-body'
+              'gn-v2-nacos-pane-body gn-nacos-service-list-body'
             }
             data-testid="nacos-service-list-body"
             style={{
@@ -982,7 +973,7 @@ const NacosServiceViewer: React.FC<NacosServiceViewerProps> = ({
               display: 'flex',
               flexDirection: 'column',
               overflow: 'hidden',
-              padding: isV2Ui ? undefined : 8,
+              padding: undefined,
             }}
           >
             <div
@@ -1101,10 +1092,10 @@ const NacosServiceViewer: React.FC<NacosServiceViewerProps> = ({
                 onChange={(page, nextPageSize) => {
                   const size = nextPageSize || pageSize;
                   if (size !== pageSize) {
-                    void loadServices(1, groupFilter.trim(), size);
+                    void loadServices(1, groupFilter.trim(), size, serviceFilter.trim());
                     return;
                   }
-                  void loadServices(page, groupFilter.trim(), size);
+                  void loadServices(page, groupFilter.trim(), size, serviceFilter.trim());
                 }}
               />
             </div>
@@ -1115,30 +1106,20 @@ const NacosServiceViewer: React.FC<NacosServiceViewerProps> = ({
           targetRef={leftPanelRef}
           onResizeEnd={setLeftPanelWidth}
           minWidth={260}
-          maxReservedWidth={isV2Ui ? 321 : 320}
-          containerWidthCssVariable={isV2Ui ? '--gn-nacos-sidebar-width' : undefined}
+          maxReservedWidth={321}
+          containerWidthCssVariable={'--gn-nacos-sidebar-width'}
           title={tr('redis_viewer.tooltip.resize_panels')}
         />
 
         <div
-          className={isV2Ui ? 'gn-v2-nacos-detail-pane' : undefined}
+          className={'gn-v2-nacos-detail-pane'}
           style={
-            isV2Ui
-              ? { minHeight: 0, overflow: 'hidden' }
-              : {
-                  ...workbenchCardStyle,
-                  flex: 1,
-                  minWidth: 0,
-                  minHeight: 0,
-                  display: 'flex',
-                  flexDirection: 'column',
-                  overflow: 'hidden',
-                }
+            { minHeight: 0, overflow: 'hidden' }
           }
         >
           <div
-            className={isV2Ui ? 'gn-v2-nacos-pane-header' : undefined}
-            style={isV2Ui ? undefined : { padding: 8, marginBottom: 8 }}
+            className={'gn-v2-nacos-pane-header'}
+            style={undefined}
           >
             <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap', alignItems: 'center' }}>
               <Space wrap size={[8, 8]}>
@@ -1190,14 +1171,14 @@ const NacosServiceViewer: React.FC<NacosServiceViewerProps> = ({
             </div>
           </div>
           <div
-            className={isV2Ui ? 'gn-v2-nacos-pane-body' : undefined}
+            className={'gn-v2-nacos-pane-body'}
             style={{
               flex: 1,
               minHeight: 0,
               display: 'flex',
               flexDirection: 'column',
               gap: 8,
-              padding: isV2Ui ? undefined : 12,
+              padding: undefined,
               overflow: 'hidden',
             }}
           >

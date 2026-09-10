@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  getMacNativeTitlebarContentOffset,
   getMacNativeTitlebarPaddingLeft,
   getMacNativeTitlebarPaddingRight,
   shouldHandleMacNativeFullscreenShortcut,
@@ -13,14 +14,26 @@ describe('macWindow helpers', () => {
     expect(getMacNativeTitlebarPaddingRight(1, false)).toBe(0);
   });
 
-  it('reserves traffic-light safe area when native controls are enabled', () => {
+  it('reserves the traffic-light area on the left and keeps actions off the right edge', () => {
     expect(getMacNativeTitlebarPaddingLeft(1, true)).toBe(96);
     expect(getMacNativeTitlebarPaddingRight(1, true)).toBe(16);
   });
 
-  it('keeps minimum safe area under small ui scales', () => {
+  it('keeps minimum safe areas under small ui scales', () => {
     expect(getMacNativeTitlebarPaddingLeft(0.5, true)).toBe(88);
     expect(getMacNativeTitlebarPaddingRight(0.5, true)).toBe(12);
+  });
+
+  it('anchors native titlebar content to the macOS traffic-light center across scales', () => {
+    expect(getMacNativeTitlebarContentOffset(28, true)).toBe(2);
+    expect(getMacNativeTitlebarContentOffset(32, true)).toBe(0);
+    expect(getMacNativeTitlebarContentOffset(35, true)).toBe(-1.5);
+    expect(getMacNativeTitlebarContentOffset(40, true)).toBe(-4);
+    expect(getMacNativeTitlebarContentOffset(45, true)).toBe(-6.5);
+    expect(getMacNativeTitlebarContentOffset(56, true)).toBe(-12);
+    expect(getMacNativeTitlebarContentOffset(62, true)).toBe(-15);
+    expect(getMacNativeTitlebarContentOffset(70, true)).toBe(-19);
+    expect(getMacNativeTitlebarContentOffset(40, false)).toBe(0);
   });
 
   it('matches Control+Command+F only for mac native mode', () => {

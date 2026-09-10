@@ -72,7 +72,6 @@ vi.mock('./QueryEditorTransactionSettings', () => ({
 const disabledShortcut = { enabled: false, combo: '' };
 
 const buildProps = (overrides: Record<string, unknown> = {}) => ({
-  isV2Ui: true,
   currentConnectionId: 'es-1',
   currentDb: 'events',
   queryCapableConnections: [{ id: 'es-1', name: 'Elasticsearch', config: { type: 'elasticsearch' } } as any],
@@ -322,7 +321,7 @@ describe('QueryEditorToolbar Elasticsearch mode', () => {
     expect(onSchemaChange).toHaveBeenCalledWith('public');
   });
 
-  it('orders connection options by the sidebar group tree instead of saved order', () => {
+  it('orders connection options by the sidebar group tree and connection sort mode', () => {
     act(() => {
       renderer = create(<QueryEditorToolbar {...buildProps({
         currentConnectionId: 'prod-api',
@@ -339,6 +338,7 @@ describe('QueryEditorToolbar Elasticsearch mode', () => {
             name: 'Production',
             connectionIds: ['prod-api', 'prod-warehouse'],
             childOrder: ['connection:prod-warehouse', 'tag:prod-databases', 'connection:prod-api'],
+            connectionSortMode: 'createdAt',
           },
           {
             id: 'prod-databases',
@@ -359,9 +359,9 @@ describe('QueryEditorToolbar Elasticsearch mode', () => {
     });
 
     expect(antdState.selectProps[0].options.map((option: any) => option.value)).toEqual([
-      'prod-warehouse',
-      'prod-db',
       'prod-api',
+      'prod-db',
+      'prod-warehouse',
       'local',
       'dev-db',
     ]);

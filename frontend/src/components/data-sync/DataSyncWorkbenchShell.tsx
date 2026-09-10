@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { isWebRPCAbortError } from '../../utils/webRpc';
 
 import {
   DataSyncCdcView,
@@ -6,7 +7,6 @@ import {
   DataSyncScheduleView,
 } from './DataSyncOperationalViews';
 import { DataSyncPreflightPanel } from './DataSyncPreflightPanel';
-import { DataSyncRouteBar } from './DataSyncRouteBar';
 import { DataSyncTaskEditor } from './DataSyncTaskEditor';
 import {
   DataSyncTaskKindSelector,
@@ -19,8 +19,10 @@ import {
 import {
   canStartDataSyncTask,
   createDataSyncTaskDraft,
+  DATA_SYNC_TASK_STAGES,
   isDataSyncPreflightCurrent,
   reviseDataSyncTask,
+  validateDataSyncTask,
   type DataSyncCdcSourceStatus,
   type DataSyncCheckpointSummary,
   type DataSyncConnectionTreeItem,
@@ -42,6 +44,7 @@ import {
 } from './model';
 import {
   createDataSyncWorkbenchTranslate,
+  dataSyncValidationIssueText,
   type DataSyncWorkbenchLocale,
 } from './text';
 import { decodeCompareResult } from './wailsDto';
@@ -49,6 +52,7 @@ import {
   dispatchSidebarDatabaseRefresh,
   type SidebarDatabaseRefreshRequest,
 } from '../../utils/sidebarDatabaseRefresh';
+import { registerWorkbenchTabCloseGuard } from '../../utils/workbenchTabCloseProtection';
 import Modal from '../common/ResizableDraggableModal';
 import './DataSyncWorkbench.css';
 
@@ -94,6 +98,8 @@ const EMPTY_CAPABILITY: DataSyncRouteCapability = {
 
 const viewKeys: WorkbenchView[] = ['tasks', 'runs', 'schedules', 'cdc'];
 const RUN_POLL_INTERVAL_MS = 3_000;
+const FOCUSABLE_SELECTOR =
+  'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])';
 const ACTIVE_RUN_STATUSES = new Set<DataSyncRunRecord['status']>([
   'queued',
   'running',
@@ -240,6 +246,7 @@ export type DataSyncWorkbenchShellProps = {
   connectionTree?: DataSyncConnectionTreeItem[];
   locale?: DataSyncWorkbenchLocale | string;
   onClose?: () => void;
+  workbenchTabId?: string;
 };
 
 /**
@@ -265,8 +272,10 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
   connectionTree = [],
   locale,
   onClose,
+  workbenchTabId,
 }) => {
   const t = useMemo(() => createDataSyncWorkbenchTranslate(locale), [locale]);
+  const taskListId = React.useId();
   const initialTasksRef = useRef<DataSyncTaskDefinition[]>();
   if (!initialTasksRef.current) {
     initialTasksRef.current =
@@ -289,20 +298,27 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
 
   const [activeView, setActiveView] = useState<WorkbenchView>('tasks');
   const [tasks, setTasks] = useState<DataSyncTaskDefinition[]>(initialTasksRef.current);
+  const tasksRef = useRef(tasks);
+  tasksRef.current = tasks;
   const [selectedTaskId, setSelectedTaskId] = useState(
     initialTasksRef.current[0]?.id || '',
   );
+  const selectedTaskIdRef = useRef(selectedTaskId);
+  selectedTaskIdRef.current = selectedTaskId;
   const [activeStage, setActiveStage] = useState<DataSyncTaskStage>('endpoints');
   const [search, setSearch] = useState('');
   const [showKindSelector, setShowKindSelector] = useState(false);
-  const [dirtyTaskIds, setDirtyTaskIds] = useState<Set<string>>(
-    () =>
-      new Set(
-        initialTasksRef.current!
-          .filter((task) => task.id.startsWith('data-sync-local-'))
-          .map((task) => task.id),
-      ),
-  );
+  const [taskRailOpen, setTaskRailOpen] = useState(false);
+  const [compactTaskRail, setCompactTaskRail] = useState(false);
+  const [taskMenuOpen, setTaskMenuOpen] = useState(false);
+  const workbenchRef = useRef<HTMLDivElement | null>(null);
+  const taskRailToggleRef = useRef<HTMLButtonElement | null>(null);
+  const taskListRef = useRef<HTMLElement | null>(null);
+  const editorColumnRef = useRef<HTMLElement | null>(null);
+  const taskMenuRef = useRef<HTMLDetailsElement | null>(null);
+  // Entry points provide the initial clean baseline. Explicit edits and tasks
+  // created inside this workbench call markTaskDirty below.
+  const [dirtyTaskIds, setDirtyTaskIds] = useState<Set<string>>(() => new Set());
   const dirtyTaskIdsRef = useRef(dirtyTaskIds);
   const deletedTaskIdsRef = useRef(new Set<string>());
   const markTaskDirty = (taskId: string) => {
@@ -311,7 +327,13 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
     setDirtyTaskIds(next);
   };
   const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
   const [preflighting, setPreflighting] = useState(false);
+  const preflightingRef = useRef(false);
+  const preflightAbortRef = useRef<AbortController | null>(null);
+  const capabilityAbortRef = useRef<AbortController | null>(null);
+  const cdcAbortRef = useRef<AbortController | null>(null);
+  const deletingTaskRef = useRef(false);
   const [preflights, setPreflights] = useState<
     Record<string, DataSyncPreflightSnapshot | undefined>
   >({});
@@ -326,6 +348,7 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
   const [approvalError, setApprovalError] = useState('');
   const [pendingPublicationTaskId, setPendingPublicationTaskId] = useState('');
   const [operationError, setOperationError] = useState('');
+  const [bootstrapRevision, setBootstrapRevision] = useState(0);
   const [operationBusy, setOperationBusy] = useState('');
   const [capability, setCapability] = useState<DataSyncRouteCapability>(
     EMPTY_CAPABILITY,
@@ -351,6 +374,12 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
     null,
   );
   const runStatusesRef = useRef<Map<string, DataSyncRunRecord['status']>>(new Map());
+
+  useEffect(() => () => {
+    preflightAbortRef.current?.abort();
+    capabilityAbortRef.current?.abort();
+    cdcAbortRef.current?.abort();
+  }, []);
 
   const applyRunPage = (
     page: DataSyncRunPage,
@@ -432,10 +461,122 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
     );
   }, [search, tasks]);
 
+  const closeTaskRailAndRestoreFocus = () => {
+    setTaskRailOpen(false);
+    const restoreFocus = () => taskRailToggleRef.current?.focus();
+    if (typeof globalThis.requestAnimationFrame === 'function') {
+      globalThis.requestAnimationFrame(restoreFocus);
+    } else {
+      restoreFocus();
+    }
+  };
+
+  useEffect(() => {
+    const workbench = workbenchRef.current;
+    if (!workbench || typeof globalThis.ResizeObserver !== 'function') {
+      return undefined;
+    }
+    const updateLayout = (width: number) => {
+      const compact = width <= 860;
+      setCompactTaskRail(compact);
+      if (!compact) setTaskRailOpen(false);
+    };
+    updateLayout(workbench.getBoundingClientRect().width);
+    const observer = new globalThis.ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (entry) updateLayout(entry.contentRect.width);
+    });
+    observer.observe(workbench);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (!compactTaskRail || !taskRailOpen || typeof document === 'undefined') {
+      return undefined;
+    }
+    const taskList = taskListRef.current;
+    const editor = editorColumnRef.current;
+    const editorWasInert = editor?.hasAttribute('inert') ?? false;
+    editor?.setAttribute('inert', '');
+
+    const focusFirstControl = () => {
+      taskList
+        ?.querySelector<HTMLInputElement>('.gn-data-sync-search input')
+        ?.focus();
+    };
+    const frame =
+      typeof globalThis.requestAnimationFrame === 'function'
+        ? globalThis.requestAnimationFrame(focusFirstControl)
+        : undefined;
+    if (frame === undefined) focusFirstControl();
+
+    const keepFocusInside = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeTaskRailAndRestoreFocus();
+        return;
+      }
+      if (event.key !== 'Tab' || !taskList) return;
+      const focusable = Array.from(
+        taskList.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR),
+      ).filter((element) => element.getAttribute('aria-hidden') !== 'true');
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && (document.activeElement === first || !taskList.contains(document.activeElement))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (document.activeElement === last || !taskList.contains(document.activeElement))) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener('keydown', keepFocusInside);
+    return () => {
+      if (frame !== undefined && typeof globalThis.cancelAnimationFrame === 'function') {
+        globalThis.cancelAnimationFrame(frame);
+      }
+      document.removeEventListener('keydown', keepFocusInside);
+      if (!editorWasInert) editor?.removeAttribute('inert');
+    };
+  }, [compactTaskRail, taskRailOpen]);
+
+  useEffect(() => {
+    setTaskMenuOpen(false);
+  }, [activeView, selectedTaskId]);
+
+  useEffect(() => {
+    if (!taskMenuOpen || typeof document === 'undefined') return undefined;
+    const closeTaskMenu = (event: MouseEvent | KeyboardEvent) => {
+      if (event instanceof KeyboardEvent && event.key !== 'Escape') return;
+      if (
+        event instanceof MouseEvent &&
+        taskMenuRef.current?.contains(event.target as Node)
+      ) {
+        return;
+      }
+      if (event instanceof KeyboardEvent) {
+        event.preventDefault();
+        taskMenuRef.current?.querySelector<HTMLElement>('summary')?.focus();
+      }
+      setTaskMenuOpen(false);
+    };
+    document.addEventListener('mousedown', closeTaskMenu);
+    document.addEventListener('keydown', closeTaskMenu);
+    return () => {
+      document.removeEventListener('mousedown', closeTaskMenu);
+      document.removeEventListener('keydown', closeTaskMenu);
+    };
+  }, [taskMenuOpen]);
+
   useEffect(() => {
     let active = true;
+    const taskController = new AbortController();
+    const cdcController = new AbortController();
+    cdcAbortRef.current?.abort();
+    cdcAbortRef.current = cdcController;
     void gatewayRef.current!
-      .listTasks()
+      .listTasks({ signal: taskController.signal })
       .then((loadedTasks) => {
         if (!active) return;
         if (loadedTasks.length > 0) {
@@ -461,7 +602,7 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
         return Promise.allSettled([
           requestRunPage(null, 10),
           gatewayRef.current!.listSchedules(),
-          gatewayRef.current!.listCdcSources(),
+          gatewayRef.current!.listCdcSources({ signal: cdcController.signal }),
         ] as const);
       })
       .then((results) => {
@@ -479,21 +620,24 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
         const rejected = results.find(
           (result): result is PromiseRejectedResult => result.status === 'rejected',
         );
-        if (rejected) {
+        if (rejected && !isWebRPCAbortError(rejected.reason)) {
           setOperationError(
             rejected.reason instanceof Error ? rejected.reason.message : String(rejected.reason),
           );
         }
       })
       .catch((error) => {
-        if (active) {
+        if (active && !isWebRPCAbortError(error)) {
           setOperationError(error instanceof Error ? error.message : String(error));
         }
       });
     return () => {
       active = false;
+      taskController.abort();
+      cdcController.abort();
+      if (cdcAbortRef.current === cdcController) cdcAbortRef.current = null;
     };
-  }, []);
+  }, [bootstrapRevision]);
 
   useEffect(() => {
     if (!selectedTask) {
@@ -501,19 +645,24 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
       return undefined;
     }
     let active = true;
+    const controller = new AbortController();
+    capabilityAbortRef.current?.abort();
+    capabilityAbortRef.current = controller;
     setCapability(EMPTY_CAPABILITY);
     void gatewayRef.current!
-      .resolveCapability(selectedTask)
+      .resolveCapability(selectedTask, { signal: controller.signal })
       .then((resolved) => {
         if (active) setCapability(resolved);
       })
       .catch((error) => {
-        if (!active) return;
+        if (!active || isWebRPCAbortError(error)) return;
         setCapability(EMPTY_CAPABILITY);
         setOperationError(error instanceof Error ? error.message : String(error));
       });
     return () => {
       active = false;
+      controller.abort();
+      if (capabilityAbortRef.current === controller) capabilityAbortRef.current = null;
     };
   }, [
     selectedTask?.id,
@@ -584,20 +733,34 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
   }, [runs, tasks]);
 
   const patchSelectedTask = (
-    patch: Partial<
-      Omit<
-        DataSyncTaskDefinition,
-        'id' | 'schemaVersion' | 'revision' | 'editEpoch' | 'createdAt'
-      >
-    >,
+    patch:
+      | Partial<
+          Omit<
+            DataSyncTaskDefinition,
+            'id' | 'schemaVersion' | 'revision' | 'editEpoch' | 'createdAt'
+          >
+        >
+      | ((currentTask: DataSyncTaskDefinition) => Partial<
+          Omit<
+            DataSyncTaskDefinition,
+            'id' | 'schemaVersion' | 'revision' | 'editEpoch' | 'createdAt'
+          >
+        >),
   ) => {
     const taskId = selectedTask?.id;
     if (!taskId) return;
-    setTasks((current) =>
-      current.map((task) =>
-        task.id === taskId ? reviseDataSyncTask(task, patch) : task,
-      ),
-    );
+    setTasks((current) => {
+      const next = current.map((task) =>
+        task.id === taskId
+          ? reviseDataSyncTask(
+              task,
+              typeof patch === 'function' ? patch(task) : patch,
+            )
+          : task,
+      );
+      tasksRef.current = next;
+      return next;
+    });
     markTaskDirty(taskId);
     setApprovalError('');
     setApprovalChallenges((current) => {
@@ -643,9 +806,21 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
     setActiveView('tasks');
   };
 
-  const saveTask = async (taskToSave = selectedTask) => {
-    if (!taskToSave || saving) return null;
+  const saveTask = async (
+    taskToSave = selectedTask,
+    expectedCurrentEditEpoch = taskToSave?.editEpoch,
+    allowDuringPreflight = false,
+  ) => {
+    if (
+      !taskToSave ||
+      savingRef.current ||
+      (preflightingRef.current && !allowDuringPreflight) ||
+      deletingTaskRef.current
+    ) {
+      return null;
+    }
     const submittedTaskId = taskToSave.id;
+    savingRef.current = true;
     setSaving(true);
     setOperationError('');
     try {
@@ -653,29 +828,62 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
       let refreshedPreflight: DataSyncPreflightSnapshot | null = null;
       let refreshError: unknown = null;
       if (saved.lifecycle === 'ready' || saved.lifecycle === 'enabled') {
+        preflightAbortRef.current?.abort();
+        const controller = new AbortController();
+        preflightAbortRef.current = controller;
         try {
           // PutJob advances the persisted revision. Revalidate that exact
           // revision before exposing the run action; the old snapshot is no
           // longer sufficient evidence, even when the visible fields did not
           // change.
-          refreshedPreflight = await gatewayRef.current!.preflightTask(saved);
+          refreshedPreflight = await gatewayRef.current!.preflightTask(saved, {
+            signal: controller.signal,
+          });
         } catch (error) {
-          refreshError = error;
+          if (!isWebRPCAbortError(error)) refreshError = error;
+        } finally {
+          if (preflightAbortRef.current === controller) {
+            preflightAbortRef.current = null;
+          }
         }
       }
+      const tombstoned =
+        deletedTaskIdsRef.current.has(submittedTaskId) ||
+        deletedTaskIdsRef.current.has(saved.id);
+      if (tombstoned) return null;
+      const latestTask = tasksRef.current.find(
+        (task) => task.id === submittedTaskId || task.id === saved.id,
+      );
+      const editedDuringSave = Boolean(
+        latestTask && latestTask.editEpoch !== expectedCurrentEditEpoch,
+      );
+      const resolvedTask =
+        editedDuringSave && latestTask
+          ? {
+              ...latestTask,
+              id: saved.id,
+              schemaVersion: saved.schemaVersion,
+              revision: saved.revision,
+              createdAt: saved.createdAt,
+            }
+          : saved;
       setTasks((current) => {
         const next = current.flatMap((task) => {
-          if (task.id === submittedTaskId) return [saved];
+          if (task.id === submittedTaskId) return [resolvedTask];
           if (task.id === saved.id) return [];
           return [task];
         });
-        return next.some((task) => task.id === saved.id) ? next : [...next, saved];
+        const resolved = next.some((task) => task.id === saved.id)
+          ? next
+          : [...next, resolvedTask];
+        tasksRef.current = resolved;
+        return resolved;
       });
       setPreflights((current) => {
         const next = { ...current };
         delete next[submittedTaskId];
         delete next[saved.id];
-        if (refreshedPreflight) {
+        if (refreshedPreflight && !editedDuringSave) {
           next[saved.id] = refreshedPreflight;
         } else if (saved.id !== submittedTaskId) {
           const previous = current[submittedTaskId];
@@ -703,6 +911,7 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
         const next = new Set(current);
         next.delete(submittedTaskId);
         next.delete(saved.id);
+        if (editedDuringSave) next.add(saved.id);
         dirtyTaskIdsRef.current = next;
         return next;
       });
@@ -718,28 +927,60 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
         delete next[saved.id];
         return next;
       });
-      if (refreshError) {
+      if (refreshError && !editedDuringSave) {
         setOperationError(
           `任务已保存，但保存后的预检失败：${
             refreshError instanceof Error ? refreshError.message : String(refreshError)
           }`,
         );
       }
-      return saved;
+      return resolvedTask;
     } catch (error) {
       setOperationError(error instanceof Error ? error.message : String(error));
       return null;
     } finally {
+      savingRef.current = false;
       setSaving(false);
     }
   };
 
+  useEffect(() => {
+    if (!workbenchTabId) return undefined;
+    return registerWorkbenchTabCloseGuard(workbenchTabId, {
+      isDirty: () => dirtyTaskIdsRef.current.size > 0,
+      save: async () => {
+        const dirtyTaskIds = Array.from(dirtyTaskIdsRef.current);
+        for (const taskId of dirtyTaskIds) {
+          const task = tasks.find((item) => item.id === taskId);
+          if (!task || !(await saveTask(task))) return false;
+        }
+        return dirtyTaskIdsRef.current.size === 0;
+      },
+      // Closing unmounts this workbench. The pending in-memory definitions
+      // are intentionally discarded only after the user chose that action.
+      discard: () => undefined,
+    });
+  }, [saveTask, tasks, workbenchTabId]);
+
   const runPreflight = async () => {
-    if (!selectedTask || preflighting) return;
+    if (
+      !selectedTask ||
+      preflightingRef.current ||
+      savingRef.current ||
+      deletingTaskRef.current
+    ) {
+      return;
+    }
+    preflightingRef.current = true;
     setPreflighting(true);
     setOperationError('');
+    preflightAbortRef.current?.abort();
+    const controller = new AbortController();
+    preflightAbortRef.current = controller;
     try {
-      const snapshot = await gatewayRef.current!.preflightTask(selectedTask);
+      const snapshot = await gatewayRef.current!.preflightTask(selectedTask, {
+        signal: controller.signal,
+      });
       setPreflights((current) => ({ ...current, [selectedTask.id]: snapshot }));
       setApprovals((current) => {
         const approval = current[selectedTask.id];
@@ -757,22 +998,38 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
         delete next[selectedTask.id];
         return next;
       });
-      setActiveStage('preflight');
+      if (selectedTaskIdRef.current === selectedTask.id) {
+        setActiveStage('preflight');
+      }
     } catch (error) {
+      if (isWebRPCAbortError(error)) return;
       setOperationError(error instanceof Error ? error.message : String(error));
     } finally {
+      if (preflightAbortRef.current === controller) preflightAbortRef.current = null;
+      preflightingRef.current = false;
       setPreflighting(false);
     }
   };
 
   const deleteTask = async (task: DataSyncTaskDefinition) => {
-    if (operationBusy === 'delete') return;
+    if (
+      deletingTaskRef.current ||
+      savingRef.current ||
+      preflightingRef.current
+    ) {
+      return;
+    }
+    deletingTaskRef.current = true;
     setOperationBusy('delete');
     setOperationError('');
     try {
       await gatewayRef.current!.deleteTask(task.id);
       deletedTaskIdsRef.current.add(task.id);
-      setTasks((current) => current.filter((item) => item.id !== task.id));
+      setTasks((current) => {
+        const next = current.filter((item) => item.id !== task.id);
+        tasksRef.current = next;
+        return next;
+      });
       setDirtyTaskIds((current) => {
         if (!current.has(task.id)) return current;
         const next = new Set(current);
@@ -806,12 +1063,15 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
     } catch (error) {
       setOperationError(error instanceof Error ? error.message : String(error));
     } finally {
+      deletingTaskRef.current = false;
       setOperationBusy('');
     }
   };
 
   const startTask = async () => {
     if (
+      preflighting ||
+      operationBusy === 'start' ||
       !selectedTask ||
       !selectedPreflight ||
       !capability.canExecute ||
@@ -820,6 +1080,8 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
     ) {
       return;
     }
+    const startedTaskId = selectedTask.id;
+    const startedEditEpoch = selectedTask.editEpoch;
     setOperationBusy('start');
     setOperationError('');
     try {
@@ -847,14 +1109,23 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
         return next;
       });
       const refreshedTask = (await gatewayRef.current!.listTasks()).find(
-        (task) => task.id === selectedTask.id,
+        (task) => task.id === startedTaskId,
       );
       if (refreshedTask) {
-        setTasks((current) =>
-          current.map((task) =>
-            task.id === refreshedTask.id ? refreshedTask : task,
-          ),
-        );
+        setTasks((current) => {
+          const next = current.map((task) => {
+            if (task.id !== refreshedTask.id) return task;
+            if (task.editEpoch === startedEditEpoch) return refreshedTask;
+            return {
+              ...task,
+              schemaVersion: refreshedTask.schemaVersion,
+              revision: refreshedTask.revision,
+              createdAt: refreshedTask.createdAt,
+            };
+          });
+          tasksRef.current = next;
+          return next;
+        });
         setPreflights((current) => {
           const next = { ...current };
           delete next[refreshedTask.id];
@@ -1099,8 +1370,18 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
         return next;
       });
       setCheckpoint(null);
-      setCdcSources(await gatewayRef.current!.listCdcSources());
+      cdcAbortRef.current?.abort();
+      const controller = new AbortController();
+      cdcAbortRef.current = controller;
+      try {
+        setCdcSources(await gatewayRef.current!.listCdcSources({
+          signal: controller.signal,
+        }));
+      } finally {
+        if (cdcAbortRef.current === controller) cdcAbortRef.current = null;
+      }
     } catch (error) {
+      if (isWebRPCAbortError(error)) return;
       setOperationError(error instanceof Error ? error.message : String(error));
     } finally {
       setOperationBusy('');
@@ -1120,11 +1401,18 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
 
   const refreshCdc = async () => {
     setOperationBusy('refresh-cdc');
+    cdcAbortRef.current?.abort();
+    const controller = new AbortController();
+    cdcAbortRef.current = controller;
     try {
-      setCdcSources(await gatewayRef.current!.listCdcSources());
+      setCdcSources(await gatewayRef.current!.listCdcSources({
+        signal: controller.signal,
+      }));
     } catch (error) {
+      if (isWebRPCAbortError(error)) return;
       setOperationError(error instanceof Error ? error.message : String(error));
     } finally {
+      if (cdcAbortRef.current === controller) cdcAbortRef.current = null;
       setOperationBusy('');
     }
   };
@@ -1143,14 +1431,34 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
   };
 
   const publishTask = async () => {
-    if (!selectedTask || saving || preflighting) return;
+    if (
+      !selectedTask ||
+      savingRef.current ||
+      preflightingRef.current ||
+      deletingTaskRef.current
+    ) {
+      return;
+    }
     const candidate = reviseDataSyncTask(selectedTask, { lifecycle: 'ready' });
+    preflightingRef.current = true;
     setPreflighting(true);
     setOperationError('');
     setApprovalError('');
+    preflightAbortRef.current?.abort();
+    const controller = new AbortController();
+    preflightAbortRef.current = controller;
     try {
-      const snapshot = await gatewayRef.current!.preflightTask(candidate);
-      setActiveStage('preflight');
+      const snapshot = await gatewayRef.current!.preflightTask(candidate, {
+        signal: controller.signal,
+      });
+      const latestTask = tasksRef.current.find((task) => task.id === selectedTask.id);
+      if (!latestTask || latestTask.editEpoch !== selectedTask.editEpoch) {
+        setOperationError(t('workbench.definition_changed_retry'));
+        return;
+      }
+      if (selectedTaskIdRef.current === selectedTask.id) {
+        setActiveStage('preflight');
+      }
       if (snapshot.status === 'blocked') {
         // Keep the editor on the persisted draft. A blocked publication must
         // never leave an unsaved ready state that the user cannot recover from.
@@ -1167,9 +1475,13 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
       if (snapshot.approvalRequired) {
         // The approval token is tied to this exact candidate definition. Keep
         // it selected until approval completes, then save it atomically.
-        setTasks((current) =>
-          current.map((task) => (task.id === candidate.id ? candidate : task)),
-        );
+        setTasks((current) => {
+          const next = current.map((task) =>
+            task.id === candidate.id ? candidate : task,
+          );
+          tasksRef.current = next;
+          return next;
+        });
         markTaskDirty(candidate.id);
         setPreflights((current) => ({ ...current, [candidate.id]: snapshot }));
         setApprovals((current) => {
@@ -1185,10 +1497,13 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
         setPendingPublicationTaskId(candidate.id);
         return;
       }
-      await saveTask(candidate);
+      await saveTask(candidate, selectedTask.editEpoch, true);
     } catch (error) {
+      if (isWebRPCAbortError(error)) return;
       setOperationError(error instanceof Error ? error.message : String(error));
     } finally {
+      if (preflightAbortRef.current === controller) preflightAbortRef.current = null;
+      preflightingRef.current = false;
       setPreflighting(false);
     }
   };
@@ -1309,7 +1624,7 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
   };
 
   const requestDeleteSelectedTask = () => {
-    if (!selectedTask || operationBusy === 'delete') return;
+    if (!selectedTask || operationBusy === 'delete' || saving || preflighting) return;
     openConfirmation({
       kind: 'delete-task',
       task: selectedTask,
@@ -1412,40 +1727,133 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
                 Date.parse(selectedApproval.expiresAt) > Date.now(),
             )))),
   );
+  const activeStageIndex = DATA_SYNC_TASK_STAGES.indexOf(activeStage);
+  const nextStage = DATA_SYNC_TASK_STAGES[activeStageIndex + 1];
+  const previousStage = DATA_SYNC_TASK_STAGES[activeStageIndex - 1];
+  const selectedTaskIssues =
+    selectedPreflight && !preflightStale
+      ? selectedPreflight.issues
+      : selectedTask
+        ? validateDataSyncTask(selectedTask)
+        : [];
+  const relevantBlockerStage = DATA_SYNC_TASK_STAGES
+    .slice(0, activeStageIndex + 1)
+    .find((stage) =>
+      selectedTaskIssues.some(
+        (issue) => issue.stage === stage && issue.severity === 'blocker',
+      ),
+    );
+  const relevantBlocker = selectedTaskIssues.find(
+    (issue) =>
+      issue.stage === relevantBlockerStage && issue.severity === 'blocker',
+  );
+  const blockerInEarlierStage = Boolean(
+    relevantBlockerStage && relevantBlockerStage !== activeStage,
+  );
+  const preflightNeedsRefresh = Boolean(
+    activeStage === 'preflight' &&
+      (!selectedPreflight || preflightStale || selectedPreflight.status === 'blocked'),
+  );
+  const actionHint = relevantBlocker
+    ? dataSyncValidationIssueText(relevantBlocker, t)
+    : preflightNeedsRefresh
+      ? preflightStale
+        ? t('preflight.stale')
+        : t('preflight.not_run')
+      : activeStage === 'preflight' && !actionEnabled
+        ? runActionTitle
+        : '';
+  const actionHintTone = relevantBlocker
+    ? relevantBlocker.code === 'mapping_required'
+      ? 'warning'
+      : 'danger'
+    : 'neutral';
+  const serviceUnavailableError = /window\.go\.app\.App\.[A-Za-z0-9_]+ is not a function/.test(
+    operationError,
+  );
 
   return (
     <div
+      ref={workbenchRef}
       className="gn-data-sync-workbench"
       data-data-sync-workbench-shell="true"
     >
       <header className="gn-data-sync-workbench__header">
         <div className="gn-data-sync-workbench__identity">
-          <strong>{t('workbench.title')}</strong>
-          <span>{t('workbench.subtitle')}</span>
+          <strong>
+            <span className="gn-data-sync-workbench__title-full">
+              {t('workbench.title')}
+            </span>
+            <span className="gn-data-sync-workbench__title-short">
+              {t('workbench.title_short')}
+            </span>
+          </strong>
+          <span className="gn-data-sync-workbench__subtitle">
+            {t('workbench.subtitle')}
+          </span>
         </div>
-        <nav className="gn-data-sync-global-nav" aria-label={t('workbench.title')}>
+        <nav className="gn-data-sync-global-nav" aria-label={t('workbench.view_navigation')}>
           {viewKeys.map((view) => (
             <button
               key={view}
               type="button"
               data-active={activeView === view ? 'true' : 'false'}
-              onClick={() => setActiveView(view)}
+              aria-current={activeView === view ? 'page' : undefined}
+              onClick={() => {
+                setActiveView(view);
+                setTaskRailOpen(false);
+              }}
             >
               {t(`nav.${view}`)}
             </button>
           ))}
         </nav>
         <div className="gn-data-sync-workbench__header-actions">
-          <button
-            type="button"
-            className="gn-data-sync-button"
-            onClick={() => {
-              setActiveView('tasks');
-              setShowKindSelector(true);
-            }}
-          >
-            {t('workbench.new_task')}
-          </button>
+          {activeView === 'tasks' ? (
+            <button
+              ref={taskRailToggleRef}
+              type="button"
+              className="gn-data-sync-button gn-data-sync-header-action gn-data-sync-task-rail-toggle"
+              aria-controls={taskListId}
+              aria-expanded={taskRailOpen}
+              aria-label={t('workbench.task_list_toggle')}
+              title={t('workbench.task_list_toggle')}
+              onClick={() => setTaskRailOpen((open) => !open)}
+            >
+              <span
+                className="gn-data-sync-header-action__icon"
+                aria-hidden="true"
+              >
+                ☷
+              </span>
+              <span className="gn-data-sync-header-action__label">
+                {t('workbench.task_list_toggle')}
+              </span>
+            </button>
+          ) : null}
+          {activeView !== 'tasks' || compactTaskRail ? (
+            <button
+              type="button"
+              className="gn-data-sync-button gn-data-sync-header-action"
+              aria-label={t('workbench.new_task')}
+              title={t('workbench.new_task')}
+              onClick={() => {
+                setActiveView('tasks');
+                setShowKindSelector(true);
+                setTaskRailOpen(false);
+              }}
+            >
+              <span
+                className="gn-data-sync-header-action__icon"
+                aria-hidden="true"
+              >
+                ＋
+              </span>
+              <span className="gn-data-sync-header-action__label">
+                {t('workbench.new_task')}
+              </span>
+            </button>
+          ) : null}
           {onClose ? (
             <button
               type="button"
@@ -1462,20 +1870,58 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
 
       {operationError ? (
         <div className="gn-data-sync-workbench-error" role="alert">
-          <span>{operationError}</span>
-          <button
-            type="button"
-            className="gn-data-sync-link-button"
-            onClick={() => setOperationError('')}
-          >
-            {t('common.dismiss')}
-          </button>
+          <div className="gn-data-sync-workbench-error__body">
+            <span className="gn-data-sync-workbench-error__message">
+              <span title={operationError}>
+              {serviceUnavailableError
+                ? t('workbench.service_unavailable')
+                : operationError}
+              </span>
+            </span>
+            {serviceUnavailableError ? (
+              <details className="gn-data-sync-workbench-error__details">
+                <summary>{t('common.details')}</summary>
+                <code>{operationError}</code>
+              </details>
+            ) : null}
+          </div>
+          <div className="gn-data-sync-workbench-error__actions">
+            {serviceUnavailableError ? (
+              <button
+                type="button"
+                className="gn-data-sync-link-button"
+                onClick={() => {
+                  setOperationError('');
+                  setBootstrapRevision((revision) => revision + 1);
+                }}
+              >
+                {t('common.retry')}
+              </button>
+            ) : null}
+            <button
+              type="button"
+              className="gn-data-sync-link-button"
+              onClick={() => setOperationError('')}
+            >
+              {t('common.dismiss')}
+            </button>
+          </div>
         </div>
       ) : null}
 
       {activeView === 'tasks' ? (
-        <div className="gn-data-sync-workspace-grid">
+        <div
+          className="gn-data-sync-workspace-grid"
+          data-task-rail-open={taskRailOpen ? 'true' : 'false'}
+          onMouseDown={(event) => {
+            if (taskRailOpen && event.target === event.currentTarget) {
+              closeTaskRailAndRestoreFocus();
+            }
+          }}
+        >
           <DataSyncTaskList
+            id={taskListId}
+            containerRef={taskListRef}
             tasks={filteredTasks}
             selectedTaskId={selectedTaskId}
             search={search}
@@ -1484,21 +1930,19 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
             onSelectTask={(taskId) => {
               setSelectedTaskId(taskId);
               setShowKindSelector(false);
+              closeTaskRailAndRestoreFocus();
             }}
-            onNewTask={() => setShowKindSelector(true)}
+            onNewTask={() => {
+              setShowKindSelector(true);
+              closeTaskRailAndRestoreFocus();
+            }}
+            onClose={closeTaskRailAndRestoreFocus}
           />
-          <main className="gn-data-sync-editor-column">
+          <main ref={editorColumnRef} className="gn-data-sync-editor-column">
             {showKindSelector || !selectedTask ? (
               <DataSyncTaskKindSelector t={t} onSelect={createTask} />
             ) : (
               <>
-                <DataSyncRouteBar
-                  source={selectedTask.source}
-                  target={selectedTask.target}
-                  capability={capability}
-                  active={selectedTask.kind === 'cdc' && selectedTask.lifecycle === 'enabled'}
-                  t={t}
-                />
                 <DataSyncTaskEditor
                   task={selectedTask}
                   gateway={gatewayRef.current!}
@@ -1507,151 +1951,252 @@ export const DataSyncWorkbenchShell: React.FC<DataSyncWorkbenchShellProps> = ({
                   activeStage={activeStage}
                   preflight={selectedPreflight}
                   preflightStale={preflightStale}
+                  preflightContent={(
+                    <DataSyncPreflightPanel
+                      snapshot={selectedPreflight}
+                      currentRevision={selectedTask.revision}
+                      stale={preflightStale}
+                      running={preflighting}
+                      t={t}
+                      onLocateIssue={locateIssue}
+                      approval={selectedApproval}
+                      approvalChallenge={selectedApprovalChallenge}
+                      beginningApproval={beginningApproval}
+                      approving={approving}
+                      approvalError={approvalError}
+                      onBeginApproval={() => void beginApproval()}
+                      onApprove={() => void approveTask()}
+                      embedded
+                    />
+                  )}
                   t={t}
                   onStageChange={setActiveStage}
                   onPatch={patchSelectedTask}
                 />
                 <footer className="gn-data-sync-action-bar">
-                  <span
-                    className="gn-data-sync-save-state"
-                    data-dirty={dirtyTaskIds.has(selectedTask.id) ? 'true' : 'false'}
-                  >
-                    {dirtyTaskIds.has(selectedTask.id)
-                      ? t('workbench.unsaved')
-                      : t('workbench.saved')}
-                  </span>
+                  {actionHint ? (
+                    <div
+                      className="gn-data-sync-action-context"
+                      data-has-hint="true"
+                      data-tone={actionHintTone}
+                    >
+                      <span
+                        className="gn-data-sync-action-hint"
+                        role="status"
+                        title={actionHint}
+                        data-tone={actionHintTone}
+                        data-issue-code={relevantBlocker?.code}
+                      >
+                        {actionHint}
+                      </span>
+                    </div>
+                  ) : null}
                   <span className="gn-data-sync-action-bar__spacer" />
-                  {selectedTask.lifecycle === 'draft' ? (
+                  <details
+                    ref={taskMenuRef}
+                    className="gn-data-sync-task-menu"
+                    open={taskMenuOpen}
+                    onToggle={(event) => setTaskMenuOpen(event.currentTarget.open)}
+                  >
+                    <summary className="gn-data-sync-button">
+                      {t('workbench.task_actions')}
+                    </summary>
+                    <div className="gn-data-sync-task-menu__panel" role="group">
+                      {selectedTask.lifecycle === 'ready' &&
+                      selectedTask.trigger.mode !== 'manual' ? (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setTaskMenuOpen(false);
+                            transitionLifecycle('enabled');
+                          }}
+                        >
+                          {t('lifecycle.enable_schedule')}
+                        </button>
+                      ) : null}
+                      {selectedTask.lifecycle === 'enabled' ? (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setTaskMenuOpen(false);
+                            transitionLifecycle('paused');
+                          }}
+                        >
+                          {t('lifecycle.pause')}
+                        </button>
+                      ) : null}
+                      {selectedTask.lifecycle === 'paused' ? (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setTaskMenuOpen(false);
+                            transitionLifecycle('enabled');
+                          }}
+                        >
+                          {t('lifecycle.resume_schedule')}
+                        </button>
+                      ) : null}
+                      {selectedTask.lifecycle === 'archived' ? (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setTaskMenuOpen(false);
+                            transitionLifecycle('draft');
+                          }}
+                        >
+                          {t('lifecycle.restore')}
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          className="gn-data-sync-task-menu__danger"
+                          onClick={() => {
+                            setTaskMenuOpen(false);
+                            transitionLifecycle('archived');
+                          }}
+                        >
+                          {t('lifecycle.archive')}
+                        </button>
+                      )}
+                      {selectedTask.lifecycle !== 'archived' ? (
+                        <button
+                          type="button"
+                          className="gn-data-sync-task-menu__danger"
+                          disabled={operationBusy === 'delete' || saving || preflighting}
+                          onClick={() => {
+                            setTaskMenuOpen(false);
+                            requestDeleteSelectedTask();
+                          }}
+                        >
+                          {operationBusy === 'delete'
+                            ? t('workbench.deleting')
+                            : t('workbench.delete')}
+                        </button>
+                      ) : null}
+                      {selectedTask.kind === 'compare' &&
+                      selectedTask.compareMode === 'schema' ? (
+                        <button
+                          type="button"
+                          data-data-sync-action="create-schema-sync"
+                          onClick={() => {
+                            setTaskMenuOpen(false);
+                            createSchemaSyncTask();
+                          }}
+                        >
+                          {t('workbench.create_schema_sync')}
+                        </button>
+                      ) : null}
+                      {activeStage !== 'preflight' || !preflightNeedsRefresh ? (
+                        <button
+                          type="button"
+                          disabled={preflighting || saving}
+                          onClick={() => {
+                            setTaskMenuOpen(false);
+                            void runPreflight();
+                          }}
+                        >
+                          {preflighting
+                            ? t('workbench.preflighting')
+                            : t('workbench.run_preflight')}
+                        </button>
+                      ) : null}
+                      {activeStage !== 'preflight' ? (
+                        <button
+                          type="button"
+                          disabled={preflighting || !actionEnabled || operationBusy === 'start'}
+                          title={runActionTitle}
+                          onClick={() => {
+                            setTaskMenuOpen(false);
+                            void startTask();
+                          }}
+                        >
+                          {t('workbench.start')}
+                        </button>
+                      ) : null}
+                    </div>
+                  </details>
+                  <button
+                    type="button"
+                    className="gn-data-sync-button"
+                    data-dirty={dirtyTaskIds.has(selectedTask.id) ? 'true' : 'false'}
+                    title={
+                      dirtyTaskIds.has(selectedTask.id)
+                        ? t('workbench.unsaved')
+                        : t('workbench.saved')
+                    }
+                    disabled={
+                      saving ||
+                      preflighting ||
+                      (!dirtyTaskIds.has(selectedTask.id) &&
+                        selectedTask.lifecycle !== 'draft') ||
+                      !saveApprovalReady
+                    }
+                    onClick={() => {
+                      if (selectedTask.lifecycle === 'draft') {
+                        void publishTask();
+                        return;
+                      }
+                      void saveTask();
+                    }}
+                  >
+                    {saving ? t('workbench.saving') : t('workbench.save')}
+                  </button>
+                  {previousStage ? (
                     <button
                       type="button"
                       className="gn-data-sync-button"
-                      disabled={saving || preflighting}
-                      onClick={() => void publishTask()}
+                      onClick={() => setActiveStage(previousStage)}
                     >
-                      {t('lifecycle.publish_ready')}
+                      {t('workbench.previous_step')}
                     </button>
                   ) : null}
-                  {selectedTask.lifecycle === 'ready' &&
-                  selectedTask.trigger.mode !== 'manual' ? (
+                  {blockerInEarlierStage && relevantBlockerStage ? (
                     <button
                       type="button"
-                      className="gn-data-sync-button"
-                      onClick={() => transitionLifecycle('enabled')}
+                      className="gn-data-sync-button gn-data-sync-button--primary"
+                      title={actionHint}
+                      onClick={() => setActiveStage(relevantBlockerStage)}
                     >
-                      {t('lifecycle.enable_schedule')}
+                      {t('workbench.return_to_stage', {
+                        stage: t(`stage.${relevantBlockerStage}`),
+                      })}
                     </button>
-                  ) : null}
-                  {selectedTask.lifecycle === 'enabled' ? (
+                  ) : nextStage ? (
+                      <button
+                        type="button"
+                        className="gn-data-sync-button gn-data-sync-button--primary"
+                        disabled={Boolean(relevantBlocker)}
+                        title={relevantBlocker ? actionHint : undefined}
+                        onClick={() => setActiveStage(nextStage)}
+                      >
+                        {t('workbench.next_step', { stage: t(`stage.${nextStage}`) })}
+                      </button>
+                  ) : preflightNeedsRefresh ? (
                     <button
                       type="button"
-                      className="gn-data-sync-button"
-                      onClick={() => transitionLifecycle('paused')}
+                      className="gn-data-sync-button gn-data-sync-button--primary"
+                      disabled={preflighting || saving}
+                      onClick={() => void runPreflight()}
                     >
-                      {t('lifecycle.pause')}
-                    </button>
-                  ) : null}
-                  {selectedTask.lifecycle === 'paused' ? (
-                    <button
-                      type="button"
-                      className="gn-data-sync-button"
-                      onClick={() => transitionLifecycle('enabled')}
-                    >
-                      {t('lifecycle.resume_schedule')}
-                    </button>
-                  ) : null}
-                  {selectedTask.lifecycle === 'archived' ? (
-                    <button
-                      type="button"
-                      className="gn-data-sync-button"
-                      onClick={() => transitionLifecycle('draft')}
-                    >
-                      {t('lifecycle.restore')}
+                      {preflighting
+                        ? t('workbench.preflighting')
+                        : t('workbench.run_preflight')}
                     </button>
                   ) : (
                     <button
                       type="button"
-                      className="gn-data-sync-link-button gn-data-sync-link-button--danger"
-                      onClick={() => transitionLifecycle('archived')}
+                      className="gn-data-sync-button gn-data-sync-button--primary"
+                      disabled={preflighting || !actionEnabled || operationBusy === 'start'}
+                      title={runActionTitle}
+                      onClick={() => void startTask()}
                     >
-                      {t('lifecycle.archive')}
+                      {t('workbench.start')}
                     </button>
                   )}
-                  {selectedTask.lifecycle !== 'archived' ? (
-                    <button
-                      type="button"
-                      className="gn-data-sync-link-button gn-data-sync-link-button--danger"
-                      disabled={operationBusy === 'delete'}
-                      onClick={requestDeleteSelectedTask}
-                    >
-                      {operationBusy === 'delete'
-                        ? t('workbench.deleting')
-                        : t('workbench.delete')}
-                    </button>
-                  ) : null}
-                  {selectedTask.kind === 'compare' && selectedTask.compareMode === 'schema' ? (
-                    <button
-                      type="button"
-                      className="gn-data-sync-button"
-                      data-data-sync-action="create-schema-sync"
-                      onClick={createSchemaSyncTask}
-                    >
-                      {t('workbench.create_schema_sync')}
-                    </button>
-                  ) : null}
-                  <button
-                    type="button"
-                    className="gn-data-sync-button"
-                    disabled={
-                      saving ||
-                      !dirtyTaskIds.has(selectedTask.id) ||
-                      !saveApprovalReady
-                    }
-                    onClick={() => void saveTask()}
-                  >
-                    {saving ? t('workbench.saving') : t('workbench.save')}
-                  </button>
-                  <button
-                    type="button"
-                    className="gn-data-sync-button"
-                    disabled={preflighting}
-                    onClick={() => void runPreflight()}
-                  >
-                    {preflighting
-                      ? t('workbench.preflighting')
-                      : t('workbench.run_preflight')}
-                  </button>
-                  <button
-                    type="button"
-                    className="gn-data-sync-button gn-data-sync-button--primary"
-                    disabled={!actionEnabled || operationBusy === 'start'}
-                    title={runActionTitle}
-                    onClick={() => void startTask()}
-                  >
-                    {t('workbench.start')}
-                  </button>
                 </footer>
               </>
             )}
           </main>
-          {selectedTask && !showKindSelector ? (
-            <DataSyncPreflightPanel
-              snapshot={selectedPreflight}
-              currentRevision={selectedTask.revision}
-              stale={preflightStale}
-              running={preflighting}
-              t={t}
-              onLocateIssue={locateIssue}
-              approval={selectedApproval}
-              approvalChallenge={selectedApprovalChallenge}
-              beginningApproval={beginningApproval}
-              approving={approving}
-              approvalError={approvalError}
-              onBeginApproval={() => void beginApproval()}
-              onApprove={() => void approveTask()}
-            />
-          ) : (
-            <aside className="gn-data-sync-preflight gn-data-sync-preflight--blank" />
-          )}
         </div>
       ) : null}
 

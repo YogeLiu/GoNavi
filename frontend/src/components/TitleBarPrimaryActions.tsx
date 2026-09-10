@@ -1,5 +1,4 @@
 import React from 'react';
-import { ConsoleSqlOutlined, PlusOutlined } from '@ant-design/icons';
 import {
   getShortcutDisplayLabel,
   resolveShortcutBinding,
@@ -22,12 +21,13 @@ export const resolveTitleBarPrimaryActionShortcut = (
 
 interface TitleBarPrimaryActionsProps {
   newQueryLabel: string;
-  newQueryIcon?: React.ReactNode;
   newConnectionLabel: string;
   newQueryShortcut?: string;
   newConnectionShortcut?: string;
   onNewQuery: () => void;
   onNewConnection: () => void;
+  connectionGroupLabel?: string;
+  onConnectionGroupManagement?: () => void;
 }
 
 const getActionTitle = (label: string, shortcut?: string): string => (
@@ -36,12 +36,13 @@ const getActionTitle = (label: string, shortcut?: string): string => (
 
 const TitleBarPrimaryActions: React.FC<TitleBarPrimaryActionsProps> = ({
   newQueryLabel,
-  newQueryIcon,
   newConnectionLabel,
   newQueryShortcut,
   newConnectionShortcut,
   onNewQuery,
   onNewConnection,
+  connectionGroupLabel,
+  onConnectionGroupManagement,
 }) => (
   <div
     className="gonavi-titlebar-primary-actions"
@@ -57,7 +58,6 @@ const TitleBarPrimaryActions: React.FC<TitleBarPrimaryActionsProps> = ({
       data-gonavi-new-query-action="true"
       onClick={onNewQuery}
     >
-      {newQueryIcon || <ConsoleSqlOutlined />}
       {newQueryLabel}
     </button>
     <button
@@ -68,9 +68,11 @@ const TitleBarPrimaryActions: React.FC<TitleBarPrimaryActionsProps> = ({
       data-gonavi-create-connection-action="true"
       onClick={onNewConnection}
     >
-      <PlusOutlined />
       {newConnectionLabel}
     </button>
+    {connectionGroupLabel && onConnectionGroupManagement && <button type="button" className="gonavi-titlebar-primary-action" aria-label={connectionGroupLabel} data-gonavi-connection-group-management-action="true" onClick={onConnectionGroupManagement}>
+      {connectionGroupLabel}
+    </button>}
   </div>
 );
 

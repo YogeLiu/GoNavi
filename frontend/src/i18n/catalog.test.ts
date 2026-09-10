@@ -50,6 +50,9 @@ const readDataGridV2DdlWorkspaceSource = (): string =>
 const readQueryEditorSource = (): string =>
   readFileSync(new URL("../components/QueryEditor.tsx", import.meta.url), "utf8");
 
+const readAppSource = (): string =>
+  readFileSync(new URL("../App.tsx", import.meta.url), "utf8");
+
 const readQueryEditorHelpersSource = (): string =>
   readFileSync(new URL("../components/queryEditor/QueryEditorHelpers.ts", import.meta.url), "utf8");
 
@@ -331,6 +334,10 @@ describe("i18n catalog", () => {
       "app.theme.data_table.table_double_click_action.open_data",
       "app.theme.data_table.table_double_click_action.open_design",
       "app.theme.data_table.table_double_click_action_hint",
+      "app.theme.data_table.query_ctrl_click_action",
+      "app.theme.data_table.query_ctrl_click_action.open_design",
+      "app.theme.data_table.query_ctrl_click_action.locate",
+      "app.theme.data_table.query_ctrl_click_action_hint",
       "app.theme.instant_apply_hint",
       "app.theme.nav.appearance.description",
       "app.theme.nav.appearance.title",
@@ -345,17 +352,17 @@ describe("i18n catalog", () => {
       "app.theme.query_template.hint",
       "app.theme.query_template.reset_default",
       "app.theme.query_template.title",
+      "app.theme.table_alias.description",
+      "app.theme.table_alias.custom_prefix.description",
+      "app.theme.table_alias.custom_prefix.placeholder",
+      "app.theme.table_alias.custom_prefix.title",
+      "app.theme.table_alias.title",
       "app.theme.theme_settings_description",
       "app.theme.theme_settings_title",
-      "app.theme.ui_version.beta_warning",
-      "app.theme.ui_version.description",
-      "app.theme.ui_version.legacy.badge",
-      "app.theme.ui_version.legacy.description",
-      "app.theme.ui_version.legacy.label",
-      "app.theme.ui_version.platform_hint",
-      "app.theme.ui_version.title",
-      "app.theme.ui_version.v2.description",
-      "app.theme.ui_version.v2.label",
+      "app.theme.ui_version.sidebar_search.title",
+      "app.theme.ui_version.sidebar_search.command",
+      "app.theme.ui_version.sidebar_search.filter",
+      "app.theme.ui_version.sidebar_search.hint",
     ] as const;
 
     for (const language of SUPPORTED_LANGUAGES) {
@@ -364,6 +371,24 @@ describe("i18n catalog", () => {
         expect(catalogs[language][key]).toBeTruthy();
       }
     }
+  });
+
+  it("renders the table alias setting in theme settings", () => {
+    const source = readAppSource();
+    const v2Source = sliceBetween(
+      source,
+      "const renderThemeSettingsContentV2 =",
+      "const renderThemeSettingsContent =",
+    );
+
+    expect(v2Source).toContain("app.theme.table_alias.title");
+    expect(v2Source).toContain("app.theme.table_alias.description");
+    expect(v2Source).toContain("setAppearance({ autoAddTableAlias: checked })");
+    expect(v2Source).toContain("app.theme.table_alias.custom_prefix.title");
+    expect(v2Source).toContain("app.theme.table_alias.custom_prefix.description");
+    expect(v2Source).toContain("app.theme.table_alias.custom_prefix.placeholder");
+    expect(v2Source).toContain("setAppearance({ customTableAliasPrefixEnabled: checked })");
+    expect(v2Source).toContain("setAppearance({ customTableAliasPrefix: event.target.value })");
   });
 
   it("includes App shortcut modal keys required by every supported language", () => {
@@ -534,11 +559,15 @@ describe("i18n catalog", () => {
       "data_grid.pagination.result_set",
       "data_grid.pagination.page_size_aria",
       "data_grid.pagination.page_size_option",
+      "data_grid.pagination.page_size_custom",
+      "data_grid.pagination.page_size_custom_label",
+      "data_grid.pagination.page_size_custom_invalid",
       "data_grid.pagination.first_page",
       "data_grid.pagination.last_page",
       "data_grid.pagination.jump_label",
       "data_grid.pagination.jump_aria",
       "data_grid.pagination.jump_action",
+      "data_grid.pagination.selected_count",
       "data_grid.pagination.summary.approximate",
       "data_grid.pagination.summary.cancelled",
       "data_grid.pagination.summary.counting",
@@ -575,13 +604,19 @@ describe("i18n catalog", () => {
       "data_grid.row_editor.popup_edit",
       "data_grid.cell_editor.title",
       "data_grid.cell_editor.title_with_column",
+      "data_grid.cell_editor.escape",
+      "data_grid.cell_editor.unescape",
+      "data_grid.cell_editor.invalid_unescape",
       "data_grid.cell_viewer.title_with_column",
+      "data_grid.context_menu.edit_cell_in_editor",
       "data_grid.batch_fill.title",
       "data_grid.batch_fill.set_null",
+      "data_grid.batch_fill.set_null_selected",
       "data_grid.batch_fill.value_placeholder",
       "data_grid.json_editor.title",
       "data_grid.json_editor.description",
       "data_grid.json_editor.format",
+      "data_grid.json_editor.compact",
       "data_grid.json_editor.apply_changes",
       "data_grid.json_editor.invalid_format",
       "data_grid.ddl.layout_bottom",
@@ -664,8 +699,13 @@ describe("i18n catalog", () => {
     expect(t("en-US", "data_grid.json_editor.title")).toContain("JSON");
     expect(t("zh-CN", "data_grid.json_editor.description")).toContain("JSON");
     expect(t("zh-CN", "data_grid.json_editor.format")).toContain("JSON");
+    expect(t("zh-CN", "data_grid.json_editor.compact")).toContain("JSON");
     expect(t("zh-CN", "data_grid.json_editor.invalid_format", { error: "<raw-json-error>" })).toContain("<raw-json-error>");
     expect(getPlaceholders(catalogs["en-US"]["data_grid.json_editor.invalid_format"])).toEqual(["error"]);
+    expect(t("zh-CN", "data_grid.cell_editor.escape")).toBe("转义");
+    expect(t("zh-CN", "data_grid.cell_editor.unescape")).toBe("去转义");
+    expect(t("en-US", "data_grid.cell_editor.invalid_unescape", { error: "<raw-unescape-error>" })).toContain("<raw-unescape-error>");
+    expect(getPlaceholders(catalogs["en-US"]["data_grid.cell_editor.invalid_unescape"])).toEqual(["error"]);
     assertSourceDoesNotInlineCatalogValues(detachedChromeSource, dataGridDetachedChromeKeys, { ignoreEnglishBaseline: true });
   });
 
@@ -905,7 +945,7 @@ describe("i18n catalog", () => {
     const source = readQueryEditorSource();
     const handleRunSource = sliceBetween(
       source,
-      "const handleRun = async () => {",
+      "const handleRun = async (runScope: QueryEditorRunScope = 'default') => {",
       "  const handleCancel = async () => {",
     );
     const handleCancelSource = sliceBetween(
@@ -935,7 +975,7 @@ describe("i18n catalog", () => {
     const source = readQueryEditorSource();
     const handleRunSource = sliceBetween(
       source,
-      "const handleRun = async () => {",
+      "const handleRun = async (runScope: QueryEditorRunScope = 'default') => {",
       "  const handleCancel = async () => {",
     );
 
@@ -961,7 +1001,7 @@ describe("i18n catalog", () => {
     const source = readQueryEditorSource();
     const handleRunSource = sliceBetween(
       source,
-      "const handleRun = async () => {",
+      "const handleRun = async (runScope: QueryEditorRunScope = 'default') => {",
       "  const handleCancel = async () => {",
     );
 
@@ -982,7 +1022,7 @@ describe("i18n catalog", () => {
     const handleReloadSource = sliceBetween(
       source,
       "  const handleReloadResult = async (resultKey: string, sql: string) => {",
-      "  const handleRun = async () => {",
+      "  const handleRun = async (runScope: QueryEditorRunScope = 'default') => {",
     );
 
     for (const language of SUPPORTED_LANGUAGES) {
@@ -1033,6 +1073,7 @@ describe("i18n catalog", () => {
     const hoverKeys = [
       "query_editor.hover.switch_database_with_shortcut",
       "query_editor.hover.open_table_with_shortcut",
+      "query_editor.hover.locate_table_with_shortcut",
       "query_editor.hover.open_view_with_shortcut",
       "query_editor.hover.open_materialized_view_with_shortcut",
       "query_editor.hover.open_trigger_with_shortcut",
@@ -1782,6 +1823,8 @@ describe("i18n catalog", () => {
       "app.shortcuts.action.saveQuery.label",
       "app.shortcuts.action.saveQueryAs.label",
       "query_editor.action.show_object_info",
+      "query_editor.action.run_selected_sql",
+      "query_editor.action.run_all_sql",
     ] as const;
     const source = readQueryEditorSource();
     const actionLabelSource = [
@@ -1917,7 +1960,7 @@ describe("i18n catalog", () => {
     const source = readQueryEditorResultsPanelSource();
     const emptyStateSource = sliceBetween(
       source,
-      "<div className={isV2Ui ? 'gn-v2-query-empty' : undefined}",
+      '<div className="gn-v2-query-empty"',
       "                    </>",
     );
 
@@ -1926,9 +1969,6 @@ describe("i18n catalog", () => {
         expect(catalogs[language]).toHaveProperty(key);
         expect(catalogs[language][key]).toBeTruthy();
       }
-    }
-
-    for (const key of emptyStateKeys) {
     }
 
     assertSourceDoesNotInlineCatalogValues(emptyStateSource, emptyStateKeys);

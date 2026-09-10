@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import TestRenderer, { act } from 'react-test-renderer';
@@ -24,6 +25,12 @@ import {
   DataSyncWorkbenchShell,
   resolveDataSyncSidebarRefreshes,
 } from './DataSyncWorkbenchShell';
+import { getDirtyWorkbenchTabCloseGuards } from '../../utils/workbenchTabCloseProtection';
+
+const dataSyncWorkbenchCss = readFileSync(
+  new URL('./DataSyncWorkbench.css', import.meta.url),
+  'utf8',
+);
 
 const buildTask = () => {
   const draft = createDataSyncTaskDraft({
@@ -63,11 +70,34 @@ const latestConfirmation = (): {
   onOk: () => Promise<void>;
 } => modalConfirm.mock.calls[modalConfirm.mock.calls.length - 1]![0];
 
+const deferred = <T,>() => {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+};
+
 describe('DataSyncWorkbenchShell', () => {
   afterEach(() => {
     modalConfirm.mockReset();
     vi.useRealTimers();
     vi.unstubAllGlobals();
+  });
+
+  it('masks step connectors behind stage labels', () => {
+    expect(dataSyncWorkbenchCss).toMatch(
+      /\.gn-data-sync-stage-nav button\s*\{[^}]*z-index:\s*0;[^}]*isolation:\s*isolate;/s,
+    );
+    expect(dataSyncWorkbenchCss).toMatch(
+      /\.gn-data-sync-stage-nav button:not\(:last-child\)::after\s*\{[^}]*z-index:\s*-1;/s,
+    );
+    expect(dataSyncWorkbenchCss).toMatch(
+      /\.gn-data-sync-stage-nav__label\s*\{[^}]*background:\s*var\(--gn-bg-panel,[^;]+;[^}]*padding-inline:/s,
+    );
+    expect(dataSyncWorkbenchCss).toMatch(
+      /\.gn-data-sync-stage-nav button:hover \.gn-data-sync-stage-nav__label,[\s\S]*button\[data-active='true'\] \.gn-data-sync-stage-nav__label\s*\{[^}]*background:\s*var\(--gn-bg-hover,/,
+    );
   });
 
   it('requests one target database refresh when a run finishes after writing rows', () => {
@@ -116,6 +146,7 @@ describe('DataSyncWorkbenchShell', () => {
   });
 
   it('keeps an entry-point task while loading unrelated persisted tasks', async () => {
+    const workbenchTabId = 'data-sync-workbench-loaded-tasks';
     const entryTask = {
       ...buildTask(),
       id: 'data-sync-local-schema-compare',
@@ -139,6 +170,7 @@ describe('DataSyncWorkbenchShell', () => {
         initialTasks={[entryTask]}
         gateway={gateway}
         locale="zh-CN"
+        workbenchTabId={workbenchTabId}
       />,
     );
 
@@ -157,6 +189,197 @@ describe('DataSyncWorkbenchShell', () => {
       'data-task-id': entryTask.id,
       'data-selected': 'true',
     })).toBeTruthy();
+    const dirtyGuards = getDirtyWorkbenchTabCloseGuards([workbenchTabId]);
+    act(() => renderer.unmount());
+    expect(dirtyGuards).toHaveLength(0);
+  });
+
+  it('treats an entry-point draft as clean until the user edits it when bootstrap fails', async () => {
+    const workbenchTabId = 'data-sync-workbench-clean-entry';
+    const task = {
+      ...buildTask(),
+      id: 'data-sync-local-clean-entry',
+    };
+    const baseGateway = createStaticDataSyncWorkbenchGateway({ tasks: [] });
+    const gateway = {
+      ...baseGateway,
+      listTasks: vi.fn(async () => {
+        throw new Error('data sync service unavailable');
+      }),
+    };
+    const renderer = TestRenderer.create(
+      <DataSyncWorkbenchShell
+        initialTasks={[task]}
+        gateway={gateway}
+        locale="en-US"
+        workbenchTabId={workbenchTabId}
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const initialDirtyGuards = getDirtyWorkbenchTabCloseGuards([workbenchTabId]);
+
+    const taskName = renderer.root
+      .findAllByType('input')
+      .find((input) => input.props.value === task.name)!;
+    act(() => taskName.props.onChange({ target: { value: 'Edited task' } }));
+    const editedDirtyGuards = getDirtyWorkbenchTabCloseGuards([workbenchTabId]);
+    act(() => renderer.unmount());
+
+    expect(initialDirtyGuards).toHaveLength(0);
+    expect(editedDirtyGuards).toHaveLength(1);
+  });
+
+  it('drops a discarded draft guard and reopens the same entry point cleanly', async () => {
+    const workbenchTabId = 'data-sync-workbench-discard';
+    const task = {
+      ...buildTask(),
+      id: 'data-sync-local-discard',
+    };
+    const renderer = TestRenderer.create(
+      <DataSyncWorkbenchShell
+        initialTasks={[task]}
+        locale="en-US"
+        workbenchTabId={workbenchTabId}
+      />,
+    );
+    const taskName = renderer.root
+      .findAllByType('input')
+      .find((input) => input.props.value === task.name)!;
+    act(() => taskName.props.onChange({ target: { value: 'Discard me' } }));
+    const [dirtyGuard] = getDirtyWorkbenchTabCloseGuards([workbenchTabId]);
+    expect(dirtyGuard).toBeTruthy();
+
+    await act(async () => {
+      await dirtyGuard.guard.discard();
+      renderer.unmount();
+    });
+    expect(getDirtyWorkbenchTabCloseGuards([workbenchTabId])).toHaveLength(0);
+
+    const reopened = TestRenderer.create(
+      <DataSyncWorkbenchShell
+        initialTasks={[task]}
+        locale="en-US"
+        workbenchTabId={workbenchTabId}
+      />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const reopenedDirtyGuards = getDirtyWorkbenchTabCloseGuards([workbenchTabId]);
+    act(() => reopened.unmount());
+    expect(reopenedDirtyGuards).toHaveLength(0);
+  });
+
+  it('clears the close guard after a successful save', async () => {
+    const workbenchTabId = 'data-sync-workbench-save-success';
+    const task = {
+      ...buildTask(),
+      id: 'data-sync-local-save-success',
+    };
+    const baseGateway = createStaticDataSyncWorkbenchGateway({ tasks: [] });
+    const saveTask = vi.fn(async (submitted: typeof task) => ({
+      ...submitted,
+      id: 'persisted-save-success',
+      revision: submitted.revision + 1,
+    }));
+    const renderer = TestRenderer.create(
+      <DataSyncWorkbenchShell
+        initialTasks={[task]}
+        gateway={{ ...baseGateway, saveTask }}
+        locale="en-US"
+        workbenchTabId={workbenchTabId}
+      />,
+    );
+    const taskName = renderer.root
+      .findAllByType('input')
+      .find((input) => input.props.value === task.name)!;
+    act(() => taskName.props.onChange({ target: { value: 'Save me' } }));
+    const [dirtyGuard] = getDirtyWorkbenchTabCloseGuards([workbenchTabId]);
+
+    await act(async () => {
+      expect(await dirtyGuard.guard.save()).toBe(true);
+      await Promise.resolve();
+    });
+    expect(saveTask).toHaveBeenCalledTimes(1);
+    expect(getDirtyWorkbenchTabCloseGuards([workbenchTabId])).toHaveLength(0);
+    expect(renderer.root.findByProps({ 'data-dirty': 'false' })).toBeTruthy();
+    act(() => renderer.unmount());
+  });
+
+  it('keeps the close guard dirty when saving fails so the user can retry', async () => {
+    const workbenchTabId = 'data-sync-workbench-save-failure';
+    const task = {
+      ...buildTask(),
+      id: 'data-sync-local-save-failure',
+    };
+    const baseGateway = createStaticDataSyncWorkbenchGateway({ tasks: [] });
+    const saveTask = vi.fn(async () => {
+      throw new Error('save failed');
+    });
+    const renderer = TestRenderer.create(
+      <DataSyncWorkbenchShell
+        initialTasks={[task]}
+        gateway={{ ...baseGateway, saveTask }}
+        locale="en-US"
+        workbenchTabId={workbenchTabId}
+      />,
+    );
+    const taskName = renderer.root
+      .findAllByType('input')
+      .find((input) => input.props.value === task.name)!;
+    act(() => taskName.props.onChange({ target: { value: 'Retry me' } }));
+    const [dirtyGuard] = getDirtyWorkbenchTabCloseGuards([workbenchTabId]);
+
+    await act(async () => {
+      expect(await dirtyGuard.guard.save()).toBe(false);
+      await Promise.resolve();
+    });
+    expect(saveTask).toHaveBeenCalledTimes(1);
+    expect(getDirtyWorkbenchTabCloseGuards([workbenchTabId])).toHaveLength(1);
+    expect(renderer.root.findByProps({ 'data-dirty': 'true' })).toBeTruthy();
+    act(() => renderer.unmount());
+  });
+
+  it('turns an unavailable Wails bridge error into a recoverable message', async () => {
+    const baseGateway = createStaticDataSyncWorkbenchGateway({ tasks: [] });
+    const listTasks = vi.fn(async () => {
+      throw new Error('window.go.app.App.DataSyncJobList is not a function');
+    });
+    const gateway = { ...baseGateway, listTasks };
+    const renderer = TestRenderer.create(
+      <DataSyncWorkbenchShell initialTasks={[]} gateway={gateway} locale="zh-CN" />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(
+      renderer.root
+        .findByProps({
+          title: 'window.go.app.App.DataSyncJobList is not a function',
+        })
+        .children.join(''),
+    ).toContain('数据同步服务暂未加载');
+    expect(renderer.root.findByType('code').children).toContain(
+      'window.go.app.App.DataSyncJobList is not a function',
+    );
+
+    await act(async () => {
+      renderer.root
+        .findAllByType('button')
+        .find((button) => button.children.includes('重试'))!
+        .props.onClick();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(listTasks).toHaveBeenCalledTimes(2);
   });
 
   it('prefers the persisted task when an entry task has the same id', () => {
@@ -166,22 +389,366 @@ describe('DataSyncWorkbenchShell', () => {
     expect(mergeDataSyncInitialTasks([initialTask], [loadedTask])).toEqual([loadedTask]);
   });
 
-  it('renders a compact full-page shell with route, task list, and five editor stages', () => {
+  it('renders a compact full-page shell without duplicating the endpoint route summary', () => {
     const task = buildTask();
     const markup = renderToStaticMarkup(
       <DataSyncWorkbenchShell initialTasks={[task]} locale="zh-CN" />,
     );
 
     expect(markup).toContain('data-data-sync-workbench-shell="true"');
-    expect(markup).toContain('data-data-sync-route="true"');
+    expect(markup).not.toContain('data-data-sync-route="true"');
     expect(markup).toContain('data-data-sync-task-editor="true"');
-    expect(markup).toContain('data-data-sync-preflight="true"');
+    expect(markup).not.toContain('data-data-sync-preflight="true"');
+    expect(markup).toContain('data-status="pending"');
     expect(markup).toContain('订单同步');
     expect(markup).toContain('MySQL 生产库');
     expect(markup).toContain('PostgreSQL 数仓');
     expect((markup.match(/gn-data-sync-stage-nav/g) || []).length).toBeGreaterThan(0);
     expect(markup).not.toContain('ant-card');
     expect(markup).not.toContain('linear-gradient');
+  });
+
+  it('keeps the route summary inside the stage content and returns to endpoints from it', () => {
+    const renderer = TestRenderer.create(
+      <DataSyncWorkbenchShell initialTasks={[buildTask()]} locale="zh-CN" />,
+    );
+
+    expect(renderer.root.findAllByProps({ 'data-data-sync-route': 'true' })).toHaveLength(0);
+
+    act(() => {
+      renderer.root.findByProps({ 'data-stage': 'mappings' }).props.onClick();
+    });
+
+    const route = renderer.root.findByProps({ 'data-data-sync-route': 'true' });
+    const stageContent = renderer.root.findByProps({
+      'data-data-sync-stage-content': 'true',
+    });
+    expect(stageContent.findAllByProps({ 'data-data-sync-route': 'true' })).toHaveLength(1);
+    expect(route.props['data-complete']).toBe('true');
+
+    const editRoute = route.findByProps({ className: 'gn-data-sync-route__path' });
+    expect(editRoute.props['aria-label']).toContain('MySQL 生产库');
+    expect(editRoute.props['aria-label']).toContain('PostgreSQL 数仓');
+
+    act(() => editRoute.props.onClick());
+
+    expect(renderer.root.findAllByProps({ 'data-data-sync-route': 'true' })).toHaveLength(0);
+    expect(renderer.root.findByProps({ 'data-stage': 'endpoints' }).props['data-active']).toBe('true');
+  });
+
+  it('uses the route as the only endpoint action before object selection is available', () => {
+    const task = createDataSyncTaskDraft({
+      id: 'missing-endpoints-task',
+      kind: 'reconcile',
+      name: '待配置的数据同步',
+    });
+    const renderer = TestRenderer.create(
+      <DataSyncWorkbenchShell initialTasks={[task]} locale="zh-CN" />,
+    );
+
+    act(() => {
+      renderer.root.findByProps({ 'data-stage': 'mappings' }).props.onClick();
+    });
+
+    const route = renderer.root.findByProps({ 'data-data-sync-route': 'true' });
+    const mappingSection = renderer.root.findByProps({
+      'data-data-sync-mapping-section': 'true',
+    });
+    const emptyState = mappingSection.findByProps({
+      className: 'gn-data-sync-mapping-empty',
+    });
+    const actionHint = renderer.root.findByProps({
+      className: 'gn-data-sync-action-hint',
+    });
+
+    expect(route.props['data-complete']).toBe('false');
+    expect(route.findAllByType('button')).toHaveLength(1);
+    expect(emptyState.props['data-state']).toBe('prerequisite');
+    expect(emptyState.findAllByType('strong')).toHaveLength(0);
+    expect(emptyState.findByType('p').children.join('')).toContain('选择端点后');
+    expect(
+      mappingSection.findAllByProps({
+        className: 'gn-data-sync-object-status-line',
+      }),
+    ).toHaveLength(0);
+    expect(
+      mappingSection.findAllByType('button').filter((button) =>
+        button.findAll((node) => node.children.includes('选择源对象')).length > 0,
+      ),
+    ).toHaveLength(0);
+    expect(actionHint.props['data-issue-code']).toBe('source_connection_required');
+    expect(actionHint.props.title).toContain('选择源连接');
+
+    act(() => {
+      route.findByProps({ className: 'gn-data-sync-route__path' }).props.onClick();
+    });
+    expect(renderer.root.findByProps({ 'data-stage': 'endpoints' }).props['data-active']).toBe('true');
+  });
+
+  it('hides stale mappings and blocks forward progress when endpoints are cleared', () => {
+    const task = reviseDataSyncTask(
+      createDataSyncTaskDraft({
+        id: 'cleared-endpoints-task',
+        kind: 'reconcile',
+        name: '端点已清空',
+      }),
+      {
+        mappings: [
+          {
+            ...createDataSyncTableMapping('preserved-map', 'orders', 'orders'),
+            keyColumns: ['id'],
+          },
+        ],
+      },
+    );
+    const renderer = TestRenderer.create(
+      <DataSyncWorkbenchShell initialTasks={[task]} locale="zh-CN" />,
+    );
+
+    act(() => {
+      renderer.root.findByProps({ 'data-stage': 'mappings' }).props.onClick();
+    });
+
+    const mappingSection = renderer.root.findByProps({
+      'data-data-sync-mapping-section': 'true',
+    });
+    expect(mappingSection.findByProps({ className: 'gn-data-sync-mapping-empty' }).props['data-state'])
+      .toBe('prerequisite');
+    expect(mappingSection.findAllByProps({ 'data-mapping-id': 'preserved-map' }))
+      .toHaveLength(0);
+    expect(mappingSection.findAllByProps({ 'data-data-sync-object-picker': 'true' }))
+      .toHaveLength(0);
+    expect(mappingSection.findAllByProps({ className: 'gn-data-sync-object-status-line' }))
+      .toHaveLength(0);
+
+    const returnFromMappings = renderer.root.findAllByType('button').find(
+      (button) => button.children.includes('返回修复：选择源和目标'),
+    )!;
+    expect(returnFromMappings.props.disabled).toBeUndefined();
+
+    act(() => {
+      renderer.root.findByProps({ 'data-stage': 'delivery' }).props.onClick();
+    });
+    const returnFromDelivery = renderer.root.findAllByType('button').find(
+      (button) => button.children.includes('返回修复：选择源和目标'),
+    )!;
+    expect(returnFromDelivery.props.title).toContain('选择源连接');
+    act(() => returnFromDelivery.props.onClick());
+    expect(renderer.root.findByProps({ 'data-stage': 'endpoints' }).props['data-active'])
+      .toBe('true');
+  });
+
+  it('supports arrow, Home, and End navigation across task steps', () => {
+    const renderer = TestRenderer.create(
+      <DataSyncWorkbenchShell initialTasks={[buildTask()]} locale="zh-CN" />,
+    );
+    const preventDefault = vi.fn();
+
+    act(() => {
+      renderer.root.findByProps({ 'data-stage': 'endpoints' }).props.onKeyDown({
+        key: 'End',
+        preventDefault,
+      });
+    });
+    expect(renderer.root.findByProps({ 'data-stage': 'preflight' }).props['data-active'])
+      .toBe('true');
+
+    act(() => {
+      renderer.root.findByProps({ 'data-stage': 'preflight' }).props.onKeyDown({
+        key: 'ArrowLeft',
+        preventDefault,
+      });
+    });
+    expect(renderer.root.findByProps({ 'data-stage': 'trigger' }).props['data-active'])
+      .toBe('true');
+
+    act(() => {
+      renderer.root.findByProps({ 'data-stage': 'trigger' }).props.onKeyDown({
+        key: 'Home',
+        preventDefault,
+      });
+    });
+    expect(renderer.root.findByProps({ 'data-stage': 'endpoints' }).props['data-active'])
+      .toBe('true');
+    expect(preventDefault).toHaveBeenCalledTimes(3);
+  });
+
+  it('aligns the preflight hint with the visible preflight action', () => {
+    const renderer = TestRenderer.create(
+      <DataSyncWorkbenchShell initialTasks={[buildTask()]} locale="zh-CN" />,
+    );
+
+    act(() => {
+      renderer.root.findByProps({ 'data-stage': 'preflight' }).props.onClick();
+    });
+
+    const actionHint = renderer.root.findByProps({
+      className: 'gn-data-sync-action-hint',
+    });
+    expect(actionHint.props.title).toContain('尚未预检');
+    expect(actionHint.props['data-tone']).toBe('neutral');
+    expect(actionHint.props.title).not.toContain('发布');
+    expect(
+      renderer.root.findAllByType('button').some((button) =>
+        button.children.includes('运行预检'),
+      ),
+    ).toBe(true);
+  });
+
+  it('returns to an earlier blocker instead of running preflight', () => {
+    const task = createDataSyncTaskDraft({
+      id: 'blocked-preflight-task',
+      kind: 'reconcile',
+      name: '待配置任务',
+    });
+    const renderer = TestRenderer.create(
+      <DataSyncWorkbenchShell initialTasks={[task]} locale="zh-CN" />,
+    );
+
+    act(() => {
+      renderer.root.findByProps({ 'data-stage': 'preflight' }).props.onClick();
+    });
+
+    const returnToEndpoints = renderer.root
+      .findAllByType('button')
+      .find((button) => button.children.includes('返回修复：选择源和目标'))!;
+    expect(returnToEndpoints.props.disabled).toBeUndefined();
+    expect(
+      renderer.root.findAllByType('button').some(
+        (button) => button.children.includes('运行预检') && !button.props.disabled,
+      ),
+    ).toBe(false);
+
+    act(() => returnToEndpoints.props.onClick());
+    expect(renderer.root.findByProps({ 'data-stage': 'endpoints' }).props['data-active'])
+      .toBe('true');
+  });
+
+  it('describes only the missing side of a partial endpoint route', () => {
+    const draft = createDataSyncTaskDraft({
+      id: 'missing-target-task',
+      kind: 'reconcile',
+      name: '待配置目标端',
+    });
+    const task = reviseDataSyncTask(draft, {
+      source: {
+        connectionId: 'mysql-prod',
+        connectionName: 'MySQL 生产库',
+        type: 'mysql',
+        database: 'sales',
+        schema: '',
+      },
+    });
+    const renderer = TestRenderer.create(
+      <DataSyncWorkbenchShell initialTasks={[task]} locale="zh-CN" />,
+    );
+
+    act(() => {
+      renderer.root.findByProps({ 'data-stage': 'mappings' }).props.onClick();
+    });
+
+    const route = renderer.root.findByProps({ 'data-data-sync-route': 'true' });
+    const target = route.findByProps({
+      className:
+        'gn-data-sync-route__endpoint gn-data-sync-route__endpoint--target',
+    });
+    const routeAction = route.findByProps({
+      className: 'gn-data-sync-route__path',
+    });
+
+    expect(target.props['data-endpoint-ready']).toBe('false');
+    expect(target.findByProps({ className: 'gn-data-sync-route__missing-side' }).children)
+      .toContain('尚未选择目标端');
+    expect(target.findAllByType('small')).toHaveLength(0);
+    expect(routeAction.props['aria-label']).not.toContain('未选择库');
+  });
+
+  it('shows the mapping blocker after both endpoints are complete', () => {
+    const completeRouteWithoutMappings = reviseDataSyncTask(
+      createDataSyncTaskDraft({
+        id: 'missing-mapping-task',
+        kind: 'reconcile',
+        name: '待选择同步数据',
+      }),
+      {
+        source: {
+          connectionId: 'mysql-prod',
+          connectionName: 'MySQL 生产库',
+          type: 'mysql',
+          database: 'sales',
+          schema: '',
+        },
+        target: {
+          connectionId: 'postgres-warehouse',
+          connectionName: 'PostgreSQL 数仓',
+          type: 'postgres',
+          database: 'warehouse',
+          schema: 'ods',
+        },
+      },
+    );
+    const renderer = TestRenderer.create(
+      <DataSyncWorkbenchShell
+        initialTasks={[completeRouteWithoutMappings]}
+        locale="zh-CN"
+      />,
+    );
+
+    act(() => {
+      renderer.root.findByProps({ 'data-stage': 'mappings' }).props.onClick();
+    });
+
+    const actionHint = renderer.root.findByProps({
+      className: 'gn-data-sync-action-hint',
+    });
+    expect(actionHint.props['data-issue-code']).toBe('mapping_required');
+    expect(actionHint.props['data-tone']).toBe('warning');
+    expect(actionHint.props.title).toBe('至少启用一条对象映射。');
+  });
+
+  it('shows the task drawer control only on the task view and resets it on navigation', async () => {
+    const task = buildTask();
+    const renderer = TestRenderer.create(
+      <DataSyncWorkbenchShell initialTasks={[task]} locale="zh-CN" />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const taskListToggle = renderer.root
+      .findAllByType('button')
+      .find((button) => button.props['aria-label'] === '任务列表')!;
+    act(() => taskListToggle.props.onClick());
+    expect(
+      renderer.root.findByProps({ className: 'gn-data-sync-workspace-grid' }).props[
+        'data-task-rail-open'
+      ],
+    ).toBe('true');
+
+    act(() => {
+      renderer.root
+        .findAllByType('button')
+        .find((button) => button.children.includes('运行记录'))!
+        .props.onClick();
+    });
+    expect(
+      renderer.root
+        .findAllByType('button')
+        .filter((button) => button.props['aria-label'] === '任务列表'),
+    ).toHaveLength(0);
+
+    act(() => {
+      renderer.root
+        .findAllByType('button')
+        .find((button) => button.children.includes('任务'))!
+        .props.onClick();
+    });
+    expect(
+      renderer.root
+        .findAllByType('button')
+        .find((button) => button.props['aria-label'] === '任务列表')!.props['aria-expanded'],
+    ).toBe(false);
   });
 
   it('converts a schema compare into an explicit schema-only task from the UI', async () => {
@@ -298,7 +865,7 @@ describe('DataSyncWorkbenchShell', () => {
     act(() => {
       renderer.root
         .findAllByType('button')
-        .find((button) => button.children.includes('Choose data'))!
+        .find((button) => button.props['data-stage'] === 'mappings')!
         .props.onClick();
     });
 
@@ -318,6 +885,61 @@ describe('DataSyncWorkbenchShell', () => {
         .findAllByType('input')
         .some((input) => input.props.value === 'ods.orders_v2'),
     ).toBe(true);
+  });
+
+  it('keeps edits made while an earlier save response is pending', async () => {
+    const task = buildTask();
+    const pendingSave = deferred<typeof task>();
+    const baseGateway = createStaticDataSyncWorkbenchGateway({ tasks: [task] });
+    const saveTask = vi.fn((_submitted: typeof task) => pendingSave.promise);
+    const renderer = TestRenderer.create(
+      <DataSyncWorkbenchShell
+        initialTasks={[task]}
+        gateway={{ ...baseGateway, saveTask }}
+        locale="en-US"
+      />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const taskName = () =>
+      renderer.root
+        .findAllByType('input')
+        .find((input) =>
+          ['订单同步', 'First edit', 'Latest edit'].includes(input.props.value),
+        )!;
+    act(() => taskName().props.onChange({ target: { value: 'First edit' } }));
+    await act(async () => {
+      renderer.root
+        .findAllByType('button')
+        .find((button) => button.children.includes('Save draft'))!
+        .props.onClick();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(saveTask).toHaveBeenCalledTimes(1);
+    expect(saveTask).toHaveBeenCalledWith(
+      expect.objectContaining({ lifecycle: 'ready' }),
+    );
+
+    act(() => {
+      renderer.root
+        .findAllByType('button')
+        .find((button) => button.props['data-stage'] === 'endpoints')!
+        .props.onClick();
+    });
+    act(() => taskName().props.onChange({ target: { value: 'Latest edit' } }));
+    const submitted = saveTask.mock.calls[0]![0];
+    await act(async () => {
+      pendingSave.resolve({ ...submitted, revision: submitted.revision + 1 });
+      await pendingSave.promise;
+      await Promise.resolve();
+    });
+
+    expect(taskName().props.value).toBe('Latest edit');
+    expect(renderer.root.findByProps({ 'data-dirty': 'true' })).toBeTruthy();
   });
 
   it('adapts run history and quarantined rows through the injected gateway', async () => {
@@ -580,9 +1202,14 @@ describe('DataSyncWorkbenchShell', () => {
       renderer.root.findByProps({
         'data-data-sync-preflight': 'true',
         'data-preflight-task-id': 'persisted-task-42',
-        'data-status': 'stale',
+        'data-status': 'warning',
       }),
     ).toBeTruthy();
+    expect(
+      renderer.root
+        .findAllByType('button')
+        .find((button) => button.props['data-stage'] === 'preflight')!.props.title,
+    ).toBe('1 warnings');
     expect(renderer.root.findByProps({ 'data-dirty': 'false' })).toBeTruthy();
   });
 
@@ -693,7 +1320,7 @@ describe('DataSyncWorkbenchShell', () => {
     ).toBeTruthy();
   });
 
-  it('publishes a draft as ready through one preflight-and-save operation', async () => {
+  it('saves a draft as ready without exposing a separate publish action', async () => {
     const task = buildTask();
     const baseGateway = createStaticDataSyncWorkbenchGateway({
       tasks: [task],
@@ -731,11 +1358,22 @@ describe('DataSyncWorkbenchShell', () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    await act(async () => {
+    const saveButton = renderer.root
+      .findAllByType('button')
+      .find((button) => button.children.includes('Save draft'))!;
+    expect(saveButton.props.disabled).toBe(false);
+    expect(
       renderer.root
         .findAllByType('button')
-        .find((button) => button.children.includes('Publish as ready'))!
-        .props.onClick();
+        .some((button) => button.children.includes('Publish as ready')),
+    ).toBe(false);
+    expect(
+      renderer.root
+        .findAllByType('button')
+        .find((button) => button.children.includes('Run task'))!.props.title,
+    ).toBe('Save the draft as ready before running it');
+    await act(async () => {
+      saveButton.props.onClick();
       await Promise.resolve();
       await Promise.resolve();
       await Promise.resolve();
@@ -1079,6 +1717,81 @@ describe('DataSyncWorkbenchShell', () => {
     expect(gateway.listTasks).toHaveBeenCalledTimes(2);
   });
 
+  it('preserves edits made while the post-start task refresh is pending', async () => {
+    const task = { ...buildTask(), lifecycle: 'ready' as const };
+    const refreshedTask = { ...task, revision: task.revision + 1 };
+    const pendingRefresh = deferred<typeof task[]>();
+    const baseGateway = createStaticDataSyncWorkbenchGateway({
+      tasks: [task],
+      capabilities: {
+        [task.id]: {
+          level: 'full',
+          canExecute: true,
+          supportsAutoCreate: true,
+          supportsCdc: false,
+        },
+      },
+    });
+    let listCount = 0;
+    const gateway = {
+      ...baseGateway,
+      listTasks: vi.fn(() => {
+        listCount += 1;
+        return listCount === 1 ? Promise.resolve([task]) : pendingRefresh.promise;
+      }),
+    };
+    const renderer = TestRenderer.create(
+      <DataSyncWorkbenchShell initialTasks={[task]} gateway={gateway} locale="en-US" />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      renderer.root
+        .findAllByType('button')
+        .find((button) => button.children.includes('Run preflight'))!
+        .props.onClick();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      renderer.root
+        .findAllByType('button')
+        .find((button) => button.children.includes('Run task'))!
+        .props.onClick();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    act(() => {
+      renderer.root.findByProps({ 'data-stage': 'endpoints' }).props.onClick();
+    });
+    const taskName = renderer.root
+      .findAllByType('input')
+      .find((input) => input.props.value === task.name)!;
+    act(() => taskName.props.onChange({ target: { value: 'Edited during start' } }));
+
+    await act(async () => {
+      pendingRefresh.resolve([refreshedTask]);
+      await pendingRefresh.promise;
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    act(() => {
+      renderer.root
+        .findAllByType('button')
+        .find((button) => button.children.includes('Tasks'))!
+        .props.onClick();
+    });
+
+    expect(
+      renderer.root.findAllByType('input').some(
+        (input) => input.props.value === 'Edited during start',
+      ),
+    ).toBe(true);
+    expect(renderer.root.findByProps({ 'data-dirty': 'true' })).toBeTruthy();
+  });
+
   it('ignores stale run-detail responses after another run is selected', async () => {
     const task = buildTask();
     const runA: DataSyncRunRecord = {
@@ -1147,7 +1860,7 @@ describe('DataSyncWorkbenchShell', () => {
     expect(renderer.root.findAllByProps({ children: '{"run":"run-a"}' })).toHaveLength(0);
   });
 
-  it('keeps a blocked publication as a draft without saving it', async () => {
+  it('keeps a blocked save-as-ready attempt as a draft without saving it', async () => {
     const task = buildTask();
     const baseGateway = createStaticDataSyncWorkbenchGateway({ tasks: [task] });
     const saveTask = vi.fn(baseGateway.saveTask);
@@ -1186,7 +1899,7 @@ describe('DataSyncWorkbenchShell', () => {
       await Promise.resolve();
       renderer.root
         .findAllByType('button')
-        .find((button) => button.children.includes('Publish as ready'))!
+        .find((button) => button.children.includes('Save draft'))!
         .props.onClick();
       await Promise.resolve();
       await Promise.resolve();
@@ -1197,14 +1910,25 @@ describe('DataSyncWorkbenchShell', () => {
       renderer.root
         .findAllByType('button')
         .some((button) => button.children.includes('Publish as ready')),
-    ).toBe(true);
+    ).toBe(false);
     expect(renderer.root.findByProps({
       'data-data-sync-preflight': 'true',
       'data-status': 'blocked',
     })).toBeTruthy();
+    act(() => {
+      renderer.root
+        .findAllByType('button')
+        .find((button) => button.children.includes('Locate'))!
+        .props.onClick();
+    });
+    expect(
+      renderer.root
+        .findAllByType('button')
+        .find((button) => button.children.includes('Next: Choose data'))!.props.disabled,
+    ).toBe(true);
   });
 
-  it('saves a publication candidate immediately after its production approval', async () => {
+  it('saves a draft as ready immediately after its production approval', async () => {
     const task = buildTask();
     const baseGateway = createStaticDataSyncWorkbenchGateway({
       tasks: [task],
@@ -1241,11 +1965,16 @@ describe('DataSyncWorkbenchShell', () => {
       await Promise.resolve();
       renderer.root
         .findAllByType('button')
-        .find((button) => button.children.includes('Publish as ready'))!
+        .find((button) => button.children.includes('Save draft'))!
         .props.onClick();
       await Promise.resolve();
       await Promise.resolve();
     });
+    expect(
+      renderer.root
+        .findAllByType('button')
+        .some((button) => button.children.includes('Publish as ready')),
+    ).toBe(false);
     expect(
       renderer.root.findAllByType('button').map((button) => button.children.join('')),
     ).toContain('Begin server 10-second confirmation');
@@ -1307,7 +2036,7 @@ describe('DataSyncWorkbenchShell', () => {
     await act(async () => {
       renderer.root
         .findAllByType('button')
-        .find((button) => button.children.includes('Choose source and target'))!
+        .find((button) => button.props['data-stage'] === 'endpoints')!
         .props.onClick();
       await Promise.resolve();
     });
@@ -1404,6 +2133,74 @@ describe('DataSyncWorkbenchShell', () => {
         .findAllByType('button')
         .find((button) => button.children.includes('Run task'))!.props.disabled,
     ).toBe(false);
+  });
+
+  it('blocks starting from stale evidence while a replacement preflight is running', async () => {
+    const task = { ...buildTask(), lifecycle: 'ready' as const };
+    const baseGateway = createStaticDataSyncWorkbenchGateway({
+      tasks: [task],
+      capabilities: {
+        [task.id]: {
+          level: 'full',
+          canExecute: true,
+          supportsAutoCreate: true,
+          supportsCdc: false,
+        },
+      },
+    });
+    type Snapshot = Awaited<ReturnType<typeof baseGateway.preflightTask>>;
+    let firstSnapshot!: Snapshot;
+    let resolveReplacement!: (snapshot: Snapshot) => void;
+    const replacement = new Promise<Snapshot>((resolve) => {
+      resolveReplacement = resolve;
+    });
+    let replacementRequested = false;
+    const preflightTask = vi.fn(async (submitted: typeof task) => {
+      if (replacementRequested) return replacement;
+      firstSnapshot = await baseGateway.preflightTask(submitted);
+      return firstSnapshot;
+    });
+    const startTask = vi.fn(baseGateway.startTask.bind(baseGateway));
+    const gateway = { ...baseGateway, preflightTask, startTask };
+    const renderer = TestRenderer.create(
+      <DataSyncWorkbenchShell initialTasks={[task]} gateway={gateway} locale="en-US" />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      renderer.root
+        .findAllByType('button')
+        .find((button) => button.children.includes('Run preflight'))!
+        .props.onClick();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(
+      renderer.root
+        .findAllByType('button')
+        .find((button) => button.children.includes('Run task'))!.props.disabled,
+    ).toBe(false);
+
+    replacementRequested = true;
+    act(() => {
+      renderer.root
+        .findAllByType('button')
+        .find((button) => button.children.includes('Run preflight'))!
+        .props.onClick();
+    });
+    const runButton = renderer.root
+      .findAllByType('button')
+      .find((button) => button.children.includes('Run task'))!;
+    expect(runButton.props.disabled).toBe(true);
+    act(() => runButton.props.onClick());
+    expect(startTask).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveReplacement(firstSnapshot);
+      await replacement;
+      await Promise.resolve();
+    });
   });
 
   it('enables checkpoint reset only for a paused task and requires confirmation', async () => {

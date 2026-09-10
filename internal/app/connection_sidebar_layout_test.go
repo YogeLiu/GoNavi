@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -33,6 +34,37 @@ func saveConnectionSidebarLayoutTestConnection(t *testing.T, application *App, i
 	}
 }
 
+func assertConnectionSidebarTagsWithCreatedAt(
+	t *testing.T,
+	got []connection.ConnectionTag,
+	want []connection.ConnectionTag,
+) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("tag count = %d, want %d: %#v", len(got), len(want), got)
+	}
+	comparable := append([]connection.ConnectionTag(nil), got...)
+	for index := range comparable {
+		if comparable[index].CreatedAt <= 0 {
+			t.Fatalf("tag %q has invalid createdAt %d", comparable[index].ID, comparable[index].CreatedAt)
+		}
+		comparable[index].CreatedAt = 0
+	}
+	expected := append([]connection.ConnectionTag(nil), want...)
+	for index := range expected {
+		// Legacy layout candidates are normalized to explicit sort modes on read.
+		if expected[index].SortMode == "" {
+			expected[index].SortMode = "manual"
+		}
+		if expected[index].ConnectionSortMode == "" {
+			expected[index].ConnectionSortMode = "createdAt"
+		}
+	}
+	if !reflect.DeepEqual(comparable, expected) {
+		t.Fatalf("connection tags = %#v, want %#v", comparable, expected)
+	}
+}
+
 func TestBootstrapConnectionSidebarLayoutPersistsFirstNonEmptyCandidate(t *testing.T) {
 	application := newConnectionSidebarLayoutTestApp(t)
 	saveConnectionSidebarLayoutTestConnection(t, application, "conn-dev")
@@ -54,9 +86,7 @@ func TestBootstrapConnectionSidebarLayoutPersistsFirstNonEmptyCandidate(t *testi
 	if !initialized.Initialized || initialized.Revision != 1 {
 		t.Fatalf("initialized state = %+v, want initialized revision 1", initialized)
 	}
-	if !reflect.DeepEqual(initialized.ConnectionTags, candidate.ConnectionTags) {
-		t.Fatalf("connection tags = %#v, want %#v", initialized.ConnectionTags, candidate.ConnectionTags)
-	}
+	assertConnectionSidebarTagsWithCreatedAt(t, initialized.ConnectionTags, candidate.ConnectionTags)
 	if !reflect.DeepEqual(initialized.SidebarRootOrder, candidate.SidebarRootOrder) {
 		t.Fatalf("root order = %#v, want %#v", initialized.SidebarRootOrder, candidate.SidebarRootOrder)
 	}
@@ -90,6 +120,174 @@ func TestBootstrapConnectionSidebarLayoutDoesNotPersistEmptyGroups(t *testing.T)
 	}
 	if _, err := os.Stat(filepath.Join(application.configDir, connectionSidebarLayoutFileName)); !os.IsNotExist(err) {
 		t.Fatalf("empty-group bootstrap created the layout file: %v", err)
+	}
+}
+
+func TestConnectionSidebarLayoutPersistsLegacyTagCreatedAtAndRootConnectionSortMode(t *testing.T) {
+	application := newConnectionSidebarLayoutTestApp(t)
+	layoutPath := filepath.Join(application.configDir, connectionSidebarLayoutFileName)
+	legacy := []byte(`{"version":1,"revision":3,"connectionTags":[{"id":"legacy-tag","name":"Legacy","connectionIds":[]}],"sidebarRootOrder":["tag:legacy-tag"],"rootSortMode":"name"}`)
+	if err := os.WriteFile(layoutPath, legacy, 0o644); err != nil {
+		t.Fatalf("write legacy layout: %v", err)
+	}
+
+	loaded, err := application.LoadConnectionSidebarLayout()
+	if err != nil {
+		t.Fatalf("LoadConnectionSidebarLayout: %v", err)
+	}
+	if loaded.RootSortMode != "manual" || loaded.RootConnectionSortMode != "name" || len(loaded.ConnectionTags) != 1 || loaded.ConnectionTags[0].CreatedAt <= 0 {
+		t.Fatalf("loaded legacy layout = %+v, want manual root sort, name connection sort and migrated timestamp", loaded)
+	}
+
+	persistedBytes, err := os.ReadFile(layoutPath)
+	if err != nil {
+		t.Fatalf("read migrated layout: %v", err)
+	}
+	var persisted connectionSidebarLayoutDiskFile
+	if err := json.Unmarshal(persistedBytes, &persisted); err != nil {
+		t.Fatalf("decode migrated layout: %v", err)
+	}
+	if persisted.RootSortMode != "manual" || persisted.RootConnectionSortMode != "name" || len(persisted.ConnectionTags) != 1 || persisted.ConnectionTags[0].CreatedAt != loaded.ConnectionTags[0].CreatedAt {
+		t.Fatalf("persisted migrated layout = %+v, want manual root sort, connection sort and timestamp", persisted)
+	}
+
+	bootstrapped, err := application.BootstrapConnectionSidebarLayout(connection.ConnectionSidebarLayoutInput{})
+	if err != nil {
+		t.Fatalf("BootstrapConnectionSidebarLayout: %v", err)
+	}
+	if bootstrapped.RootSortMode != "manual" || bootstrapped.RootConnectionSortMode != "name" {
+		t.Fatalf("bootstrap sort modes = root %q, connections %q; want manual/name", bootstrapped.RootSortMode, bootstrapped.RootConnectionSortMode)
+	}
+}
+
+func TestLoadConnectionSidebarLayoutMissingIsReadOnly(t *testing.T) {
+	application := newConnectionSidebarLayoutTestApp(t)
+	saveConnectionSidebarLayoutTestConnection(t, application, "conn-local")
+	layoutPath := filepath.Join(application.configDir, connectionSidebarLayoutFileName)
+
+	loaded, err := application.LoadConnectionSidebarLayout()
+	if err != nil {
+		t.Fatalf("LoadConnectionSidebarLayout: %v", err)
+	}
+	if loaded.Initialized || loaded.Revision != 0 || len(loaded.ConnectionTags) != 0 || len(loaded.SidebarRootOrder) != 0 {
+		t.Fatalf("missing layout load = %+v, want uninitialized empty state", loaded)
+	}
+	if _, err := os.Stat(layoutPath); !os.IsNotExist(err) {
+		t.Fatalf("read-only load created the layout file: %v", err)
+	}
+}
+
+func TestLoadConnectionSidebarLayoutRefreshesAnotherInstanceAndPreservesCAS(t *testing.T) {
+	configDir := t.TempDir()
+	instanceA := NewAppWithSecretStore(secretstore.NewUnavailableStore("test-a"))
+	instanceA.configDir = configDir
+	instanceB := NewAppWithSecretStore(secretstore.NewUnavailableStore("test-b"))
+	instanceB.configDir = configDir
+	saveConnectionSidebarLayoutTestConnection(t, instanceA, "conn-shared")
+
+	initial, err := instanceA.BootstrapConnectionSidebarLayout(connection.ConnectionSidebarLayoutInput{
+		ConnectionTags: []connection.ConnectionTag{{
+			ID:            "tag-shared",
+			Name:          "Initial",
+			ConnectionIDs: []string{"conn-shared"},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("instance A bootstrap: %v", err)
+	}
+	updated, err := instanceB.SaveConnectionSidebarLayout(connection.SaveConnectionSidebarLayoutInput{
+		ExpectedRevision: initial.Revision,
+		Layout: connection.ConnectionSidebarLayoutInput{
+			ConnectionTags: []connection.ConnectionTag{{
+				ID:            "tag-shared",
+				Name:          "Updated by B",
+				ConnectionIDs: []string{"conn-shared"},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("instance B save: %v", err)
+	}
+	if updated.Conflict {
+		t.Fatalf("instance B save unexpectedly conflicted: %+v", updated)
+	}
+
+	loaded, err := instanceA.LoadConnectionSidebarLayout()
+	if err != nil {
+		t.Fatalf("instance A refresh: %v", err)
+	}
+	if !reflect.DeepEqual(loaded, updated.Layout) {
+		t.Fatalf("instance A refreshed layout = %+v, want instance B authority %+v", loaded, updated.Layout)
+	}
+
+	resaved, err := instanceA.SaveConnectionSidebarLayout(connection.SaveConnectionSidebarLayoutInput{
+		ExpectedRevision: loaded.Revision,
+		Layout: connection.ConnectionSidebarLayoutInput{
+			ConnectionTags:   loaded.ConnectionTags,
+			SidebarRootOrder: loaded.SidebarRootOrder,
+		},
+	})
+	if err != nil {
+		t.Fatalf("instance A save after refresh: %v", err)
+	}
+	if resaved.Conflict || resaved.Layout.Revision != loaded.Revision+1 {
+		t.Fatalf("instance A save after refresh = %+v, want successful next revision", resaved)
+	}
+}
+
+func TestLoadConnectionSidebarLayoutNormalizesWithoutWriting(t *testing.T) {
+	application := newConnectionSidebarLayoutTestApp(t)
+	saveConnectionSidebarLayoutTestConnection(t, application, "conn-a")
+	saveConnectionSidebarLayoutTestConnection(t, application, "conn-b")
+	initial, err := application.BootstrapConnectionSidebarLayout(connection.ConnectionSidebarLayoutInput{
+		ConnectionTags: []connection.ConnectionTag{{
+			ID:            "tag-b",
+			Name:          "B",
+			ConnectionIDs: []string{"conn-b"},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("bootstrap initial layout: %v", err)
+	}
+	if err := application.DeleteConnection("conn-b"); err != nil {
+		t.Fatalf("delete grouped connection: %v", err)
+	}
+	layoutPath := filepath.Join(application.configDir, connectionSidebarLayoutFileName)
+	before, err := os.ReadFile(layoutPath)
+	if err != nil {
+		t.Fatalf("read layout before refresh: %v", err)
+	}
+
+	loaded, err := application.LoadConnectionSidebarLayout()
+	if err != nil {
+		t.Fatalf("load normalized layout: %v", err)
+	}
+	if loaded.Revision != initial.Revision {
+		t.Fatalf("read-only normalization revision = %d, want %d", loaded.Revision, initial.Revision)
+	}
+	if len(loaded.ConnectionTags) != 1 || len(loaded.ConnectionTags[0].ConnectionIDs) != 0 {
+		t.Fatalf("read-only normalization retained deleted host: %+v", loaded)
+	}
+	after, err := os.ReadFile(layoutPath)
+	if err != nil {
+		t.Fatalf("read layout after refresh: %v", err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatalf("read-only normalization changed layout bytes: before=%q after=%q", before, after)
+	}
+
+	saved, err := application.SaveConnectionSidebarLayout(connection.SaveConnectionSidebarLayoutInput{
+		ExpectedRevision: loaded.Revision,
+		Layout: connection.ConnectionSidebarLayoutInput{
+			ConnectionTags:   loaded.ConnectionTags,
+			SidebarRootOrder: loaded.SidebarRootOrder,
+		},
+	})
+	if err != nil {
+		t.Fatalf("save normalized view: %v", err)
+	}
+	if saved.Conflict || saved.Layout.Revision != loaded.Revision+1 {
+		t.Fatalf("save normalized view = %+v, want successful next revision", saved)
 	}
 }
 
@@ -405,9 +603,7 @@ func TestBootstrapConnectionSidebarLayoutNormalizesAgainstSavedConnections(t *te
 			ChildOrder:    []string{"connection:conn-b"},
 		},
 	}
-	if !reflect.DeepEqual(got.ConnectionTags, wantTags) {
-		t.Fatalf("normalized tags = %#v, want %#v", got.ConnectionTags, wantTags)
-	}
+	assertConnectionSidebarTagsWithCreatedAt(t, got.ConnectionTags, wantTags)
 	wantRootOrder := []string{"tag:tag-a", "tag:tag-b"}
 	if !reflect.DeepEqual(got.SidebarRootOrder, wantRootOrder) {
 		t.Fatalf("normalized root order = %#v, want %#v", got.SidebarRootOrder, wantRootOrder)
@@ -454,9 +650,7 @@ func TestBootstrapConnectionSidebarLayoutRepairsHierarchyAndCompletesOrders(t *t
 		{ID: "cycle-a", Name: "Cycle A", ConnectionIDs: []string{}, ChildOrder: []string{}},
 		{ID: "cycle-b", Name: "Cycle B", ConnectionIDs: []string{}, ChildOrder: []string{}},
 	}
-	if !reflect.DeepEqual(got.ConnectionTags, wantTags) {
-		t.Fatalf("repaired tags = %#v, want %#v", got.ConnectionTags, wantTags)
-	}
+	assertConnectionSidebarTagsWithCreatedAt(t, got.ConnectionTags, wantTags)
 	wantRootOrder := []string{
 		"tag:parent",
 		"tag:missing-parent",
@@ -548,7 +742,7 @@ func TestConnectionSidebarLayoutFutureVersionReturnsErrorWithoutOverwrite(t *tes
 		t.Run(operation.name, func(t *testing.T) {
 			application := newConnectionSidebarLayoutTestApp(t)
 			layoutPath := filepath.Join(application.configDir, connectionSidebarLayoutFileName)
-			future := []byte(`{"version":2,"revision":1,"connectionTags":[],"sidebarRootOrder":[]}`)
+			future := []byte(fmt.Sprintf(`{"version":%d,"revision":1,"connectionTags":[],"sidebarRootOrder":[]}`, connectionSidebarLayoutFormatVersion+1))
 			if err := os.WriteFile(layoutPath, future, 0o644); err != nil {
 				t.Fatalf("write future layout: %v", err)
 			}
@@ -692,14 +886,12 @@ func TestBootstrapConnectionSidebarLayoutSharesFirstNonEmptyCandidateAcrossAppIn
 	if !shared.Initialized || shared.Revision != 1 {
 		t.Fatalf("instance B initialized layout = %+v, want revision 1", shared)
 	}
-	if !reflect.DeepEqual(shared.ConnectionTags, []connection.ConnectionTag{{
+	assertConnectionSidebarTagsWithCreatedAt(t, shared.ConnectionTags, []connection.ConnectionTag{{
 		ID:            "tag-shared",
 		Name:          "Shared",
 		ConnectionIDs: []string{"conn-shared"},
 		ChildOrder:    []string{"connection:conn-shared"},
-	}}) {
-		t.Fatalf("instance B shared groups = %#v", shared.ConnectionTags)
-	}
+	}})
 
 	reloaded, err := instanceA.BootstrapConnectionSidebarLayout(connection.ConnectionSidebarLayoutInput{})
 	if err != nil {
@@ -833,6 +1025,41 @@ func TestConnectionSidebarLayoutWaitsForSharedStorageLock(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("bootstrap did not acquire shared lock after external release")
+	}
+}
+
+func TestLoadConnectionSidebarLayoutWaitsForSharedStorageLock(t *testing.T) {
+	application := newConnectionSidebarLayoutTestApp(t)
+	if _, err := application.BootstrapConnectionSidebarLayout(connection.ConnectionSidebarLayoutInput{
+		ConnectionTags: []connection.ConnectionTag{{ID: "tag-load-lock", Name: "Load lock"}},
+	}); err != nil {
+		t.Fatalf("bootstrap layout: %v", err)
+	}
+	sharedLock, err := appdata.AcquireFileLock(appdata.SharedStorageLockPath(application.configDir))
+	if err != nil {
+		t.Fatalf("acquire shared storage lock: %v", err)
+	}
+
+	finished := make(chan error, 1)
+	go func() {
+		_, loadErr := application.LoadConnectionSidebarLayout()
+		finished <- loadErr
+	}()
+	select {
+	case err := <-finished:
+		t.Fatalf("load acquired shared lock before external release: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := sharedLock.Close(); err != nil {
+		t.Fatalf("release shared storage lock: %v", err)
+	}
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatalf("load after shared lock release: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("load did not acquire shared lock after external release")
 	}
 }
 

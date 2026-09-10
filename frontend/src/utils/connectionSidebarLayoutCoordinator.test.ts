@@ -123,6 +123,204 @@ describe('connection sidebar layout coordinator', () => {
     coordinator.dispose();
   });
 
+  it('adopts a layout initialized by another app instance after this instance bootstraps empty', async () => {
+    vi.useFakeTimers();
+    const store = createLayoutStore(emptyLayout);
+    const backend = {
+      BootstrapConnectionSidebarLayout: vi.fn(async () => ({
+        initialized: false,
+        revision: 0,
+        ...emptyLayout,
+      })),
+      LoadConnectionSidebarLayout: vi.fn(async () => cloneLayout(remoteLayout)),
+      SaveConnectionSidebarLayout: vi.fn(),
+    };
+    const coordinatorArgs = {
+      backend,
+      store: store.adapter,
+      refreshIntervalMs: 1_000,
+    };
+    const coordinator = createConnectionSidebarLayoutCoordinator(coordinatorArgs);
+
+    await coordinator.bootstrap();
+    expect(store.read()).toEqual(emptyLayout);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(backend.BootstrapConnectionSidebarLayout).toHaveBeenCalledTimes(1);
+    expect(backend.LoadConnectionSidebarLayout).toHaveBeenCalledTimes(1);
+    expect(store.read()).toEqual({
+      connectionTags: remoteLayout.connectionTags,
+      sidebarRootOrder: remoteLayout.sidebarRootOrder,
+    });
+    coordinator.dispose();
+  });
+
+  it('adopts a newer revision saved by another app instance without echo-saving it', async () => {
+    vi.useFakeTimers();
+    const store = createLayoutStore(emptyLayout);
+    const updatedRemoteLayout: ConnectionSidebarLayout = {
+      ...remoteLayout,
+      revision: 8,
+      connectionTags: [{ ...remoteLayout.connectionTags[0], name: '另一实例更新' }],
+    };
+    const backend = {
+      BootstrapConnectionSidebarLayout: vi.fn(async () => cloneLayout(remoteLayout)),
+      LoadConnectionSidebarLayout: vi.fn(async () => cloneLayout(updatedRemoteLayout)),
+      SaveConnectionSidebarLayout: vi.fn(),
+    };
+    const coordinator = createConnectionSidebarLayoutCoordinator({
+      backend,
+      store: store.adapter,
+      refreshIntervalMs: 1_000,
+    });
+
+    await coordinator.bootstrap();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(store.read()).toEqual({
+      connectionTags: updatedRemoteLayout.connectionTags,
+      sidebarRootOrder: updatedRemoteLayout.sidebarRootOrder,
+    });
+    expect(backend.SaveConnectionSidebarLayout).not.toHaveBeenCalled();
+    coordinator.dispose();
+  });
+
+  it('keeps a pending local edit recoverable until the user accepts the remote layout', async () => {
+    vi.useFakeTimers();
+    const store = createLayoutStore(emptyLayout);
+    const onSaveStateChange = vi.fn();
+    const concurrentRemoteLayout: ConnectionSidebarLayout = {
+      ...remoteLayout,
+      revision: 8,
+      connectionTags: [{ ...remoteLayout.connectionTags[0], name: '远端修改' }],
+    };
+    const backend = {
+      BootstrapConnectionSidebarLayout: vi.fn(async () => cloneLayout(remoteLayout)),
+      LoadConnectionSidebarLayout: vi.fn(async () => cloneLayout(concurrentRemoteLayout)),
+      SaveConnectionSidebarLayout: vi.fn(async () => ({
+        conflict: true,
+        layout: cloneLayout(concurrentRemoteLayout),
+      })),
+    };
+    const coordinator = createConnectionSidebarLayoutCoordinator({
+      backend,
+      store: store.adapter,
+      debounceMs: 160,
+      onSaveStateChange,
+    });
+    await coordinator.bootstrap();
+
+    const localEdit: ConnectionSidebarLayoutInput = {
+      connectionTags: [{ ...remoteLayout.connectionTags[0], name: '本地修改' }],
+      sidebarRootOrder: remoteLayout.sidebarRootOrder,
+    };
+    store.update(localEdit);
+    await coordinator.refresh();
+    expect(store.read()).toEqual(localEdit);
+
+    await vi.advanceTimersByTimeAsync(160);
+
+    expect(backend.SaveConnectionSidebarLayout).toHaveBeenCalledWith({
+      expectedRevision: 7,
+      layout: localEdit,
+    });
+    expect(store.read()).toEqual(localEdit);
+    expect(onSaveStateChange).toHaveBeenLastCalledWith({
+      status: 'conflict',
+      localLayout: localEdit,
+      remoteLayout: concurrentRemoteLayout,
+    });
+    await expect(coordinator.flush()).rejects.toThrow('unresolved revision conflict');
+    expect(store.read()).toEqual(localEdit);
+
+    coordinator.acceptRemoteLayout();
+    expect(store.read()).toEqual({
+      connectionTags: concurrentRemoteLayout.connectionTags,
+      sidebarRootOrder: concurrentRemoteLayout.sidebarRootOrder,
+    });
+    coordinator.dispose();
+  });
+
+  it('ignores a stale refresh response that arrives after a newer local save succeeds', async () => {
+    vi.useFakeTimers();
+    const store = createLayoutStore(emptyLayout);
+    let resolveRefresh!: (layout: ConnectionSidebarLayout) => void;
+    const refreshResult = new Promise<ConnectionSidebarLayout>((resolve) => {
+      resolveRefresh = resolve;
+    });
+    const backend = {
+      BootstrapConnectionSidebarLayout: vi.fn(async () => cloneLayout(remoteLayout)),
+      LoadConnectionSidebarLayout: vi.fn(() => refreshResult),
+      SaveConnectionSidebarLayout: vi.fn(async (input) => ({
+        conflict: false,
+        layout: {
+          initialized: true,
+          revision: 8,
+          ...cloneLayout(input.layout),
+        },
+      })),
+    };
+    const coordinator = createConnectionSidebarLayoutCoordinator({
+      backend,
+      store: store.adapter,
+      debounceMs: 160,
+    });
+    await coordinator.bootstrap();
+
+    const refreshPromise = coordinator.refresh();
+    const localEdit: ConnectionSidebarLayoutInput = {
+      connectionTags: [{ ...remoteLayout.connectionTags[0], name: '已保存的新布局' }],
+      sidebarRootOrder: remoteLayout.sidebarRootOrder,
+    };
+    store.update(localEdit);
+    await vi.advanceTimersByTimeAsync(160);
+    expect(backend.SaveConnectionSidebarLayout).toHaveBeenCalledTimes(1);
+
+    resolveRefresh(cloneLayout(remoteLayout));
+    await refreshPromise;
+
+    expect(store.read()).toEqual(localEdit);
+    coordinator.dispose();
+  });
+
+  it('retries a failed background refresh and applies the next successful result', async () => {
+    vi.useFakeTimers();
+    const store = createLayoutStore(emptyLayout);
+    const onError = vi.fn();
+    const backend = {
+      BootstrapConnectionSidebarLayout: vi.fn(async () => ({
+        initialized: false,
+        revision: 0,
+        ...emptyLayout,
+      })),
+      LoadConnectionSidebarLayout: vi
+        .fn()
+        .mockRejectedValueOnce(new Error('layout temporarily locked'))
+        .mockResolvedValue(cloneLayout(remoteLayout)),
+      SaveConnectionSidebarLayout: vi.fn(),
+    };
+    const coordinator = createConnectionSidebarLayoutCoordinator({
+      backend,
+      store: store.adapter,
+      refreshIntervalMs: 1_000,
+      onError,
+    });
+    await coordinator.bootstrap();
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(store.read()).toEqual(emptyLayout);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(backend.LoadConnectionSidebarLayout).toHaveBeenCalledTimes(2);
+    expect(store.read()).toEqual({
+      connectionTags: remoteLayout.connectionTags,
+      sidebarRootOrder: remoteLayout.sidebarRootOrder,
+    });
+    coordinator.dispose();
+  });
+
   it('offers a non-empty legacy local layout as the atomic bootstrap candidate', async () => {
     const candidate: ConnectionSidebarLayoutInput = {
       connectionTags: remoteLayout.connectionTags,
@@ -194,6 +392,7 @@ describe('connection sidebar layout coordinator', () => {
 
   it('coalesces changes made during an in-flight save and reuses the returned revision', async () => {
     vi.useFakeTimers();
+    const onSaveStateChange = vi.fn();
     const store = createLayoutStore({
       connectionTags: remoteLayout.connectionTags,
       sidebarRootOrder: remoteLayout.sidebarRootOrder,
@@ -227,6 +426,7 @@ describe('connection sidebar layout coordinator', () => {
       backend,
       store: store.adapter,
       debounceMs: 160,
+      onSaveStateChange,
     });
     await coordinator.bootstrap();
 
@@ -261,15 +461,21 @@ describe('connection sidebar layout coordinator', () => {
       expectedRevision: 8,
       layout: latestChange,
     });
+    expect(
+      onSaveStateChange.mock.calls
+        .map(([state]) => state)
+        .filter((state) => state.status === 'saved'),
+    ).toEqual([{ status: 'saved', revision: 9 }]);
     coordinator.dispose();
   });
 
-  it('applies the authoritative backend layout on conflict without echo-saving it', async () => {
+  it('retries the current local layout against the latest revision after a conflict', async () => {
     vi.useFakeTimers();
     const store = createLayoutStore({
       connectionTags: remoteLayout.connectionTags,
       sidebarRootOrder: remoteLayout.sidebarRootOrder,
     });
+    const onSaveStateChange = vi.fn();
     const concurrentLayout: ConnectionSidebarLayout = {
       initialized: true,
       revision: 8,
@@ -278,30 +484,65 @@ describe('connection sidebar layout coordinator', () => {
     };
     const backend = {
       BootstrapConnectionSidebarLayout: vi.fn(async () => cloneLayout(remoteLayout)),
-      SaveConnectionSidebarLayout: vi.fn(async () => ({
-        conflict: true,
-        layout: cloneLayout(concurrentLayout),
-      })),
+      SaveConnectionSidebarLayout: vi
+        .fn()
+        .mockResolvedValueOnce({
+          conflict: true,
+          layout: cloneLayout(concurrentLayout),
+        })
+        .mockImplementationOnce(async (input) => ({
+          conflict: false,
+          layout: {
+            initialized: true,
+            revision: 9,
+            ...cloneLayout(input.layout),
+          },
+        })),
     };
     const coordinator = createConnectionSidebarLayoutCoordinator({
       backend,
       store: store.adapter,
       debounceMs: 160,
+      onSaveStateChange,
     });
     await coordinator.bootstrap();
 
-    store.update({
+    const localLayout: ConnectionSidebarLayoutInput = {
       connectionTags: [{ ...remoteLayout.connectionTags[0], name: '本实例' }],
       sidebarRootOrder: remoteLayout.sidebarRootOrder,
-    });
+    };
+    store.update(localLayout);
     await vi.advanceTimersByTimeAsync(160);
     await vi.advanceTimersByTimeAsync(500);
 
-    expect(store.read()).toEqual({
-      connectionTags: concurrentLayout.connectionTags,
-      sidebarRootOrder: concurrentLayout.sidebarRootOrder,
-    });
+    expect(store.read()).toEqual(localLayout);
     expect(backend.SaveConnectionSidebarLayout).toHaveBeenCalledTimes(1);
+    expect(onSaveStateChange).toHaveBeenLastCalledWith({
+      status: 'conflict',
+      localLayout,
+      remoteLayout: concurrentLayout,
+    });
+
+    const latestLocalLayout: ConnectionSidebarLayoutInput = {
+      connectionTags: [{ ...remoteLayout.connectionTags[0], name: '本实例继续修改' }],
+      sidebarRootOrder: remoteLayout.sidebarRootOrder,
+    };
+    store.update(latestLocalLayout);
+    await vi.advanceTimersByTimeAsync(160);
+    expect(backend.SaveConnectionSidebarLayout).toHaveBeenCalledTimes(1);
+
+    await coordinator.retryPendingSave();
+
+    expect(backend.SaveConnectionSidebarLayout).toHaveBeenCalledTimes(2);
+    expect(backend.SaveConnectionSidebarLayout).toHaveBeenLastCalledWith({
+      expectedRevision: 8,
+      layout: latestLocalLayout,
+    });
+    expect(onSaveStateChange).toHaveBeenLastCalledWith({
+      status: 'saved',
+      revision: 9,
+    });
+    expect(store.read()).toEqual(latestLocalLayout);
     coordinator.dispose();
   });
 
@@ -372,6 +613,7 @@ describe('connection sidebar layout coordinator', () => {
       rejectFirstSave = reject;
     });
     const onError = vi.fn();
+    const onSaveStateChange = vi.fn();
     const backend = {
       BootstrapConnectionSidebarLayout: vi.fn(async () => cloneLayout(remoteLayout)),
       SaveConnectionSidebarLayout: vi
@@ -391,6 +633,7 @@ describe('connection sidebar layout coordinator', () => {
       store: store.adapter,
       debounceMs: 160,
       onError,
+      onSaveStateChange,
     });
     await coordinator.bootstrap();
 
@@ -411,13 +654,21 @@ describe('connection sidebar layout coordinator', () => {
     rejectFirstSave(new Error('disk temporarily busy'));
     await vi.runAllTimersAsync();
     expect(onError).toHaveBeenCalledTimes(1);
+    expect(onSaveStateChange).toHaveBeenLastCalledWith({
+      status: 'error',
+      error: expect.objectContaining({ message: 'disk temporarily busy' }),
+    });
     expect(backend.SaveConnectionSidebarLayout).toHaveBeenCalledTimes(1);
 
-    await coordinator.flush();
+    await coordinator.retryPendingSave();
     expect(backend.SaveConnectionSidebarLayout).toHaveBeenCalledTimes(2);
     expect(backend.SaveConnectionSidebarLayout).toHaveBeenLastCalledWith({
       expectedRevision: 7,
       layout: latestChange,
+    });
+    expect(onSaveStateChange).toHaveBeenLastCalledWith({
+      status: 'saved',
+      revision: 8,
     });
     coordinator.dispose();
   });

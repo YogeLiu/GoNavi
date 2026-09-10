@@ -1,7 +1,8 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo } from 'react';
 import { act, create } from 'react-test-renderer';
 import { describe, expect, it, vi } from 'vitest';
 
+import { t } from '../../i18n';
 import { useSidebarTitleRender } from './useSidebarTitleRender';
 
 const TitleRenderProbe = ({
@@ -12,25 +13,19 @@ const TitleRenderProbe = ({
   revision: number;
   onTitleRender: (titleRender: (node: any) => React.ReactNode) => void;
   onAddDirectory: (revision: number, node: any) => void;
+
 }) => {
-  const [, setIsTreeDragging] = useState(false);
-  const treeDragSelectSuppressUntilRef = useRef(0);
   const connectionStates = useMemo(() => ({}), []);
-  const renderV2TreeTitle = useCallback((node: any) => <span>{node.title}</span>, []);
-  const snapshotTreeSelectionBeforeDrag = useCallback(() => {}, []);
-  const restoreTreeSelectionAfterDrag = useCallback(() => {}, []);
+  const renderV2TreeTitle = useCallback((_: any, hoverTitle: string) => (
+    <span title={hoverTitle}>{hoverTitle}</span>
+  ), []);
   const handleAddExternalSQLDirectory = useCallback(async (node: any) => {
     onAddDirectory(revision, node);
   }, [onAddDirectory, revision]);
   const titleRender = useSidebarTitleRender({
     connectionStates,
-    isV2Ui: true,
     renderV2TreeTitle,
     handleAddExternalSQLDirectory,
-    snapshotTreeSelectionBeforeDrag,
-    restoreTreeSelectionAfterDrag,
-    treeDragSelectSuppressUntilRef,
-    setIsTreeDragging,
   });
 
   useEffect(() => {
@@ -84,5 +79,30 @@ describe('useSidebarTitleRender', () => {
     });
 
     expect(onAddDirectory).toHaveBeenCalledWith(2, expect.objectContaining({ key: 'external-sql-root' }));
+  });
+
+  it('localizes the saved queries folder in the current sidebar renderer', () => {
+    const onTitleRender = vi.fn();
+
+    act(() => {
+      create(
+        <TitleRenderProbe
+          revision={1}
+          onTitleRender={onTitleRender}
+          onAddDirectory={vi.fn()}
+
+        />,
+      );
+    });
+
+    const titleRender = onTitleRender.mock.lastCall?.[0] as (node: any) => React.ReactElement;
+    const title = titleRender({
+      key: 'saved-queries',
+      title: 'stale bundle-local title',
+      type: 'queries-folder',
+    });
+
+    expect(title.props.title).toBe(t('sidebar.tree.saved_queries'));
+    expect(React.Children.toArray(title.props.children)).toContain(t('sidebar.tree.saved_queries'));
   });
 });

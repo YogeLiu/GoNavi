@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	aiservice "GoNavi-Wails/internal/ai/service"
@@ -30,7 +31,22 @@ const (
 	internalRoutePrefix       = "/__gonavi"
 	detachedWindowIDHeader    = "X-GoNavi-Detached-Window-ID"
 	eventSubscriberQueueLimit = 128
-	eventStreamDataChunkBytes = 256 << 10
+	// Reliable events are allowed bounded headroom over the broadcast queue so
+	// a critical targeted event can still be delivered after broadcasts fill
+	// the soft limit. A subscriber that remains slower than this hard limit is
+	// closed and must reconnect instead of retaining an unbounded queue.
+	eventSubscriberReliableQueueLimit = eventSubscriberQueueLimit * 2
+	eventStreamDataChunkBytes         = 256 << 10
+)
+
+// Shutdown deadlines are package variables so tests can shorten them.
+var (
+	// shutdownGraceTimeout bounds the graceful phase after the listener is
+	// closed: in-flight handlers may still finish normally within this window.
+	shutdownGraceTimeout = 5 * time.Second
+	// shutdownDrainTimeout bounds how long force-cancelled handlers may take
+	// to unwind before the deferred App resource teardown starts.
+	shutdownDrainTimeout = 5 * time.Second
 )
 
 var errorType = reflect.TypeOf((*error)(nil)).Elem()
@@ -77,31 +93,6 @@ var desktopOnlyAppMethods = map[string]struct{}{
 	"SelectCertificateFile":         {},
 	"SelectDatabaseFile":            {},
 	"ImportData":                    {},
-	"ImportDatabaseSQL":             {},
-	"PreviewImportFile":             {},
-	"PreviewImportFileWithOptions":  {},
-	"ImportDataWithProgress":        {},
-	"ImportDataWithProgressOptions": {},
-	"ListImportJobs":                {},
-	"GetImportJob":                  {},
-	"CancelImportJob":               {},
-	"DeleteImportJob":               {},
-	"ExportImportErrorRows":         {},
-	"ExportTable":                   {},
-	"ExportTableWithOptions":        {},
-	"ExportTablesSQL":               {},
-	"ExportTablesDataSQL":           {},
-	"ExportTablesSQLWithOptions":    {},
-	"ExportDatabaseSQL":             {},
-	"ExportDatabaseSQLWithOptions":  {},
-	"ExportDatabasesSQLWithOptions": {},
-	"ExportSchemaSQL":               {},
-	"ExportSchemaSQLWithOptions":    {},
-	"ExportData":                    {},
-	"ExportDataWithOptions":         {},
-	"ExportQuery":                   {},
-	"ExportQueryWithOptions":        {},
-	"RedisExportKeys":               {},
 	"ExportSQLAuditFile":            {},
 }
 
@@ -172,10 +163,24 @@ func (s *eventSubscriber) enqueue(msg eventMessage, reliable bool) {
 		}
 		return
 	}
-	// AI stream deltas are loss-sensitive. Once one delta is queued, later
-	// deltas for that session coalesce into it; the first delta and terminal
-	// events may therefore exceed the soft broadcast limit by a small amount.
-	if s.closed || (!reliable && !strings.HasPrefix(msg.Name, "ai:stream:") && len(s.queue)-s.head >= eventSubscriberQueueLimit) {
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	queueLen := len(s.queue) - s.head
+	if reliable && queueLen >= eventSubscriberReliableQueueLimit {
+		// Reliable delivery cannot silently drop the event, but retaining it
+		// forever would make a stalled detached window an unbounded memory
+		// sink. Close this stream and release its pending payloads; the child
+		// runtime will reconnect and obtain fresh state.
+		s.closed = true
+		s.queue = nil
+		s.head = 0
+		close(s.done)
+		s.mu.Unlock()
+		return
+	}
+	if !reliable && queueLen >= eventSubscriberQueueLimit {
 		s.mu.Unlock()
 		return
 	}
@@ -192,14 +197,6 @@ func (s *eventSubscriber) coalesceQueuedEventLocked(incoming eventMessage) bool 
 	if s == nil || s.closed {
 		return false
 	}
-	if strings.HasPrefix(incoming.Name, "ai:stream:") {
-		for index := len(s.queue) - 1; index >= s.head; index-- {
-			if s.queue[index].Name == incoming.Name {
-				return mergeQueuedAIStreamEvent(&s.queue[index], incoming)
-			}
-		}
-		return false
-	}
 	key := detachedSyncEventKey(incoming)
 	if key == "" {
 		return false
@@ -211,48 +208,6 @@ func (s *eventSubscriber) coalesceQueuedEventLocked(incoming eventMessage) bool 
 		}
 	}
 	return false
-}
-
-func mergeQueuedAIStreamEvent(existing *eventMessage, incoming eventMessage) bool {
-	if existing == nil || existing.Name != incoming.Name || len(existing.Args) != 1 || len(incoming.Args) != 1 {
-		return false
-	}
-	current, currentOK := existing.Args[0].(map[string]any)
-	next, nextOK := incoming.Args[0].(map[string]any)
-	if !currentOK || !nextOK || aiStreamPayloadIsTerminal(current) || aiStreamPayloadIsTerminal(next) {
-		return false
-	}
-	merged := make(map[string]any, len(current)+len(next))
-	for key, value := range current {
-		merged[key] = value
-	}
-	for key, value := range next {
-		merged[key] = value
-	}
-	for _, key := range []string{"content", "thinking", "reasoning_content"} {
-		merged[key] = stringValue(current[key]) + stringValue(next[key])
-	}
-	existing.Args = []any{merged}
-	return true
-}
-
-func aiStreamPayloadIsTerminal(payload map[string]any) bool {
-	if payload == nil {
-		return true
-	}
-	if done, _ := payload["done"].(bool); done {
-		return true
-	}
-	if strings.TrimSpace(stringValue(payload["error"])) != "" {
-		return true
-	}
-	toolCalls := reflect.ValueOf(payload["tool_calls"])
-	return toolCalls.IsValid() && (toolCalls.Kind() == reflect.Array || toolCalls.Kind() == reflect.Slice) && toolCalls.Len() > 0
-}
-
-func stringValue(value any) string {
-	text, _ := value.(string)
-	return text
 }
 
 func detachedSyncEventKey(msg eventMessage) string {
@@ -318,6 +273,8 @@ func (s *eventSubscriber) close() {
 		return
 	}
 	s.closed = true
+	s.queue = nil
+	s.head = 0
 	close(s.done)
 	s.mu.Unlock()
 }
@@ -379,11 +336,12 @@ func (h *eventHub) unsubscribe(subscriber *eventSubscriber) {
 
 type methodInvoker struct {
 	targets             map[string]reflect.Value
+	contextHandlers     map[string]map[string]reflect.Value
 	allowDesktopMethods bool
 }
 
-func newMethodInvoker(app *appcore.App, ai *aiservice.Service) *methodInvoker {
-	return &methodInvoker{
+func newMethodInvoker(app *appcore.App, ai *aiservice.Service) (*methodInvoker, error) {
+	invoker := &methodInvoker{
 		targets: map[string]reflect.Value{
 			"app.app":           reflect.ValueOf(app),
 			"app":               reflect.ValueOf(app),
@@ -391,9 +349,98 @@ func newMethodInvoker(app *appcore.App, ai *aiservice.Service) *methodInvoker {
 			"aiservice":         reflect.ValueOf(ai),
 		},
 	}
+	appHandlers, err := validateContextHandlers(
+		reflect.ValueOf(app),
+		appcore.RequiredIssue1098WebRPCContextMethods(),
+		appcore.WebRPCContextHandlers(app),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("validate App Web RPC context handlers: %w", err)
+	}
+	invoker.contextHandlers = map[string]map[string]reflect.Value{"app": appHandlers}
+	return invoker, nil
 }
 
-func (i *methodInvoker) Invoke(req invokeRequest) (any, error) {
+func validateContextHandlers(target reflect.Value, required []string, handlers map[string]any) (map[string]reflect.Value, error) {
+	if !target.IsValid() || (target.Kind() == reflect.Pointer && target.IsNil()) {
+		return nil, fmt.Errorf("context handler target is unavailable")
+	}
+	requiredSet := make(map[string]struct{}, len(required))
+	for _, methodName := range required {
+		methodName = strings.TrimSpace(methodName)
+		if methodName == "" {
+			return nil, fmt.Errorf("required context method name is empty")
+		}
+		if _, exists := requiredSet[methodName]; exists {
+			return nil, fmt.Errorf("required context method %s is duplicated", methodName)
+		}
+		requiredSet[methodName] = struct{}{}
+	}
+	if len(handlers) != len(requiredSet) {
+		return nil, fmt.Errorf("context handler count mismatch: want %d got %d", len(requiredSet), len(handlers))
+	}
+
+	contextType := reflect.TypeOf((*context.Context)(nil)).Elem()
+	validated := make(map[string]reflect.Value, len(handlers))
+	for methodName, rawHandler := range handlers {
+		if _, required := requiredSet[methodName]; !required {
+			return nil, fmt.Errorf("context handler %s is not in the required method set", methodName)
+		}
+		publicMethod := target.MethodByName(methodName)
+		if !publicMethod.IsValid() {
+			return nil, fmt.Errorf("public method %s does not exist", methodName)
+		}
+		publicType := publicMethod.Type()
+		if publicType.IsVariadic() {
+			return nil, fmt.Errorf("public method %s must not be variadic", methodName)
+		}
+
+		handler := reflect.ValueOf(rawHandler)
+		if !handler.IsValid() || handler.Kind() != reflect.Func || handler.IsNil() {
+			return nil, fmt.Errorf("context handler %s must be a non-nil function", methodName)
+		}
+		handlerType := handler.Type()
+		if handlerType.IsVariadic() {
+			return nil, fmt.Errorf("context handler %s must not be variadic", methodName)
+		}
+		if handlerType.NumIn() != publicType.NumIn()+1 || handlerType.In(0) != contextType {
+			return nil, fmt.Errorf("context handler %s has an invalid parameter list", methodName)
+		}
+		for index := 0; index < publicType.NumIn(); index++ {
+			if handlerType.In(index+1) != publicType.In(index) {
+				return nil, fmt.Errorf("context handler %s parameter %d type mismatch", methodName, index)
+			}
+		}
+		if handlerType.NumOut() != publicType.NumOut() {
+			return nil, fmt.Errorf("context handler %s return count mismatch", methodName)
+		}
+		for index := 0; index < publicType.NumOut(); index++ {
+			if handlerType.Out(index) != publicType.Out(index) {
+				return nil, fmt.Errorf("context handler %s return %d type mismatch", methodName, index)
+			}
+		}
+		validated[methodName] = handler
+	}
+	for methodName := range requiredSet {
+		if _, exists := validated[methodName]; !exists {
+			return nil, fmt.Errorf("required context handler %s is missing", methodName)
+		}
+	}
+	return validated, nil
+}
+
+func canonicalInvokeTarget(key string) string {
+	switch key {
+	case "app", "app.app":
+		return "app"
+	case "aiservice", "aiservice.service":
+		return "aiservice"
+	default:
+		return key
+	}
+}
+
+func (i *methodInvoker) Invoke(ctx context.Context, req invokeRequest) (any, error) {
 	if i == nil {
 		return nil, fmt.Errorf("web invoker is not initialized")
 	}
@@ -436,6 +483,24 @@ func (i *methodInvoker) Invoke(req invokeRequest) (any, error) {
 			return nil, fmt.Errorf("decode argument %d for %s failed: %w", index, methodName, err)
 		}
 		callArgs = append(callArgs, argValue)
+	}
+
+	canonicalTarget := canonicalInvokeTarget(key)
+	handler := reflect.Value{}
+	if handlers := i.contextHandlers[canonicalTarget]; handlers != nil {
+		handler = handlers[methodName]
+	}
+	if handler.IsValid() {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		contextCallArgs := make([]reflect.Value, 0, len(callArgs)+1)
+		contextCallArgs = append(contextCallArgs, reflect.ValueOf(ctx))
+		contextCallArgs = append(contextCallArgs, callArgs...)
+		return unpackResults(handler.Call(contextCallArgs))
 	}
 
 	results := method.Call(callArgs)
@@ -489,6 +554,89 @@ func unpackResults(results []reflect.Value) (any, error) {
 	}
 }
 
+// requestTracker counts in-flight HTTP handlers so Server.runHTTP can keep the
+// deferred App resource teardown ordered after the last handler has returned.
+type requestTracker struct {
+	mu      sync.Mutex
+	count   int
+	drained chan struct{}
+}
+
+func newRequestTracker() *requestTracker {
+	drained := make(chan struct{})
+	close(drained)
+	return &requestTracker{drained: drained}
+}
+
+func (t *requestTracker) begin() {
+	t.mu.Lock()
+	if t.count == 0 {
+		t.drained = make(chan struct{})
+	}
+	t.count++
+	t.mu.Unlock()
+}
+
+func (t *requestTracker) done() {
+	t.mu.Lock()
+	t.count--
+	if t.count == 0 {
+		close(t.drained)
+	}
+	t.mu.Unlock()
+}
+
+func (t *requestTracker) active() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.count
+}
+
+// wait blocks until every in-flight handler has returned or ctx expires and
+// reports how many handlers were still running. The re-check loop matters
+// because a handler can still begin after http.Server.Shutdown for a request
+// that was already being read, so a drained signal must never be trusted
+// without re-reading the counter.
+func (t *requestTracker) wait(ctx context.Context) int {
+	for {
+		t.mu.Lock()
+		count := t.count
+		drained := t.drained
+		t.mu.Unlock()
+		if count == 0 {
+			return 0
+		}
+		select {
+		case <-drained:
+		case <-ctx.Done():
+			return t.active()
+		}
+	}
+}
+
+func (t *requestTracker) waitDrain(timeout time.Duration) int {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return t.wait(ctx)
+}
+
+// withRequestLifecycle tracks each request as in-flight and derives its
+// context from the request's own context (so client disconnects still cancel
+// long-lived streams) while linking server-level cancellation into it, so a
+// shutdown can force handlers to unwind through r.Context() even when
+// http.Server.Shutdown no longer waits for them.
+func withRequestLifecycle(serveCtx context.Context, tracker *requestTracker, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+		stopServerCancel := context.AfterFunc(serveCtx, cancel)
+		defer stopServerCancel()
+		tracker.begin()
+		defer tracker.done()
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
 type Server struct {
 	options       Options
 	assets        fs.FS
@@ -498,6 +646,9 @@ type Server struct {
 	events        *eventHub
 	invoker       *methodInvoker
 	auditHeavySem chan struct{}
+	// boundAddr records the actual listener address once runHTTP has bound
+	// the socket, which is observable by tests when Addr uses port zero.
+	boundAddr atomic.Value
 }
 
 // SharedRuntimeOptions configures the authenticated loopback runtime used by
@@ -529,9 +680,9 @@ func NewSharedRuntime(assetFS fs.FS, app *appcore.App, ai *aiservice.Service, op
 	if app == nil || ai == nil {
 		return nil, fmt.Errorf("shared App and AI service are required")
 	}
-	frontendFS, err := fs.Sub(assetFS, "frontend/dist")
+	frontendFS, err := resolveFrontendAssets(assetFS)
 	if err != nil {
-		return nil, fmt.Errorf("resolve frontend dist assets failed: %w", err)
+		return nil, err
 	}
 
 	bridgePath := strings.TrimSpace(options.RuntimeBridgePath)
@@ -540,17 +691,18 @@ func NewSharedRuntime(assetFS fs.FS, app *appcore.App, ai *aiservice.Service, op
 	}
 
 	events := newEventHub()
+	invoker, err := newMethodInvoker(app, ai)
+	if err != nil {
+		return nil, err
+	}
+	invoker.allowDesktopMethods = true
 	shared := &SharedRuntime{
 		server: &Server{
-			assets: frontendFS,
-			app:    app,
-			ai:     ai,
-			events: events,
-			invoker: func() *methodInvoker {
-				invoker := newMethodInvoker(app, ai)
-				invoker.allowDesktopMethods = true
-				return invoker
-			}(),
+			assets:        frontendFS,
+			app:           app,
+			ai:            ai,
+			events:        events,
+			invoker:       invoker,
 			auditHeavySem: make(chan struct{}, 1),
 		},
 		runtimeBridgePath:   bridgePath,
@@ -678,9 +830,9 @@ func New(ctx context.Context, assetFS fs.FS, options Options) (*Server, error) {
 	if assetFS == nil {
 		return nil, fmt.Errorf("web assets are unavailable")
 	}
-	frontendFS, err := fs.Sub(assetFS, "frontend/dist")
+	frontendFS, err := resolveFrontendAssets(assetFS)
 	if err != nil {
-		return nil, fmt.Errorf("resolve frontend dist assets failed: %w", err)
+		return nil, err
 	}
 
 	events := newEventHub()
@@ -690,6 +842,10 @@ func New(ctx context.Context, assetFS fs.FS, options Options) (*Server, error) {
 	appcore.InitializeLifecycle(app, lifecycleCtx)
 	ai := aiservice.NewService()
 	aiservice.InitializeLifecycle(ai, lifecycleCtx)
+	invoker, err := newMethodInvoker(app, ai)
+	if err != nil {
+		return nil, err
+	}
 	auth, err := newWebAuthManagerFromEnvironment("")
 	if err != nil {
 		return nil, fmt.Errorf("initialize web auth failed: %w", err)
@@ -702,9 +858,28 @@ func New(ctx context.Context, assetFS fs.FS, options Options) (*Server, error) {
 		ai:            ai,
 		auth:          auth,
 		events:        events,
-		invoker:       newMethodInvoker(app, ai),
+		invoker:       invoker,
 		auditHeavySem: make(chan struct{}, 1),
 	}, nil
+}
+
+// resolveFrontendAssets accepts both the production ZIP layout, where Vite's
+// output is stored at the FS root, and the development layout, where the
+// project root contains frontend/dist.
+func resolveFrontendAssets(assetFS fs.FS) (fs.FS, error) {
+	if info, err := fs.Stat(assetFS, "index.html"); err == nil {
+		if !info.IsDir() {
+			return assetFS, nil
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("resolve frontend index asset failed: %w", err)
+	}
+
+	frontendFS, err := fs.Sub(assetFS, "frontend/dist")
+	if err != nil {
+		return nil, fmt.Errorf("resolve frontend dist assets failed: %w", err)
+	}
+	return frontendFS, nil
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -714,13 +889,23 @@ func (s *Server) Run(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	return s.runHTTP(ctx, s.routes())
+}
 
-	defer s.ai.Shutdown()
-	defer s.app.Shutdown()
+// runHTTP owns the HTTP server lifecycle. The deferred resource teardown must
+// only start once every in-flight handler has returned or was explicitly
+// cancelled, otherwise live requests race closed databases and already
+// shut-down services.
+func (s *Server) runHTTP(ctx context.Context, handler http.Handler) error {
+	defer s.shutdownTeardown()
 
+	serveCtx, serveCancel := context.WithCancel(ctx)
+	defer serveCancel()
+
+	tracker := newRequestTracker()
 	httpServer := &http.Server{
 		Addr:              s.options.Addr,
-		Handler:           s.routes(),
+		Handler:           withRequestLifecycle(serveCtx, tracker, handler),
 		ReadHeaderTimeout: httpserverlimits.ReadHeaderTimeout,
 		ReadTimeout:       httpserverlimits.ReadTimeout,
 		WriteTimeout:      httpserverlimits.WriteTimeout,
@@ -731,7 +916,8 @@ func (s *Server) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	logger.Infof("GoNavi Web Server 启动：addr=%s", listener.Addr().String())
+	s.boundAddr.Store(listener.Addr().String())
+	logger.Infof("GoNavi Web Server 启动：addr=%s", listener.Addr())
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -743,19 +929,56 @@ func (s *Server) Run(ctx context.Context) error {
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
+		// Serve stopped accepting connections, but handlers already in flight
+		// must still be drained before the resources they use are released.
+		serveCancel()
+		if remaining := tracker.waitDrain(shutdownDrainTimeout); remaining > 0 {
+			logger.Warnf("Web Server 监听异常退出后仍有 %d 个请求未能在等待期内退出", remaining)
+		}
 		return err
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		shutdownErr := httpServer.Shutdown(shutdownCtx)
-		serveErr := <-errCh
-		if shutdownErr != nil && !errors.Is(shutdownErr, http.ErrServerClosed) {
-			return shutdownErr
-		}
-		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
-			return serveErr
-		}
-		return nil
+		return s.shutdownHTTP(serveCtx, serveCancel, tracker, httpServer, errCh)
+	}
+}
+
+// shutdownHTTP stops the listener, gives in-flight handlers a bounded grace
+// period to finish normally, then force-cancels the survivors through their
+// request contexts and waits for them to unwind. It returns only after every
+// handler finished or was explicitly cancelled; the deferred App resource
+// teardown starts the moment this returns.
+func (s *Server) shutdownHTTP(serveCtx context.Context, serveCancel context.CancelFunc, tracker *requestTracker, httpServer *http.Server, errCh <-chan error) error {
+	graceCtx, graceCancel := context.WithTimeout(context.Background(), shutdownGraceTimeout)
+	defer graceCancel()
+	shutdownErr := httpServer.Shutdown(graceCtx)
+	if shutdownErr != nil && !errors.Is(shutdownErr, http.ErrServerClosed) {
+		logger.Warnf("Web Server 优雅关闭等待超时：%v；活跃请求 %d 个，已发送强制取消信号", shutdownErr, tracker.active())
+	}
+
+	// http.Server.Shutdown never cancels active handlers; server-level
+	// cancellation is delivered through each request's derived context.
+	serveCancel()
+	serveErr := <-errCh
+
+	remaining := tracker.waitDrain(shutdownDrainTimeout)
+	if remaining > 0 {
+		return fmt.Errorf("web server shutdown: %d request handler(s) still active after forced cancellation and drain timeout", remaining)
+	}
+	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		return serveErr
+	}
+	// A graceful-phase timeout is already logged above; handlers unwound
+	// after the explicit cancellation, so the shutdown itself succeeded.
+	return nil
+}
+
+// shutdownTeardown releases App-owned resources after the HTTP handlers are
+// done. Run defers it so teardown cannot race live requests.
+func (s *Server) shutdownTeardown() {
+	if s.app != nil {
+		s.app.Shutdown()
+	}
+	if s.ai != nil {
+		s.ai.Shutdown()
 	}
 }
 
@@ -769,6 +992,8 @@ func (s *Server) routes() http.Handler {
 	mux.Handle(internalRoutePrefix+"/auth/settings", s.requireWebAuth(http.HandlerFunc(s.handleAuthSettings)))
 	mux.Handle(internalRoutePrefix+"/auth/settings/password", s.requireWebAuth(httpserverlimits.LimitRequestBody(http.HandlerFunc(s.handleAuthPasswordChange))))
 	mux.Handle(internalRoutePrefix+"/api/invoke", s.requireWebAuth(httpserverlimits.LimitRequestBody(http.HandlerFunc(s.handleInvoke))))
+	mux.Handle(internalRoutePrefix+"/api/upload", s.requireWebAuth(http.HandlerFunc(s.handleWebUpload)))
+	mux.Handle(internalRoutePrefix+"/api/download/", s.requireWebAuth(httpserverlimits.StreamingWriteTimeout(http.HandlerFunc(s.handleWebDownload))))
 	mux.Handle(internalRoutePrefix+"/events", s.requireWebAuth(httpserverlimits.StreamingWriteTimeout(http.HandlerFunc(s.handleEvents))))
 	mux.Handle(internalRoutePrefix+"/web-runtime.js", s.requireWebAuth(http.HandlerFunc(s.handleRuntimeBridge)))
 	mux.HandleFunc(internalRoutePrefix+"/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -888,6 +1113,9 @@ func (s *Server) handleInvoke(w http.ResponseWriter, r *http.Request) {
 		if webTrace != nil {
 			completeWebInvokeTrace(webTrace, response)
 		}
+		if r.Context().Err() != nil {
+			return
+		}
 		if requestID != "" {
 			w.Header().Set("X-GoNavi-Request-ID", requestID)
 		}
@@ -902,7 +1130,7 @@ func (s *Server) handleInvoke(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	result, err := s.invoker.Invoke(request)
+	result, err := s.invoker.Invoke(r.Context(), request)
 	if err != nil {
 		writeResponse(http.StatusBadRequest, invokeResponse{Error: err.Error()})
 		return

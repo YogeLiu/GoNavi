@@ -21,7 +21,7 @@ func TestAITestProviderUsesCodexCLIAndClearsAPISecrets(t *testing.T) {
 		return nil
 	}
 
-	service := NewService()
+	service := newProviderManagementTestService(t)
 	result := service.AITestProvider(ai.ProviderConfig{
 		Type:      "custom",
 		APIFormat: "codex-cli",
@@ -50,7 +50,7 @@ func TestCodexCLIRejectsMismatchedAPIKeyAuthBeforeSaveOrTest(t *testing.T) {
 		return nil
 	}
 
-	service := NewService()
+	service := newProviderManagementTestService(t)
 	service.configDir = t.TempDir()
 	invalid := ai.ProviderConfig{
 		ID:        "provider-invalid-codex",
@@ -95,7 +95,7 @@ func TestAITestProviderUsesClaudeSubscriptionWithoutChangingQwenCLI(t *testing.T
 		return nil
 	}
 
-	service := NewService()
+	service := newProviderManagementTestService(t)
 	localResult := service.AITestProvider(ai.ProviderConfig{
 		Type:      "custom",
 		APIFormat: "claude-cli",
@@ -125,7 +125,7 @@ func TestAITestProviderUsesClaudeSubscriptionWithoutChangingQwenCLI(t *testing.T
 }
 
 func TestAISaveProviderRemovesExistingSecretWhenSwitchingToLocalCLIAuth(t *testing.T) {
-	service := NewService()
+	service := newProviderManagementTestService(t)
 	service.configDir = t.TempDir()
 	service.providers = []ai.ProviderConfig{{
 		ID:        "provider-existing",
@@ -159,6 +159,64 @@ func TestAISaveProviderRemovesExistingSecretWhenSwitchingToLocalCLIAuth(t *testi
 	}
 }
 
+func TestAISaveProviderKeepsHiddenCLIEnvironmentWhenEditingLocalCLI(t *testing.T) {
+	service := newProviderManagementTestService(t)
+	service.configDir = t.TempDir()
+	initial := ai.ProviderConfig{
+		ID: "provider-codex", Type: "custom", Name: "Codex subscription",
+		AuthMode: "local-cli", APIFormat: "codex-cli", Model: "first",
+		CLIEnv: map[string]string{"GONAVI_PRIVATE_TOKEN": "secret-value"},
+	}
+	if err := service.AISaveProvider(initial); err != nil {
+		t.Fatal(err)
+	}
+	view := service.AIGetProviders()[0]
+	if !view.HasSecret || len(view.CLIEnv) != 0 {
+		t.Fatalf("public view = %#v, want hidden CLI environment marker", view)
+	}
+	view.Model = "second"
+	if err := service.AISaveProvider(view); err != nil {
+		t.Fatal(err)
+	}
+	if got := service.providers[0].CLIEnv["GONAVI_PRIVATE_TOKEN"]; got != "secret-value" {
+		t.Fatalf("hidden CLI environment was lost during edit: %q", got)
+	}
+}
+
+func TestLocalCLITestRestoresHiddenEnvironmentWithoutAPISecrets(t *testing.T) {
+	original := codexCLIHealthCheckFunc
+	t.Cleanup(func() { codexCLIHealthCheckFunc = original })
+	var received ai.ProviderConfig
+	codexCLIHealthCheckFunc = func(config ai.ProviderConfig) error {
+		received = config
+		return nil
+	}
+	service := newProviderManagementTestService(t)
+	service.configDir = t.TempDir()
+	if err := service.AISaveProvider(ai.ProviderConfig{
+		ID: "provider-codex", Type: "custom", AuthMode: "local-cli", APIFormat: "codex-cli",
+		CLIEnv: map[string]string{
+			"CODEX_HOME":     "/private/codex-home",
+			"OPENAI_API_KEY": "cli-managed-key",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	view := service.AIGetProviders()[0]
+	if result := service.AITestProvider(view); result["success"] != true {
+		t.Fatalf("provider test failed: %#v", result)
+	}
+	if received.CLIEnv["CODEX_HOME"] != "/private/codex-home" {
+		t.Fatalf("hidden CLI environment was not restored: %#v", received.CLIEnv)
+	}
+	if received.CLIEnv["OPENAI_API_KEY"] != "cli-managed-key" {
+		t.Fatalf("CLI API key environment was not restored: %#v", received.CLIEnv)
+	}
+	if received.APIKey != "" || received.BaseURL != "" || len(received.Headers) != 0 {
+		t.Fatalf("API secrets reached subscription test: %#v", received)
+	}
+}
+
 func TestAIListModelsReturnsConfiguredLocalCLIModelsWithoutRemoteFetch(t *testing.T) {
 	originalFetch := fetchModelsFunc
 	defer func() { fetchModelsFunc = originalFetch }()
@@ -167,7 +225,7 @@ func TestAIListModelsReturnsConfiguredLocalCLIModelsWithoutRemoteFetch(t *testin
 		return nil, nil
 	}
 
-	service := NewService()
+	service := newProviderManagementTestService(t)
 	service.providers = []ai.ProviderConfig{{
 		ID:        "provider-codex",
 		Type:      "custom",

@@ -58,6 +58,31 @@ type importFileConsumer interface {
 	ConsumeRow(row map[string]interface{}) error
 }
 
+type contextImportFileConsumer struct {
+	ctx      context.Context
+	delegate importFileConsumer
+}
+
+func (c *contextImportFileConsumer) SetColumns(columns []string) error {
+	if err := c.ctx.Err(); err != nil {
+		return err
+	}
+	return c.delegate.SetColumns(columns)
+}
+
+func (c *contextImportFileConsumer) ConsumeRow(row map[string]interface{}) error {
+	if err := c.ctx.Err(); err != nil {
+		return err
+	}
+	return c.delegate.ConsumeRow(row)
+}
+
+func (c *contextImportFileConsumer) SetImportSourceProgress(bytesRead int64, totalBytes int64, stage string) {
+	if progress, ok := c.delegate.(importSourceProgressConsumer); ok {
+		progress.SetImportSourceProgress(bytesRead, totalBytes, stage)
+	}
+}
+
 type importSourceProgressConsumer interface {
 	SetImportSourceProgress(bytesRead int64, totalBytes int64, stage string)
 }
@@ -128,15 +153,23 @@ type importProgressState struct {
 }
 
 type importExecutionResult struct {
-	Success            int
-	Skipped            int
-	Failed             int
-	Total              int
-	ErrorLogs          []string
-	ErrorArtifactID    string
-	ErrorArtifactCount int64
-	StoppedOnError     bool
-	OutcomeUnknown     bool
+	Success                       int
+	Skipped                       int
+	Failed                        int
+	Total                         int
+	ErrorLogs                     []string
+	ErrorArtifactID               string
+	ErrorArtifactCount            int64
+	ErrorArtifactBytes            int64
+	ErrorArtifactOmittedCount     int64
+	ErrorArtifactTruncated        bool
+	ErrorArtifactRetryableCount   int64
+	ErrorArtifactUnretryableCount int64
+	ErrorArtifactScopeKnown       bool
+	ErrorArtifactMaxRows          int64
+	ErrorArtifactMaxBytes         int64
+	StoppedOnError                bool
+	OutcomeUnknown                bool
 }
 
 type importPreviewCollector struct {
@@ -241,10 +274,7 @@ func newImportColumnMappingConsumer(
 	requiredTargets := make(map[string]string)
 	for _, column := range targetColumns {
 		if strings.EqualFold(strings.TrimSpace(column.Nullable), "NO") &&
-			!column.HasDefault && column.Default == nil &&
-			!strings.Contains(strings.ToLower(column.Extra), "auto_increment") &&
-			!strings.Contains(strings.ToLower(column.Extra), "identity") &&
-			!strings.Contains(strings.ToLower(column.Extra), "generated") {
+			!importColumnUsesDatabaseValue(column) {
 			requiredTargets[normalizeColumnName(column.Name)] = column.Name
 		}
 	}
@@ -394,18 +424,22 @@ type importRowColumnValidator interface {
 }
 
 type importColumnTypeLookup struct {
-	byExactName          map[string]string
-	byFoldedName         map[string][]string
-	nullableByExactName  map[string]string
-	nullableByFoldedName map[string][]string
+	byExactName               map[string]string
+	byFoldedName              map[string][]string
+	nullableByExactName       map[string]string
+	nullableByFoldedName      map[string][]string
+	databaseValueByExactName  map[string]bool
+	databaseValueByFoldedName map[string][]bool
 }
 
 func newImportColumnTypeLookup(columns []connection.ColumnDefinition) importColumnTypeLookup {
 	lookup := importColumnTypeLookup{
-		byExactName:          make(map[string]string, len(columns)),
-		byFoldedName:         make(map[string][]string, len(columns)),
-		nullableByExactName:  make(map[string]string, len(columns)),
-		nullableByFoldedName: make(map[string][]string, len(columns)),
+		byExactName:               make(map[string]string, len(columns)),
+		byFoldedName:              make(map[string][]string, len(columns)),
+		nullableByExactName:       make(map[string]string, len(columns)),
+		nullableByFoldedName:      make(map[string][]string, len(columns)),
+		databaseValueByExactName:  make(map[string]bool, len(columns)),
+		databaseValueByFoldedName: make(map[string][]bool, len(columns)),
 	}
 	for _, column := range columns {
 		name := column.Name
@@ -419,11 +453,24 @@ func newImportColumnTypeLookup(columns []connection.ColumnDefinition) importColu
 				lookup.nullableByFoldedName[foldedName],
 				strings.TrimSpace(column.Nullable),
 			)
+			lookup.databaseValueByFoldedName[foldedName] = append(
+				lookup.databaseValueByFoldedName[foldedName],
+				importColumnUsesDatabaseValue(column),
+			)
 		}
 		lookup.byExactName[name] = strings.TrimSpace(column.Type)
 		lookup.nullableByExactName[name] = strings.TrimSpace(column.Nullable)
+		lookup.databaseValueByExactName[name] = importColumnUsesDatabaseValue(column)
 	}
 	return lookup
+}
+
+func importColumnUsesDatabaseValue(column connection.ColumnDefinition) bool {
+	extra := strings.ToLower(strings.TrimSpace(column.Extra))
+	return column.HasDefault || column.Default != nil ||
+		strings.Contains(extra, "auto_increment") ||
+		strings.Contains(extra, "identity") ||
+		strings.Contains(extra, "generated")
 }
 
 func (l importColumnTypeLookup) Resolve(columnName string) string {
@@ -460,9 +507,25 @@ func (l importColumnTypeLookup) IsNullable(columnName string) (bool, bool) {
 	return normalizeImportNullable(raw)
 }
 
+func (l importColumnTypeLookup) UsesDatabaseValue(columnName string) bool {
+	if usesDatabaseValue, ok := l.databaseValueByExactName[columnName]; ok {
+		return usesDatabaseValue
+	}
+	foldedMatches := l.databaseValueByFoldedName[normalizeColumnName(columnName)]
+	return len(foldedMatches) == 1 && foldedMatches[0]
+}
+
+func isBlankImportValue(value interface{}) bool {
+	if value == nil {
+		return true
+	}
+	text, ok := value.(string)
+	return ok && strings.TrimSpace(text) == ""
+}
+
 func normalizeImportValueForColumn(value interface{}, nullable bool) interface{} {
 	if nullable {
-		if text, ok := value.(string); ok && text == "" {
+		if text, ok := value.(string); ok && strings.TrimSpace(text) == "" {
 			return nil
 		}
 	}
@@ -473,7 +536,13 @@ func normalizeImportRowForTargetColumns(row map[string]interface{}, columnTypes 
 	normalized := cloneImportRow(row)
 	for column, value := range normalized {
 		if nullable, known := columnTypes.IsNullable(column); known {
-			normalized[column] = normalizeImportValueForColumn(value, nullable)
+			if nullable {
+				normalized[column] = normalizeImportValueForColumn(value, true)
+				continue
+			}
+		}
+		if columnTypes.UsesDatabaseValue(column) && isBlankImportValue(value) {
+			delete(normalized, column)
 		}
 	}
 	return normalized
@@ -514,7 +583,7 @@ func newImportDatabaseRowWriterWithOptions(dbInst db.Database, dbType, tableName
 		conflictPolicy:     normalizeImportConflictPolicy(options.ConflictPolicy),
 		conflictKeyColumns: append([]string(nil), options.ConflictKeyColumns...),
 	}
-	if applier, ok := dbInst.(db.BatchApplier); ok {
+	if applier, ok := dbInst.(db.BatchApplier); ok && runtimeSupportsBatchApply(dbInst) {
 		writer.applier = applier
 	}
 	return writer
@@ -874,7 +943,8 @@ func (c *importBatchConsumer) flush() error {
 						SourceRow: int64(sourceRow),
 						Category:  "database",
 						Message:   sanitizedMessage,
-						Values:    cloneImportRow(row),
+						Retryable: true,
+						Values:    row,
 					}); persistErr != nil {
 						c.stoppedOnError = true
 						c.emitProgress(startRow+idx, true)
@@ -938,8 +1008,12 @@ func buildImportPreview(filePath string, previewLimit int) (importPreviewData, e
 }
 
 func buildImportPreviewWithOptions(filePath string, previewLimit int, options ImportFileOptions) (importPreviewData, error) {
+	return buildImportPreviewWithOptionsContext(context.Background(), filePath, previewLimit, options)
+}
+
+func buildImportPreviewWithOptionsContext(ctx context.Context, filePath string, previewLimit int, options ImportFileOptions) (importPreviewData, error) {
 	collector := newImportPreviewCollector(previewLimit)
-	if err := streamImportFileWithOptions(filePath, collector, options); err != nil && !errors.Is(err, errImportPreviewLimitReached) {
+	if err := streamImportFileWithOptionsContext(ctx, filePath, collector, options); err != nil && !errors.Is(err, errImportPreviewLimitReached) {
 		return importPreviewData{}, err
 	} else if err == nil {
 		collectorResult := collector.Result()
@@ -962,12 +1036,23 @@ func streamImportFile(filePath string, consumer importFileConsumer) error {
 }
 
 func streamImportFileWithOptions(filePath string, consumer importFileConsumer, options ImportFileOptions) error {
+	return streamImportFileWithOptionsContext(context.Background(), filePath, consumer, options)
+}
+
+func streamImportFileWithOptionsContext(ctx context.Context, filePath string, consumer importFileConsumer, options ImportFileOptions) error {
 	if consumer == nil {
 		return fmt.Errorf("import file consumer is required")
 	}
 	if err := validateImportFileOptions(options); err != nil {
 		return err
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	consumer = &contextImportFileConsumer{ctx: ctx, delegate: consumer}
 	lower := strings.ToLower(filePath)
 	switch {
 	case strings.HasSuffix(lower, ".json"):
@@ -1452,10 +1537,13 @@ func buildImportInsertQueryWithConflict(
 		if strings.TrimSpace(column) == "" {
 			continue
 		}
+		value, exists := normalizedRow[column]
+		if !exists {
+			continue
+		}
 		usableColumns = append(usableColumns, column)
 		quotedCols = append(quotedCols, quoteIdentByType(dbType, column))
 		colType := columnTypes.Resolve(column)
-		value := normalizedRow[column]
 		values = append(values, formatImportSQLValue(dbType, colType, value))
 	}
 	if len(quotedCols) == 0 {

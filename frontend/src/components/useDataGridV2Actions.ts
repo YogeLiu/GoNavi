@@ -69,8 +69,10 @@ export const useDataGridV2Actions = (ctx: DataGridV2ActionsContext) => {
     filterConditions,
     handleBatchFillToSelected,
     handleCellSetNull,
+    handleSetNullForSelectedCells,
     handleCopyColumnData,
     handleCopyContextMenuFieldName,
+    handleOpenContextMenuCellEditor,
     handleOpenContextMenuRowEditor,
     handlePasteCopiedColumnsToSelectedRows,
     handlePasteCopiedRowsAsNew,
@@ -396,7 +398,7 @@ const handleV2ColumnHeaderContextMenuAction = useCallback((action: V2ColumnHeade
       document.addEventListener('mousedown', onPointerDown);
       return () => document.removeEventListener('mousedown', onPointerDown);
   }, [cellEditMode, closeCellEditMode, isActive, isTableSurfaceActive, resetCellSelection, selectedCells.size]);
-  
+
   const getTargets = useCallback((clickedRecord: any) => {
       const selKeys = selectedRowKeysRef.current;
       const currentData = displayDataRef.current;
@@ -801,8 +803,17 @@ const handleV2ColumnHeaderContextMenuAction = useCallback((action: V2ColumnHeade
           case 'set-null':
               handleCellSetNull();
               return;
+          case 'set-null-selected':
+              // This explicit menu action always targets the current cell
+              // selection; the right-clicked cell is not a fallback here.
+              handleSetNullForSelectedCells();
+              return;
           case 'edit-row':
               handleOpenContextMenuRowEditor();
+              return;
+          case 'edit-cell':
+              handleOpenContextMenuCellEditor();
+              closeMenu();
               return;
           case 'fill-selected':
               if (selectedRowKeys.length > 0 && record) {
@@ -867,6 +878,7 @@ const handleV2ColumnHeaderContextMenuAction = useCallback((action: V2ColumnHeade
       getTargets,
       handleBatchFillToSelected,
       handleCellSetNull,
+      handleSetNullForSelectedCells,
       handleUndoContextMenuCellChange,
       handleCopyContextMenuFieldName,
       handleCopyCsv,
@@ -877,6 +889,7 @@ const handleV2ColumnHeaderContextMenuAction = useCallback((action: V2ColumnHeade
       handleCopyRowData,
       handleCopyUpdate,
       handleExportSelected,
+      handleOpenContextMenuCellEditor,
       handleOpenContextMenuRowEditor,
       handlePasteCopiedColumnsToSelectedRows,
       handlePasteCopiedRowsAsNew,

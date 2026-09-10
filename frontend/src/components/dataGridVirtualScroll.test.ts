@@ -1,5 +1,4 @@
 import { describe, expect, it, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
 
 import {
   applyDataGridFixedCellPreviewOffset,
@@ -107,9 +106,9 @@ describe('calculateFixedVirtualRange', () => {
       scrollTop: 14_000_001,
     })).toEqual({
       scrollHeight: 28_000_000,
-      start: 500_000,
-      end: 500_011,
-      offset: 14_000_000,
+      start: 499_991,
+      end: 500_020,
+      offset: 13_999_748,
     });
   });
 
@@ -122,7 +121,7 @@ describe('calculateFixedVirtualRange', () => {
     })).toEqual({
       scrollHeight: 2_800,
       start: 0,
-      end: 12,
+      end: 21,
       offset: 0,
     });
   });
@@ -142,53 +141,66 @@ describe('calculateFixedVirtualRange', () => {
       scrollTop: Number.POSITIVE_INFINITY,
     })).toEqual({
       scrollHeight: 2_800,
-      start: 89,
+      start: 80,
       end: 99,
-      offset: 2_492,
+      offset: 2_240,
     });
   });
 
-  it('matches the dependency linear scan throughout a small fixed-height list', () => {
+  it('extends the dependency visible range by one viewport for native scroll coverage', () => {
     const itemCount = 40;
     const itemHeight = 7;
-    const viewportHeight = 35;
+    const viewportHeight = 70;
     const maxScrollTop = itemCount * itemHeight - viewportHeight;
     for (let scrollTop = 0; scrollTop <= maxScrollTop; scrollTop += 1) {
+      const linear = calculateLinearReference({
+        itemCount,
+        itemHeight,
+        viewportHeight,
+        scrollTop,
+      });
+      const overscanRows = Math.max(6, Math.ceil(viewportHeight / itemHeight));
       expect(calculateFixedVirtualRange({
         itemCount,
         itemHeight,
         viewportHeight,
         scrollTop,
-      })).toEqual(calculateLinearReference({
-        itemCount,
-        itemHeight,
-        viewportHeight,
-        scrollTop,
-      }));
+      })).toEqual({
+        ...linear,
+        start: Math.max(0, linear.start - (overscanRows - 1)),
+        end: Math.min(itemCount - 1, linear.end + (overscanRows - 1)),
+        offset: Math.max(0, linear.start - (overscanRows - 1)) * itemHeight,
+      });
     }
   });
 
-  it('ships the fixed-height opt-in through both dependency patches', () => {
-    const virtualListPatch = readFileSync(
-      new URL('../../patches/rc-virtual-list+3.19.2.patch', import.meta.url),
-      'utf8',
-    );
-    const tablePatch = readFileSync(
-      new URL('../../patches/rc-table+7.54.0.patch', import.meta.url),
-      'utf8',
-    );
+  it('keeps the recorded fifteen-row native jump covered before React commits', () => {
+    const itemHeight = 28;
+    const viewportHeight = 840;
+    const initialRange = calculateFixedVirtualRange({
+      itemCount: 1_000,
+      itemHeight,
+      viewportHeight,
+      scrollTop: 0,
+    });
+    const jumpedViewportBottom = (15 * itemHeight) + viewportHeight;
 
-    expect(virtualListPatch).toContain('itemHeightFixed');
-    expect(virtualListPatch).toContain('fixedStartIndex');
-    expect(tablePatch).toContain('listItemHeightFixed');
-    expect(tablePatch).toContain('itemHeightFixed: listItemHeightFixed');
-    expect(tablePatch).toContain('bodyLinePropsAreEqual');
-    expect(tablePatch).toContain('responseImmutable(BodyLine, bodyLinePropsAreEqual)');
-    expect(tablePatch).toContain('lastForwardedXRef');
-    expect(tablePatch).toContain('listItemColumnVirtual');
-    expect(tablePatch).toContain('cell-virtual-spacer');
-    expect(tablePatch).toContain('if (listItemColumnVirtual)');
-    expect(virtualListPatch).toContain('disabled?: boolean');
+    expect((initialRange.end + 1) * itemHeight).toBeGreaterThanOrEqual(jumpedViewportBottom);
+  });
+
+  it('keeps the recorded reverse jump covered while React still has the old range', () => {
+    const itemHeight = 28;
+    const viewportHeight = 840;
+    const previousVisibleRow = 112;
+    const previousRange = calculateFixedVirtualRange({
+      itemCount: 1_000,
+      itemHeight,
+      viewportHeight,
+      scrollTop: previousVisibleRow * itemHeight,
+    });
+    const jumpedVisibleRow = previousVisibleRow - 24;
+
+    expect(previousRange.start).toBeLessThanOrEqual(jumpedVisibleRow);
   });
 });
 

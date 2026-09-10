@@ -17,6 +17,7 @@ import {
 import { buildSQLFileExecutionWorkbenchTab } from '../../utils/sqlFileExecutionTab';
 import type { BuildDataImportWorkbenchTabInput } from '../../utils/dataImportTab';
 import { buildRpcConnectionConfig } from '../../utils/connectionRpcConfig';
+import { uploadBrowserFile } from '../../utils/browserFileTransfer';
 import { filterVisibleDatabaseNames } from '../../utils/databaseVisibility';
 import { getDataSourceCapabilities } from '../../utils/dataSourceCapabilities';
 import { resolveConnectionHostSummary } from '../../utils/tabDisplay';
@@ -88,6 +89,7 @@ type UseSidebarExternalSqlWorkflowOptions = {
   setExpandedKeys: React.Dispatch<React.SetStateAction<React.Key[]>>;
   setAutoExpandParent: React.Dispatch<React.SetStateAction<boolean>>;
   getActiveContext: () => ActiveExecutionContext;
+  isWebRuntime?: boolean;
 };
 
 export const launchDatabaseSQLImportWorkbench = (
@@ -446,7 +448,9 @@ export const useSidebarExternalSqlWorkflow = ({
   setExpandedKeys,
   setAutoExpandParent,
   getActiveContext,
+  isWebRuntime = false,
 }: UseSidebarExternalSqlWorkflowOptions) => {
+  const externalSQLDirectorySelectionPendingRef = useRef(false);
   const [isExternalSQLFileModalOpen, setIsExternalSQLFileModalOpen] = useState(false);
   const [externalSQLFileForm] = Form.useForm();
   const [externalSQLFileModalMode, setExternalSQLFileModalMode] = useState<ExternalSQLFileModalMode>('create');
@@ -459,6 +463,8 @@ export const useSidebarExternalSqlWorkflow = ({
   const [loadingExternalSQLBindingDatabases, setLoadingExternalSQLBindingDatabases] = useState(false);
   const [savingExternalSQLBinding, setSavingExternalSQLBinding] = useState(false);
   const externalSQLBindingDatabaseRequestRef = useRef(0);
+  const browserSQLFileInputRef = useRef<HTMLInputElement>(null);
+  const browserSQLExecutionContextRef = useRef<ActiveExecutionContext>(null);
 
   const loadExternalSQLBindingDatabases = useCallback(async (
     connectionId: string,
@@ -558,6 +564,17 @@ export const useSidebarExternalSqlWorkflow = ({
       message.warning(t('sidebar.message.select_connection_or_database_first'));
       return;
     }
+    if (isWebRuntime) {
+      const input = browserSQLFileInputRef.current;
+      if (!input) {
+        message.error(t('sidebar.message.read_file_failed', { error: 'Browser file upload is unavailable' }));
+        return;
+      }
+      browserSQLExecutionContextRef.current = ctx;
+      input.value = '';
+      input.click();
+      return;
+    }
     const res = await selectSQLFileForExecution();
     if (res.success) {
       const data = normalizeSQLFileDialogData(res.data);
@@ -588,6 +605,28 @@ export const useSidebarExternalSqlWorkflow = ({
       });
     } else if (res.message !== '已取消') {
       message.error(t('sidebar.message.read_file_failed', { error: res.message }));
+    }
+  };
+
+  const handleBrowserSQLFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    const ctx = browserSQLExecutionContextRef.current;
+    browserSQLExecutionContextRef.current = null;
+    event.target.value = '';
+    if (!file || !ctx?.connectionId) return;
+    try {
+      const uploaded = await uploadBrowserFile(file, 'sql-execution');
+      openSQLFileExecutionWorkbench({
+        connectionId: ctx.connectionId,
+        dbName: String(ctx.dbName || '').trim(),
+        filePath: uploaded.filePath,
+        fileName: uploaded.name || file.name,
+        fileSizeMB: uploaded.fileSizeMB,
+      });
+    } catch (error: any) {
+      message.error(t('sidebar.message.read_file_failed', {
+        error: error?.message || String(error),
+      }));
     }
   };
 
@@ -1048,46 +1087,56 @@ export const useSidebarExternalSqlWorkflow = ({
   };
 
   const handleAddExternalSQLDirectory = async (node: any) => {
+    if (externalSQLDirectorySelectionPendingRef.current) return;
+    externalSQLDirectorySelectionPendingRef.current = true;
     void node;
-    const currentDirectory = externalSQLDirectories[0]?.path || '';
-    const selection = await SelectSQLDirectory(currentDirectory);
-    if (!selection.success) {
-      if (selection.message !== '已取消') {
-        message.error(t('sidebar.message.select_sql_directory_failed', { error: selection.message }));
+    try {
+      const currentDirectory = externalSQLDirectories[0]?.path || '';
+      const selection = await SelectSQLDirectory(currentDirectory);
+      if (!selection.success) {
+        if (selection.message !== '已取消') {
+          message.error(t('sidebar.message.select_sql_directory_failed', { error: selection.message }));
+        }
+        return;
       }
-      return;
+
+      const payload = (selection.data && typeof selection.data === 'object') ? selection.data as Record<string, unknown> : {};
+      const path = String(payload.path || '').trim();
+      const name = String(payload.name || '').trim();
+      if (!path) {
+        message.error(t('sidebar.message.sql_directory_path_invalid'));
+        return;
+      }
+
+      const activeContext = getActiveContext();
+      const connectionId = String(activeContext?.connectionId || '').trim();
+      const dbName = String(activeContext?.dbName || '').trim();
+      const directoryId = buildExternalSQLDirectoryId(connectionId, dbName, path);
+      const nextDirectory: ExternalSQLDirectory = {
+        id: directoryId,
+        name: name || path.split(/[\\/]/).filter(Boolean).pop() || t('sidebar.sql_directory.default_name'),
+        path,
+        ...(connectionId ? { connectionId } : {}),
+        ...(dbName ? { dbName } : {}),
+        createdAt: Date.now(),
+      };
+      saveExternalSQLDirectory(nextDirectory);
+
+      const nextDirectories = [
+        ...externalSQLDirectories.filter((item) => item.id !== directoryId),
+        nextDirectory,
+      ];
+      setExpandedKeys((prev) => Array.from(new Set([...prev, 'external-sql-root'])));
+      setAutoExpandParent(false);
+      await refreshGlobalExternalSQLRootNode(false, nextDirectories);
+      message.success(t('sidebar.message.external_sql_directory_added'));
+    } catch (error) {
+      message.error(t('sidebar.message.select_sql_directory_failed', {
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    } finally {
+      externalSQLDirectorySelectionPendingRef.current = false;
     }
-
-    const payload = (selection.data && typeof selection.data === 'object') ? selection.data as Record<string, unknown> : {};
-    const path = String(payload.path || '').trim();
-    const name = String(payload.name || '').trim();
-    if (!path) {
-      message.error(t('sidebar.message.sql_directory_path_invalid'));
-      return;
-    }
-
-    const activeContext = getActiveContext();
-    const connectionId = String(activeContext?.connectionId || '').trim();
-    const dbName = String(activeContext?.dbName || '').trim();
-    const directoryId = buildExternalSQLDirectoryId(connectionId, dbName, path);
-    const nextDirectory: ExternalSQLDirectory = {
-      id: directoryId,
-      name: name || path.split(/[\\/]/).filter(Boolean).pop() || t('sidebar.sql_directory.default_name'),
-      path,
-      ...(connectionId ? { connectionId } : {}),
-      ...(dbName ? { dbName } : {}),
-      createdAt: Date.now(),
-    };
-    saveExternalSQLDirectory(nextDirectory);
-
-    const nextDirectories = [
-      ...externalSQLDirectories.filter((item) => item.id !== directoryId),
-      nextDirectory,
-    ];
-    setExpandedKeys((prev) => Array.from(new Set([...prev, 'external-sql-root'])));
-    setAutoExpandParent(false);
-    await refreshGlobalExternalSQLRootNode(false, nextDirectories);
-    message.success(t('sidebar.message.external_sql_directory_added'));
   };
 
   const handleRemoveExternalSQLDirectory = async (node: any) => {
@@ -1128,6 +1177,15 @@ export const useSidebarExternalSqlWorkflow = ({
     handleAddExternalSQLDirectory,
     handleRemoveExternalSQLDirectory,
     handleRefreshExternalSQLDirectory,
+    browserSQLFileInputProps: {
+      ref: browserSQLFileInputRef,
+      type: 'file' as const,
+      accept: '.sql,.sql.gz',
+      style: { display: 'none' },
+      onChange: (event: React.ChangeEvent<HTMLInputElement>) => {
+        void handleBrowserSQLFileChange(event);
+      },
+    },
     externalSQLFileModalProps: {
       open: isExternalSQLFileModalOpen,
       mode: externalSQLFileModalMode,

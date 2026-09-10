@@ -11,10 +11,16 @@ const REQUIRED_NAV_KEYS = [
   'ai_settings.nav.title',
   'ai_settings.nav.providers.title',
   'ai_settings.nav.providers.description',
+  'ai_settings.nav.analysis.title',
+  'ai_settings.nav.analysis.description',
+  'ai_settings.nav.request_events.title',
+  'ai_settings.nav.request_events.description',
   'ai_settings.nav.safety.title',
   'ai_settings.nav.safety.description',
   'ai_settings.nav.context.title',
   'ai_settings.nav.context.description',
+  'ai_settings.nav.run_policy.title',
+  'ai_settings.nav.run_policy.description',
   'ai_settings.nav.mcp.title',
   'ai_settings.nav.mcp.description',
   'ai_settings.nav.skills.title',
@@ -26,7 +32,7 @@ const REQUIRED_NAV_KEYS = [
 ] as const;
 
 describe('AISettingsSidebar', () => {
-  it('renders the ai settings navigation with the active section highlighted', () => {
+  it('keeps every category one click away in the vertical navigation', () => {
     const markup = renderToStaticMarkup(
       <I18nProvider preference="en-US" systemLanguages={['en-US']} onPreferenceChange={() => {}}>
         <AISettingsSidebar
@@ -40,17 +46,14 @@ describe('AISettingsSidebar', () => {
 
     expect(markup).toContain('Settings navigation');
     expect(markup).toContain('MCP services');
-    expect(markup).toContain('Built-in tools');
+    expect(markup).not.toContain('role="combobox"');
     expect(markup).toContain('role="tablist"');
     expect(markup).toContain('aria-orientation="vertical"');
-    expect(markup).toContain('id="gonavi-ai-settings-tab-mcp"');
-    expect(markup).toContain('role="tab" aria-selected="true" aria-controls="gonavi-ai-settings-panel-mcp" tabindex="0"');
-    expect(markup).toContain('aria-selected="false" aria-controls="gonavi-ai-settings-panel-providers" tabindex="-1"');
-    expect(markup).not.toContain('aria-pressed=');
-    expect(markup).toContain('gonavi-ai-settings-nav-item is-active');
-    expect(markup).toContain('border-left:3px solid');
-    expect(markup).toContain('border-radius:4px');
-    expect(markup).not.toContain('linear-gradient(180deg');
+    expect(markup.match(/role="tab"/g)).toHaveLength(10);
+    expect(markup).toContain('Analysis');
+    expect(markup).toContain('Request events');
+    expect(markup).toContain('id="gonavi-ai-settings-tab-mcp" type="button" role="tab" aria-selected="true"');
+    expect(markup).toContain('gonavi-ai-settings-sidebar');
   });
 
   it('uses catalog fallback keys for settings navigation chrome', () => {

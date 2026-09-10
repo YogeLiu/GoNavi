@@ -3,9 +3,12 @@ package aiservice
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"GoNavi-Wails/internal/ai"
@@ -32,6 +35,10 @@ func TestSplitProviderSecretsStripsAPIKeyAndSensitiveHeaders(t *testing.T) {
 			"Authorization": "Bearer test",
 			"X-Team":        "db",
 		},
+		CLIEnv: map[string]string{
+			"HTTP_PROXY":     "http://user:password@proxy.invalid",
+			"OPENAI_API_KEY": "cli-secret",
+		},
 	}
 
 	meta, bundle := splitProviderSecrets(input)
@@ -49,6 +56,17 @@ func TestSplitProviderSecretsStripsAPIKeyAndSensitiveHeaders(t *testing.T) {
 	}
 	if bundle.SensitiveHeaders["Authorization"] != "Bearer test" {
 		t.Fatal("bundle should keep sensitive header")
+	}
+	if len(meta.CLIEnv) != 0 {
+		t.Fatalf("CLI environment should not stay in metadata: %#v", meta.CLIEnv)
+	}
+}
+
+func TestNewDefaultAISecretStoreSkipsKeychainOnDarwin(t *testing.T) {
+	withTestAIGOOS(t, "darwin")
+
+	if _, err := newDefaultAISecretStore().Get("must-not-reach-keychain"); !secretstore.IsUnavailable(err) {
+		t.Fatal("macOS AI service must not open the Keychain backend")
 	}
 }
 
@@ -222,8 +240,20 @@ func TestAISaveProviderKeepsLegacyPlaintextSecretAfterStartupLoad(t *testing.T) 
 }
 
 func TestAITestProviderUsesLegacyPlaintextSecretAfterStartupLoad(t *testing.T) {
-	service := NewServiceWithSecretStore(failOnUseSecretStore{})
-	service.configDir = t.TempDir()
+	service := newProviderManagementTestService(t)
+	service.secretStore = failOnUseSecretStore{}
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.Header.Get("Authorization") != "Bearer sk-test" || r.Header.Get("X-Api-Key") != "header-test" || r.Header.Get("X-Team") != "db" {
+			t.Error("legacy API key and sensitive headers were not retained")
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	}))
+	defer server.Close()
 
 	legacy := aiConfig{
 		Providers: []ai.ProviderConfig{
@@ -232,10 +262,10 @@ func TestAITestProviderUsesLegacyPlaintextSecretAfterStartupLoad(t *testing.T) {
 				Type:    "custom",
 				Name:    "OpenAI",
 				APIKey:  "sk-test",
-				BaseURL: "",
+				BaseURL: server.URL,
 				Headers: map[string]string{
-					"Authorization": "Bearer test",
-					"X-Team":        "db",
+					"X-Api-Key": "header-test",
+					"X-Team":    "db",
 				},
 			},
 		},
@@ -254,7 +284,7 @@ func TestAITestProviderUsesLegacyPlaintextSecretAfterStartupLoad(t *testing.T) {
 		ID:        "openai-main",
 		Type:      "custom",
 		Name:      "OpenAI",
-		BaseURL:   "",
+		BaseURL:   server.URL,
 		HasSecret: true,
 		Headers: map[string]string{
 			"X-Team": "db",
@@ -263,6 +293,9 @@ func TestAITestProviderUsesLegacyPlaintextSecretAfterStartupLoad(t *testing.T) {
 
 	if success, _ := result["success"].(bool); !success {
 		t.Fatalf("expected test provider to use in-memory legacy secret, got %#v", result)
+	}
+	if requests.Load() != 1 || result["checkKind"] != "endpoint" || result["modelVerified"] != false {
+		t.Fatal("expected exactly one local endpoint check, not a model response")
 	}
 }
 
@@ -280,6 +313,7 @@ func TestAISaveProviderPersistsSecretlessConfigAndReturnsSecretlessView(t *testi
 			"Authorization": "Bearer test",
 			"X-Team":        "db",
 		},
+		CLIEnv: map[string]string{"GONAVI_PRIVATE_TOKEN": "cli-secret"},
 	})
 	if err != nil {
 		t.Fatalf("AISaveProvider returned error: %v", err)
@@ -298,11 +332,21 @@ func TestAISaveProviderPersistsSecretlessConfigAndReturnsSecretlessView(t *testi
 	if providers[0].Headers["Authorization"] != "" {
 		t.Fatalf("expected secretless provider headers, got %#v", providers[0].Headers)
 	}
+	if len(providers[0].CLIEnv) != 0 {
+		t.Fatalf("expected secretless provider CLI environment, got %#v", providers[0].CLIEnv)
+	}
 	if service.providers[0].APIKey != "sk-test" {
 		t.Fatalf("expected runtime provider to keep apiKey, got %q", service.providers[0].APIKey)
 	}
 	if service.providers[0].Headers["Authorization"] != "Bearer test" {
 		t.Fatalf("expected runtime provider to keep sensitive header, got %#v", service.providers[0].Headers)
+	}
+	if service.providers[0].CLIEnv["GONAVI_PRIVATE_TOKEN"] != "cli-secret" {
+		t.Fatalf("expected runtime provider to keep CLI environment, got %#v", service.providers[0].CLIEnv)
+	}
+	stored, ok, err := service.dailySecretStore().GetAIProvider("openai-main")
+	if err != nil || !ok || stored.CLIEnv["GONAVI_PRIVATE_TOKEN"] != "cli-secret" {
+		t.Fatalf("expected daily secret store to keep CLI environment: %#v %v", stored, err)
 	}
 
 	configPath := filepath.Join(service.configDir, "ai_config.json")
@@ -316,6 +360,9 @@ func TestAISaveProviderPersistsSecretlessConfigAndReturnsSecretlessView(t *testi
 	}
 	if strings.Contains(text, "Bearer test") {
 		t.Fatalf("expected config file to remove sensitive headers, got %s", text)
+	}
+	if strings.Contains(text, "cli-secret") || strings.Contains(text, "GONAVI_PRIVATE_TOKEN") {
+		t.Fatalf("expected config file to remove CLI environment secrets, got %s", text)
 	}
 }
 

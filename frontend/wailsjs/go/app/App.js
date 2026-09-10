@@ -22,6 +22,10 @@ export function AuthorizeMCPConnectionSQL(arg1, arg2) {
   return window['go']['app']['App']['AuthorizeMCPConnectionSQL'](arg1, arg2);
 }
 
+export function BootstrapConnectionSidebarLayout(arg1) {
+  return window['go']['app']['App']['BootstrapConnectionSidebarLayout'](arg1);
+}
+
 export function BuildDatabaseDiagnosticPackage() {
   return window['go']['app']['App']['BuildDatabaseDiagnosticPackage']();
 }
@@ -52,6 +56,10 @@ export function CancelQuery(arg1) {
 
 export function CancelSQLFileExecution(arg1) {
   return window['go']['app']['App']['CancelSQLFileExecution'](arg1);
+}
+
+export function CancelSavedConnectionsHealthRun(arg1) {
+  return window['go']['app']['App']['CancelSavedConnectionsHealthRun'](arg1);
 }
 
 export function CheckDriverNetworkStatus() {
@@ -220,6 +228,10 @@ export function DBGetViewsContext(arg1, arg2, arg3) {
 
 export function DBQuery(arg1, arg2, arg3) {
   return window['go']['app']['App']['DBQuery'](arg1, arg2, arg3);
+}
+
+export function DBQueryApplicationWithCancel(arg1, arg2, arg3, arg4) {
+  return window['go']['app']['App']['DBQueryApplicationWithCancel'](arg1, arg2, arg3, arg4);
 }
 
 export function DBQueryAI(arg1, arg2, arg3) {
@@ -426,6 +438,14 @@ export function DeleteConnection(arg1) {
   return window['go']['app']['App']['DeleteConnection'](arg1);
 }
 
+export function DeleteConnectionGroup(arg1) {
+  return window['go']['app']['App']['DeleteConnectionGroup'](arg1);
+}
+
+export function DeleteConnections(arg1) {
+  return window['go']['app']['App']['DeleteConnections'](arg1);
+}
+
 export function DeleteImportJob(arg1) {
   return window['go']['app']['App']['DeleteImportJob'](arg1);
 }
@@ -590,12 +610,20 @@ export function GetAppInfo() {
   return window['go']['app']['App']['GetAppInfo']();
 }
 
+export function GetBrandIconDataURL(arg1) {
+  return window['go']['app']['App']['GetBrandIconDataURL'](arg1);
+}
+
 export function GetDataRootDirectoryInfo() {
   return window['go']['app']['App']['GetDataRootDirectoryInfo']();
 }
 
 export function GetDatabaseDiagnosticPackagePreview() {
   return window['go']['app']['App']['GetDatabaseDiagnosticPackagePreview']();
+}
+
+export function GetDownloadSourceConfig() {
+  return window['go']['app']['App']['GetDownloadSourceConfig']();
 }
 
 export function GetDriverStatusList(arg1, arg2) {
@@ -644,6 +672,10 @@ export function GetSQLAuditSettings() {
 
 export function GetSavedConnections() {
   return window['go']['app']['App']['GetSavedConnections']();
+}
+
+export function GetSavedConnectionsHealthRun(arg1) {
+  return window['go']['app']['App']['GetSavedConnectionsHealthRun'](arg1);
 }
 
 export function GetSavedQueries() {
@@ -816,6 +848,10 @@ export function ListReproductionBundleSources() {
 
 export function ListSQLDirectory(arg1) {
   return window['go']['app']['App']['ListSQLDirectory'](arg1);
+}
+
+export function LoadConnectionSidebarLayout() {
+  return window['go']['app']['App']['LoadConnectionSidebarLayout']();
 }
 
 export function LogWindowDiagnostic(arg1, arg2) {
@@ -1266,6 +1302,14 @@ export function SaveConnection(arg1) {
   return window['go']['app']['App']['SaveConnection'](arg1);
 }
 
+export function SaveConnectionSidebarLayout(arg1) {
+  return window['go']['app']['App']['SaveConnectionSidebarLayout'](arg1);
+}
+
+export function SaveDownloadSourceConfig(arg1) {
+  return window['go']['app']['App']['SaveDownloadSourceConfig'](arg1);
+}
+
 export function SaveGlobalProxy(arg1) {
   return window['go']['app']['App']['SaveGlobalProxy'](arg1);
 }
@@ -1342,8 +1386,8 @@ export function SetUpdateChannel(arg1) {
   return window['go']['app']['App']['SetUpdateChannel'](arg1);
 }
 
-export function SetWindowTranslucency(arg1, arg2) {
-  return window['go']['app']['App']['SetWindowTranslucency'](arg1, arg2);
+export function SetWindowTranslucency(arg1, arg2, arg3) {
+  return window['go']['app']['App']['SetWindowTranslucency'](arg1, arg2, arg3);
 }
 
 export function Shutdown() {
@@ -1352,6 +1396,10 @@ export function Shutdown() {
 
 export function StartDriverPackageDownload(arg1, arg2, arg3, arg4) {
   return window['go']['app']['App']['StartDriverPackageDownload'](arg1, arg2, arg3, arg4);
+}
+
+export function StartSavedConnectionsHealthRun(arg1) {
+  return window['go']['app']['App']['StartSavedConnectionsHealthRun'](arg1);
 }
 
 export function StartSecurityUpdate(arg1) {
